@@ -1,0 +1,66 @@
+# @package _global_
+
+# Segformer Model Configuration
+defaults:
+  - _self_
+  - /data: BUSBRA_SegFormer
+
+model:
+  name: Segformer
+  # Pretrained model options:
+  # - nvidia/segformer-b0-finetuned-ade-512-512 (3.7M params)
+  # - nvidia/segformer-b1-finetuned-ade-512-512 (13.7M params)
+  # - nvidia/segformer-b2-finetuned-ade-512-512 (24.7M params)
+  # - nvidia/segformer-b3-finetuned-ade-512-512 (44.6M params)
+  # - nvidia/segformer-b4-finetuned-ade-512-512 (61.4M params)
+  # - nvidia/segformer-b5-finetuned-ade-512-512 (81.9M params)
+  pretrained_model: "nvidia/segformer-b2-finetuned-ade-512-512"
+
+# Training configuration
+training:
+  num_workers: 8
+  max_iterations: 30000
+  max_epochs: 200
+  stop_epoch: 160
+  batch_size: 16
+  base_lr: 0.00006              # Segformer typically uses lower LR (6e-5)
+  warmup: true
+  warmup_period: 250
+  dice_param: 0.8               # Weight for dice loss (0.8 = 80% dice, 20% CE)
+  save_interval: 20             # Save checkpoint every N epochs
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW                   # AdamW is recommended for Transformers
+  weight_decay: 0.01
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+    norm_type: 2
+
+# Hardware configuration
+hardware:
+  n_gpu: 1
+  deterministic: 1
+  seed: 1234
+  gpu_ids: [0]
+
+# Output configuration
+output:
+  dir: logs
+  is_pretrain: true             # Using pretrained Segformer weights
+
+# Visualization
+visualization:
+  enabled: true
+  num_samples: 10               # Number of samples to visualize during test
+
+# WandB configuration
+wandb:
+  project: TinyUSFM
+  entity: hheo
+  log_model: true

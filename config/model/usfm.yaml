@@ -1,0 +1,9 @@
+# @package _global_
+
+# USFM Model Configuration (Similar to TinyUSFM but potentially different architecture)
+defaults:
+  - tinyusfm
+
+# If USFM has different settings, override here
+# model:
+#   name: USFM

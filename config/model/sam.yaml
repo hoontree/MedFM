@@ -1,0 +1,55 @@
+# @package _global_
+
+# SAM Model Configuration
+defaults:
+  - _self_
+  - /data: Standard
+  - encoder: vit_b
+
+# Training configuration
+training:
+  num_workers: 8
+  max_iterations: 30000
+  max_epochs: 200
+  stop_epoch: 160
+  batch_size: 16
+  base_lr: 0.005
+  warmup: false
+  warmup_period: 250
+  dice_param: 0.8
+  save_interval: 20               # Save checkpoint every N epochs
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW                     # AdamW or SGD
+  weight_decay: 0.01
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+    norm_type: 2
+
+# Hardware configuration
+hardware:
+  n_gpu: 1
+  deterministic: 1
+  seed: 1234
+  gpu_ids: [0]
+
+# Output configuration
+output:
+  dir: logs
+  is_pretrain: true               # Pretrained or scratch
+
+# Visualization
+visualization:
+  num_samples: 10                 # Number of samples to visualize during test
+
+# WandB configuration
+wandb:
+  project: TinyUSFM
+  entity: hheo
+  log_model: true

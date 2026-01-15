@@ -1,0 +1,9 @@
+# @package _global_
+
+model:
+  name: vit_l                     # VIT-L variant
+  img_size: 256
+  ckpt: checkpoints/sam_vit_l.pth # VIT-L pretrained checkpoint
+  lora_ckpt: null
+  module: sam_lora_image_encoder
+  rank: 4

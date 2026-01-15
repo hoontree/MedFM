@@ -1,0 +1,26 @@
+# Unified Training Configuration
+#
+# Usage:
+#   python main.py                              # Use default (sam)
+#   python main.py model=sam                    # Train SAM
+#   python main.py model=tinyusfm               # Train TinyUSFM
+#   python main.py mode=test checkpoint=...     # Test mode
+#   python main.py list_models=true             # List available models
+
+defaults:
+  - model: sam                    # Default model (sam or tinyusfm)
+  - _self_
+
+# Mode: train or test
+mode: train
+
+# Checkpoint path (for test mode or resume training)
+checkpoint: null
+
+# List available models
+list_models: false
+
+# Test-only mode configuration
+test_only:
+  enabled: true
+  checkpoint_path: logs/vit_b/Standard/pretrain/20251226_012711_bs16_lr0.005/checkpoints/best_epoch_37_dice0.8155.pth

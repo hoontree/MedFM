@@ -1,0 +1,49 @@
+# 기존 .gitignore 내용 유지하면서 추가
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+env/
+ENV/
+
+# Logs and results
+logs/
+results/
+wandb/
+*.log
+
+# Checkpoints
+checkpoints/
+*.pth
+*.pt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data
+datasets/
+data/
+
+# Temporary files
+*.tmp
+*.bak
+*~
+legacy/
+outputs/
+.claude

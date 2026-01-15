@@ -1,0 +1,9 @@
+# @package _global_
+
+model:
+  name: vit_b                     # Model variant: vit_b, vit_l, vit_h
+  img_size: 224                   # Input image size
+  ckpt: checkpoints/sam_vit_b_01ec64.pth  # SAM pretrained checkpoint
+  lora_ckpt: null                 # LoRA checkpoint (optional, for resume)
+  module: model.sam_lora_image_encoder_mask_decoder  # LoRA module
+  rank: 4                         # LoRA rank

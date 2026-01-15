@@ -1,0 +1,89 @@
+# Knowledge Distillation Configuration
+# Teacher: Finetuned SAM with LoRA
+# Student: Pretrained TinyUSFM
+
+defaults:
+  - _self_
+  - data: BUSBRA+BUSI
+
+# Dataset configuration is inherited from data/BUSBRA.yaml
+
+# Teacher model (Finetuned SAM)
+teacher:
+  model_name: vit_b  # or vit_l, vit_h
+  module: model.sam_lora_image_encoder_mask_decoder  # or model.sam_lora_image_encoder_mask_decoder
+  img_size: 224
+  rank: 4
+  # SAM pretrained checkpoint (ImageNet weights)
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  # Finetuned LoRA checkpoint (required!)
+  lora_checkpoint: logs/vit_b/B/pretrain/20251226_031118_bs16_lr0.005/checkpoints/best_epoch_19_dice0.8566.pth
+  b_checkpoint: logs/vit_b/B/pretrain/20251226_031118_bs16_lr0.005/checkpoints/best_epoch_19_dice0.8566.pth
+  busi+b_checkpoint: logs/vit_b/BUSI+B/pretrain/20251226_025713_bs16_lr0.005/checkpoints/best_epoch_28_dice0.6808.pth
+
+# Student model (TinyUSFM)
+student:
+  model_name: TinyUSFM
+  pretrained: true
+  # Optional: pretrained TinyUSFM checkpoint for initialization
+  checkpoint: logs/distill_experiments/B/BUSBRA+BUSI/gamma_1.0/TinyUSFM/BUSI+BUSBRA/distill/20251226_080854_bs16_lr0.0005_T4.0_a0.5_b0.5/models/best_epoch78_dice0.7474.pth  # e.g., pretrained_tinyusfm.pth
+
+# Distillation parameters
+distillation:
+  temperature: 4.0      # Temperature for softening probability distributions (higher = softer)
+  alpha: 0.5           # Weight for task loss (ground truth supervision)
+  beta: 0.5            # Weight for distillation loss (teacher supervision)
+  gamma: 1.0           # Weight for feature distillation (0 = disabled)
+
+# Training configuration
+training:
+  num_epochs: 150
+  lr: 0.0005           # Lower learning rate for distillation
+  warmup_epochs: 5
+  batch_size: 16
+  num_workers: 8
+
+  early_stopping:
+    enabled: true
+    patience: 30       # More patience for distillation
+    min_delta: 0.0001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW          # AdamW, Adam, or SGD
+  weight_decay: 0.01
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+    norm_type: 2
+
+# Scheduler configuration
+scheduler:
+  use_reduce_on_plateau: false
+  # If use_reduce_on_plateau is false, WarmupPolyLR is used
+  warmup_iters: 500
+  total_iters: 15000
+  power: 0.9
+  # If use_reduce_on_plateau is true
+  factor: 0.5
+  patience: 10
+  min_lr: 1.0e-7
+
+# Hardware configuration
+hardware:
+  gpu_ids: [1]
+  seed: 1234
+
+# Output configuration
+output:
+  dir: logs
+
+# Visualization
+visualization:
+  num_samples: 10
+
+# Wandb configuration
+wandb:
+  project: TinyUSFM
+  entity: hheo
+  log_model: true

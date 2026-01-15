@@ -1,0 +1,4 @@
+name: 'USFM_Seg'
+num_classes: 2
+pretrained: true
+checkpoint: 'checkpoints/USFM_latest.pth'
