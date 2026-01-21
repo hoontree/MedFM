@@ -2,6 +2,6 @@
 defaults:
   - _self_
   - data: dynamic
-  - model: TinyUSFM
+  - model: ca_sam
 
 gpu_ids: [0]

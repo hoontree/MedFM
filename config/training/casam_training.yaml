@@ -1,0 +1,50 @@
+# @package _global_
+
+# Training configuration (paper settings)
+training:
+  num_epochs: 24                     # Paper: 24 epochs per task
+  batch_size: 6                      # Paper: batch size 6
+  base_lr: 1e-4                      # Paper: 1e-4
+  num_workers: 4
+
+  # VAE training (after alignment layer training)
+  vae_epochs: 10                     # Paper: 10 epochs
+  vae_lr: 5e-4                       # Paper: 5e-4
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.001
+
+  # Checkpoint saving
+  save_interval: 5
+
+# Optimizer configuration
+optimizer:
+  name: Adam                         # Paper uses Adam
+  weight_decay: 0.0
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+
+# Hardware configuration
+hardware:
+  n_gpu: 1
+  deterministic: true
+  seed: 42
+  gpu_ids: [0]
+
+# Output configuration
+output:
+  dir: logs
+
+# Visualization
+visualization:
+  num_samples: 10
+
+# WandB configuration
+wandb:
+  project: TinyUSFM
+  entity: hheo
+  log_model: true

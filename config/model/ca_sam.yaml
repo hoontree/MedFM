@@ -1,0 +1,31 @@
+# @package _global_
+
+# CA-SAM (Continual Alignment for SAM) Model Configuration
+# Based on paper: "Continual Alignment for SAM: Rethinking Foundation Models
+#                  for Medical Image Segmentation in Continual Learning"
+
+defaults:
+  - _self_
+  - /training: casam_training
+
+# Model configuration
+model:
+  name: ca_sam
+  sam_type: vit_b                    # SAM variant: vit_b, vit_l, vit_h
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  img_size: 224
+
+  # Training mode
+  mode: single_task                  # single_task or continual
+
+  # Alignment Layer configuration (paper: 3.54M params with 4 blocks)
+  alignment:
+    hidden_dim: 256                  # Hidden dimension (same as encoder output)
+    num_blocks: 4                    # Number of CAResBlocks (paper: 3-5)
+
+  # VAE Router configuration
+  vae:
+    latent_dim: 64                   # VAE latent dimension
+    beta: 16.5                       # KL divergence weight (paper: 16.5)
+    temperature: 1.0                 # Attention pooling temperature
+    threshold_percentile: 97         # OOD threshold percentile (p97)

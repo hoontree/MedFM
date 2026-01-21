@@ -28,6 +28,8 @@ class ModelBuilder:
         "usfm": ("trainers.tinyusfm_trainer", "TinyUSFMTrainer"),
         "segformer": ("trainers.segformer_trainer", "SegformerTrainer"),
         "sam3": ("trainers.sam3_adapter", "SAM3TrainerAdapter"),
+        "ca_sam": ("trainers.ca_sam_trainer", "CASAMTrainer"),
+        "casam": ("trainers.ca_sam_trainer", "CASAMTrainer"),
     }
 
     # Registry mapping model names to model creation functions or classes
