@@ -1,0 +1,113 @@
+# @package _global_
+
+# SAM3 Model Configuration
+# SAM3 is Meta's latest Segment Anything Model with improved performance.
+#
+# Two training modes are available:
+# 1. Simple mode (default): Uses SAM3TrainerAdapter with BaseTrainer interface
+# 2. Native mode: Uses SAM3Orchestrator with full SAM3 capabilities
+#
+# Usage:
+#   # Simple training
+#   python main.py model=sam3
+#
+#   # With custom config
+#   python main.py model=sam3 sam3.resolution=1024 training.batch_size=2
+#
+#   # Native mode (advanced)
+#   python main.py model=sam3 sam3.use_native_trainer=true
+
+defaults:
+  - _self_
+  - /data: Standard
+
+# Model identification
+model:
+  name: sam3
+  img_size: 1008
+
+# SAM3-specific configuration
+sam3:
+  # Use native SAM3 trainer (advanced) vs adapter (simple)
+  use_native_trainer: false
+
+  # Model checkpoint (null for pretrained from HuggingFace)
+  checkpoint_path: null
+
+  # BPE path for text encoder (relative to project root)
+  bpe_path: model/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+
+  # Enable segmentation masks (vs detection only)
+  enable_segmentation: true
+
+  # Input resolution
+  resolution: 1008
+
+  # Learning rate scale factor
+  lr_scale: 0.1
+
+  # AMP (Automatic Mixed Precision)
+  amp_enabled: true
+  amp_dtype: bfloat16  # bfloat16 or float16
+
+  # Validation frequency
+  val_epoch_freq: 1
+
+  # Logging frequency (iterations)
+  log_freq: 10
+
+  # Normalization (SAM3 uses [0.5, 0.5, 0.5])
+  norm_mean: [0.5, 0.5, 0.5]
+  norm_std: [0.5, 0.5, 0.5]
+
+# Training configuration
+training:
+  num_workers: 4
+  max_epochs: 20
+  batch_size: 1                       # SAM3 typically uses small batch sizes
+  base_lr: 0.0001
+  weight_decay: 0.1
+  gradient_accumulation_steps: 1
+  save_interval: 5
+
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW
+  weight_decay: 0.1
+  grad_clip:
+    enabled: true
+    max_norm: 0.1
+    norm_type: 2
+
+# Hardware configuration
+hardware:
+  n_gpu: 1
+  deterministic: false                # SAM3 benefits from non-deterministic for speed
+  seed: 123
+  gpu_ids: [0]
+
+# Output configuration
+output:
+  dir: logs
+  is_pretrain: true
+
+# Visualization
+visualization:
+  num_samples: 10
+
+# WandB configuration
+wandb:
+  project: TinyUSFM
+  entity: hheo
+  log_model: false                    # SAM3 checkpoints are large
+
+# Data configuration defaults (can be overridden)
+data:
+  name: custom
+  num_classes: 2
+  img_size: 1008

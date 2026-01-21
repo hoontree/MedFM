@@ -1,0 +1,28 @@
+name: "B"
+type: "SegBase"
+num_classes: 2  # Binary segmentation (background, lesion)
+img_size: 224
+path:
+  root: "/home/hheo/data/Ultrasound/seg/breast/Dataset_B"
+  split:
+    train: "train"
+    val: "val"
+    test: "test"
+    vis:
+      samples: 16
+      interval: 10
+extensions: [".png"]
+seed: 42
+
+# Directory structure
+image_dir: "original"
+mask_dir: "GT"
+
+# File naming pattern
+# Images: "XXXXXX.png" in origin/ directory
+# Masks: "XXXXXX.png" in GT/ directory
+
+# Dataset info
+# Total: 163 images
+# Binary segmentation
+# Random split: 70% train, 15% val, 15% test

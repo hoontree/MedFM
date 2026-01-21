@@ -17,4 +17,10 @@ def __getattr__(name):
     elif name == 'SegformerTrainer':
         from .segformer_trainer import SegformerTrainer
         return SegformerTrainer
+    elif name == 'SAM3TrainerAdapter':
+        from .sam3_adapter import SAM3TrainerAdapter
+        return SAM3TrainerAdapter
+    elif name == 'SAM3Orchestrator':
+        from .sam3_adapter import SAM3Orchestrator
+        return SAM3Orchestrator
     raise AttributeError(f"module 'trainers' has no attribute '{name}'")

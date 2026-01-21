@@ -12,6 +12,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
+import wandb
 
 from transformers import SegformerForSemanticSegmentation, SegformerConfig, SegformerImageProcessor
 from .base_trainer import BaseTrainer
@@ -228,21 +229,15 @@ class SegformerTrainer(BaseTrainer):
                 'lr': f'{lr:.6f}'
             })
 
-            # Log to tensorboard and wandb
+            # Log to wandb (step-level metrics)
             if self.global_step % 10 == 0:
-                if self.writer is not None:
-                    self.writer.add_scalar('info/lr', lr, self.global_step)
-                    self.writer.add_scalar('info/total_loss', loss.item(), self.global_step)
-                    self.writer.add_scalar('info/loss_ce', loss_ce.item(), self.global_step)
-                    self.writer.add_scalar('info/loss_dice', loss_dice.item(), self.global_step)
-
-                import wandb
                 wandb.log({
-                    'train/loss': loss.item(),
-                    'train/loss_ce': loss_ce.item(),
-                    'train/loss_dice': loss_dice.item(),
-                    'learning_rate': lr
-                }, step=self.global_step)
+                    'step_train/loss': loss.item(),
+                    'step_train/loss_ce': loss_ce.item(),
+                    'step_train/loss_dice': loss_dice.item(),
+                    'step_train/learning_rate': lr,
+                    'global_step': self.global_step
+                })
 
             self.global_step += 1
 

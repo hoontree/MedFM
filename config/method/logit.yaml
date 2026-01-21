@@ -1,0 +1,5 @@
+name: logit
+temperature: 4.0
+alpha: 0.5
+beta: 0.5
+gamma: 0.0

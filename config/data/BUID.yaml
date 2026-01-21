@@ -1,0 +1,33 @@
+name: "BUID"
+type: "SegBase"
+num_classes: 2  # Binary segmentation (background, lesion)
+img_size: 224
+path:
+  root: "/home/hheo/data/Ultrasound/seg/breast/BUID"
+  split:
+    train: "train"
+    val: "valid"
+    test: "test"
+    vis:
+      samples: 16
+      interval: 10
+extensions: [".bmp", ".tif"]
+seed: 42
+usage: train # external or train
+
+# Class directories
+classes:
+  benign: "Benign"
+  malignant: "Malignant"
+
+# File naming pattern
+# Images: "XXX {Benign|Malignant} Image.bmp"
+# Masks: "XXX {Benign|Malignant} Mask.tif"
+# Lesions: "XXX {Benign|Malignant} Lesion.bmp" (not used)
+
+# Dataset info
+# Benign: 109 cases (327 files / 3)
+# Malignant: 123 cases (369 files / 3)
+# Total: 232 cases
+# Files per case: Image.bmp, Mask.tif, Lesion.bmp
+# Image size: 590x590 or 600x600

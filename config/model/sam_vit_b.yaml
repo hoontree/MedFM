@@ -1,29 +1,30 @@
-# Knowledge Distillation Configuration (Refactored)
+# @package _global_
 
-defaults:
-  - _self_
-  - data: dynamic
-  - teacher: sam_vit_b
-  - student: tinyusfm
-  - method: logit
+model:
+  name: vit_b
+  module: model.sam_lora_image_encoder_mask_decoder
+  img_size: 224
+  rank: 4
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  lora_checkpoint: logs/vit_b/B/pretrain/20251226_031118_bs16_lr0.005/checkpoints/best_epoch_19_dice0.8566.pth
 
 # Training configuration
 training:
-  num_epochs: 150
-  lr: 0.0005           # Learning rate for student
-  warmup_epochs: 5
-  batch_size: 16
-  num_workers: 8
+  num_epochs: 1000
+  lr: 0.0001
+  warmup_epochs: 2
+  batch_size: 4
+  num_workers: 4
   limit_train_batches: null
-
+  dice_weight: 0.8
   early_stopping:
     enabled: true
-    patience: 30
+    patience: 100
     min_delta: 0.0001
 
 # Optimizer configuration
 optimizer:
-  name: AdamW          # AdamW or Adam
+  name: AdamW
   weight_decay: 0.01
   gradient_clip:
     enabled: true
@@ -32,14 +33,14 @@ optimizer:
 # Scheduler configuration
 scheduler:
   use_reduce_on_plateau: false
-  warmup_iters: 500
-  total_iters: 15000
+  warmup_iters: 200
+  total_iters: 5000
   power: 0.9
 
 # Hardware configuration
 hardware:
   gpu_ids: [0]
-  seed: 1234
+  seed: 42
 
 # Output configuration
 output:
@@ -51,6 +52,6 @@ visualization:
 
 # Wandb configuration
 wandb:
-  project: TinyUSFM
+  project: medical_foundation_models
   entity: hheo
   log_model: true

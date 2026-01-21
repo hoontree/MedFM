@@ -6,6 +6,7 @@ This module provides a trainer for TinyUSFM segmentation models.
 
 from pathlib import Path
 from typing import Dict
+import lightning as L
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -101,7 +102,6 @@ class TinyUSFMTrainer(BaseTrainer):
                 factor=self.cfg.scheduler.get('factor', 0.5),
                 patience=self.cfg.scheduler.get('patience', 5),
                 min_lr=self.cfg.scheduler.get('min_lr', 1e-7),
-                verbose=True
             )
             self.logger.info(f"Using ReduceLROnPlateau scheduler")
         else:
@@ -285,3 +285,4 @@ class TinyUSFMTrainer(BaseTrainer):
             )
 
         self.logger.info(f"Visualizations saved to {vis_dir}")
+        

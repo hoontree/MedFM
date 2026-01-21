@@ -1,0 +1,6 @@
+name: vit_b
+module: model.sam_lora_image_encoder_mask_decoder
+img_size: 224
+rank: 4
+sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+lora_checkpoint: logs/vit_b/B/pretrain/20251226_031118_bs16_lr0.005/checkpoints/best_epoch_19_dice0.8566.pth

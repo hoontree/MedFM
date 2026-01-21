@@ -1,0 +1,28 @@
+name: "BUSBRA"
+type: "SegBase"
+num_classes: 2  # Binary segmentation (background, lesion)
+img_size: 224  # Resize images to 224x224 for training and evaluation
+# img_size: 512  # Resize images to 512x512 for training and evaluation
+path:
+  root: "/home/hheo/data/Ultrasound/seg/breast/BUSBRA"
+  split:
+    train: "train"
+    val: "val"
+    test: "test"
+    vis:
+      samples: 16
+      interval: 10
+extensions: [".png"]
+image_dir: "Images"
+mask_dir: "Masks"
+image_prefix: "bus_"
+mask_prefix: "mask_"
+batch_size: 8
+num_workers: 4
+pin_memory: true
+
+# Dataset info
+# Total: 1875 images (left/right breast images)
+# Binary masks (background: 0, lesion: 1)
+# Grayscale images with varying sizes
+# Split files: busbra_train.txt, busbra_val.txt, busbra_test.txt in root directory

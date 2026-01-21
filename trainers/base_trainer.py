@@ -15,7 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
@@ -92,7 +91,6 @@ class BaseTrainer(ABC):
         self.val_loader = None
         self.test_loader = None
         self.logger = None
-        self.writer = None
         self.evaluator = Evaluator_seg()
         self.early_stopping = None
 
@@ -139,9 +137,6 @@ class BaseTrainer(ABC):
             self._create_scheduler()
             self._setup_early_stopping()
 
-            # Setup tensorboard
-            self.writer = SummaryWriter(str(self.log_dir / 'tensorboard'))
-
         self.logger.info(f"Setup completed for {mode} mode")
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Experiment directory: {self.exp_dir}")
@@ -166,8 +161,11 @@ class BaseTrainer(ABC):
     def _setup_directories(self, mode: str):
         """Setup experiment directories."""
         # Get model name
-        model_name = self.cfg.model.name
-        dataset_name = self.cfg.data.name
+        model_name = self.cfg.model.get("adaptation_mode", self.cfg.model.name)
+        if self.cfg.data.get('name') == 'dynamic':
+            dataset_name = "+".join(self.cfg.data.train)
+        else:
+            dataset_name = self.cfg.data.name
 
         # Create base directory
         logs_root = Path(self.cfg.get('output', {}).get('dir', 'logs'))
@@ -175,16 +173,12 @@ class BaseTrainer(ABC):
         # Create experiment tags
         exp_tags = self._create_exp_tags()
 
-        # Determine train mode
-        is_pretrain = self.cfg.get('output', {}).get('is_pretrain', False)
-        train_mode = "pretrain" if is_pretrain else "scratch"
-
         # Create timestamp-based experiment directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
 
         # Final experiment directory
-        self.exp_dir = logs_root / model_name / dataset_name / train_mode / exp_dir_name
+        self.exp_dir = logs_root / model_name / dataset_name / exp_dir_name
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         # Checkpoint directory
@@ -226,13 +220,10 @@ class BaseTrainer(ABC):
         """Setup Weights & Biases logging."""
         wandb_config = self.cfg.get('wandb', {})
 
-        is_pretrain = self.cfg.get('output', {}).get('is_pretrain', False)
-        train_mode = "pretrained" if is_pretrain else "scratch"
-
         wandb.init(
             entity=wandb_config.get('entity', 'hheo'),
             project=wandb_config.get('project', 'TinyUSFM'),
-            name=f"{self.cfg.model.name}_{train_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=f"{self.cfg.model.get('adaptation_mode', self.cfg.model.get('name', 'model'))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config=OmegaConf.to_container(self.cfg, resolve=True),
             dir=str(self.exp_dir)
         )
@@ -321,9 +312,12 @@ class BaseTrainer(ABC):
 
             # Validate
             val_metrics = self.validate(epoch)
+            
+            # Test
+            test_metrics = self.test()
 
             # Log metrics
-            self._log_metrics(epoch, train_metrics, val_metrics)
+            self._log_metrics(epoch, train_metrics, val_metrics, test_metrics=test_metrics)
 
             # Save checkpoint
             self._save_checkpoint(epoch, val_metrics)
@@ -345,13 +339,11 @@ class BaseTrainer(ABC):
             self._save_test_results(test_metrics)
 
         # Cleanup
-        if self.writer is not None:
-            self.writer.close()
         wandb.finish()
 
         self.logger.info("Training completed!")
 
-    def _log_metrics(self, epoch: int, train_metrics: Dict, val_metrics: Dict):
+    def _log_metrics(self, epoch: int, train_metrics: Dict, val_metrics: Dict, test_metrics: Dict = None):
         """Log training and validation metrics."""
         # Log to console
         self.logger.info(f"\nEpoch {epoch + 1}/{self.cfg.training.get('num_epochs', self.cfg.training.get('max_epochs', 100))}")
@@ -359,20 +351,16 @@ class BaseTrainer(ABC):
         self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in train_metrics.items()]))
         self.logger.info(f"Val:")
         self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()]))
+        if test_metrics is not None:
+            self.logger.info(f"Test:")
+            self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()]))
 
-        # Log to tensorboard
-        if self.writer is not None:
-            for key, value in train_metrics.items():
-                self.writer.add_scalar(f'train/{key}', value, epoch + 1)
-            for key, value in val_metrics.items():
-                self.writer.add_scalar(f'val/{key}', value, epoch + 1)
-
-        # Log to wandb
-        # Note: Don't specify step here to avoid conflicts with global_step logging in train_epoch
-        # WandB will auto-increment the step, or we can use epoch-based metrics with different names
+        # Log to wandb (epoch-level metrics)
         wandb_metrics = {'epoch': epoch + 1}
         wandb_metrics.update({f'epoch_train/{k}': v for k, v in train_metrics.items()})
         wandb_metrics.update({f'epoch_val/{k}': v for k, v in val_metrics.items()})
+        if test_metrics is not None:
+            wandb_metrics.update({f'epoch_test/{k}': v for k, v in test_metrics.items()})
         wandb.log(wandb_metrics)
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):

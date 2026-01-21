@@ -1,0 +1,9 @@
+name: BUSI+B
+type: Combined
+train: [BUSI, B]
+val: [BUSI, B]
+test: [BUSI, B]
+
+num_classes: 2
+img_size: 224  # Default size, can be overridden by model config
+normalization: "imagenet" # Options: "imagenet", "min_max"

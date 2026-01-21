@@ -1,16 +1,12 @@
 # @package _global_
 
-# TinyUSFM Model Configuration
-defaults:
-  - /data: BUSBRA_distill
-
-
 model:
   name: TinyUSFM
   num_classes: 2
   pretrained: true                # Use pretrained weights
   checkpoint: checkpoints/TinyUSFM.pth
-  
+  img_size: 224
+
 # Training settings
 training:
   lr: 0.0001                      # Learning rate
@@ -19,19 +15,20 @@ training:
   warmup_epochs: 5
   num_workers: 8
   save_interval: 20               # Save checkpoint every N epochs
+  limit_train_batches: null       # For debugging purposes, limit number of batches per epoch
+  dice_weight: 0.8                # Weight for Dice loss in combined loss
   early_stopping:
     enabled: true
     patience: 20
     min_delta: 0.0001
 
-# Optimizer settings
+# Optimizer configuration
 optimizer:
-  name: AdamW                     # Adam, AdamW, or SGD
-  weight_decay: 0
-  grad_clip:
+  name: AdamW
+  weight_decay: 0.01
+  gradient_clip:
     enabled: true
     max_norm: 1.0
-    norm_type: 2
 
 # Scheduler settings
 scheduler:
@@ -61,5 +58,5 @@ visualization:
 
 # WandB configuration
 wandb:
-  project: TinyUSFM
+  project: medfm
   entity: hheo

@@ -1,0 +1,12 @@
+# Dynamic Data Configuration
+# Use this to specify datasets at runtime via command line:
+# python distill.py data=dynamic data.train='[BUSI,BUSBRA]' data.test='[BUID,BUS_UCLM]'
+
+name: "dynamic"
+type: "Dynamic"
+train: [BUSBRA, BUSI, B]
+val: []   # If empty, defaults to same as train (using val split)
+test: [BUID, BUS_UCLM]  # Each dataset in this list will be evaluated separately
+
+num_classes: 2
+normalization: "imagenet"

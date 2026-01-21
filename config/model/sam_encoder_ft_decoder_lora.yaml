@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - /training: sam_training
+  
+model:
+  name: sam_hybrid
+  module: model.sam_hybrid_adapter
+  sam_type: vit_b
+  adaptation_mode: encoder_ft_decoder_lora
+  img_size: 224
+  rank: 4
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  lora_checkpoint: null

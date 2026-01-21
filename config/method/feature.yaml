@@ -1,0 +1,7 @@
+name: feature
+temperature: 4.0
+alpha: 0.5
+beta: 0.3
+gamma: 0.2
+student_channels: 48
+teacher_channels: 256

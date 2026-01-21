@@ -1,0 +1,13 @@
+name: "Standard"
+type: "Combined"
+# Training: Combine BUSI and BUSBRA
+# Internal Validation: Combine BUSI and BUSBRA
+train: ["BUSI", "BUSBRA", "B"]
+val: ["BUSI", "BUSBRA", "B"]
+
+# External Validation: Separate evaluation for BUID and BUS_UCLM
+test: ["BUID", "BUS_UCLM"]
+
+num_classes: 2
+img_size: 224  # Default size, can be overridden by model config
+normalization: "imagenet" # Options: "imagenet", "min_max"

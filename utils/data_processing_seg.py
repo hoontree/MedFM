@@ -11,9 +11,10 @@ import torchvision.transforms.functional as TF
 import logging
 from sklearn.model_selection import train_test_split
 from transformers import SegformerImageProcessor
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, ListConfig
 
 logger = logging.getLogger(__name__)
+
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -23,6 +24,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 class BUID(Dataset):
     """
@@ -41,6 +43,7 @@ class BUID(Dataset):
             XXX Malignant Lesion.bmp (not used)
     - Random split by class: 70% train, 15% val, 15% test
     """
+
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         self.cfg = cfg
         self.num_classes = cfg.num_classes
@@ -51,11 +54,11 @@ class BUID(Dataset):
         self.image_size = (cfg.img_size, cfg.img_size)
 
         self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, 'seed', 42)
+        self.seed = getattr(cfg, "seed", 42)
         self.classes = cfg.classes
-        self.normalization = getattr(cfg, 'normalization', 'imagenet')
-        self.usage = getattr(cfg, 'usage', 'external')
-        if self.usage == 'external':
+        self.normalization = getattr(cfg, "normalization", "imagenet")
+        self.usage = getattr(cfg, "usage", "external")
+        if self.usage == "external":
             # Get all image and mask files from both classes
             self.images, self.masks = self._unzip_pairs(self._collect_paired_files())
         else:
@@ -67,7 +70,7 @@ class BUID(Dataset):
         # Group by class
         benign_pairs = []
         malignant_pairs = []
-        
+
         for img, msk in zip(images, masks):
             if "Benign" in str(img):
                 benign_pairs.append((img, msk))
@@ -82,7 +85,7 @@ class BUID(Dataset):
         def split_class(pairs, seed):
             if not pairs:
                 return [], [], []
-            
+
             # First split: 70% train, 30% temp
             train, temp = train_test_split(pairs, test_size=0.3, random_state=seed)
             # Second split: 50% val, 50% test (from 30% temp -> 15% each)
@@ -91,27 +94,27 @@ class BUID(Dataset):
 
         b_train, b_val, b_test = split_class(benign_pairs, self.seed)
         m_train, m_val, m_test = split_class(malignant_pairs, self.seed)
-        
+
         # Combine
         train_pairs = b_train + m_train
         val_pairs = b_val + m_val
         test_pairs = b_test + m_test
-        
+
         # Support both 'val' and 'valid'
-        target_split = 'val' if self.split in ['val', 'valid'] else self.split
-        
-        if target_split == 'train':
+        target_split = "val" if self.split in ["val", "valid"] else self.split
+
+        if target_split == "train":
             selected = train_pairs
-        elif target_split == 'val':
+        elif target_split == "val":
             selected = val_pairs
-        elif target_split == 'test':
+        elif target_split == "test":
             selected = test_pairs
         else:
             raise ValueError(f"Invalid split: {self.split}")
-            
+
         # Sort for consistency
         selected.sort(key=lambda x: str(x[0]))
-        
+
         return self._unzip_pairs(selected)
 
     def _collect_paired_files(self) -> List[Tuple[Path, Path]]:
@@ -131,7 +134,7 @@ class BUID(Dataset):
                     pairs.append((img_path, mask_path))
                 else:
                     print(f"Warning: Mask file not found: {mask_path}")
-        
+
         # Sort pairs by image path to ensure consistent ordering
         pairs.sort(key=lambda x: str(x[0]))
         return pairs
@@ -151,13 +154,13 @@ class BUID(Dataset):
 
         # Load image
         try:
-            image = Image.open(image_path).convert('RGB')
+            image = Image.open(image_path).convert("RGB")
         except Exception as e:
             raise ValueError(f"Error loading image {image_path}: {e}")
 
         # Load mask (binary mask from .tif file)
         try:
-            mask = Image.open(mask_path).convert('L')
+            mask = Image.open(mask_path).convert("L")
         except Exception as e:
             raise ValueError(f"Error loading mask {mask_path}: {e}")
 
@@ -170,9 +173,12 @@ class BUID(Dataset):
 
         # --- Image tensorization and normalization ---
         image_tensor = TF.to_tensor(image)
-        if self.normalization == 'imagenet':
-            image_tensor = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])(image_tensor)  # [C, H, W]
+        if self.normalization == "imagenet":
+            image_tensor = T.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )(
+                image_tensor
+            )  # [C, H, W]
 
         # --- Mask tensor and low_res_label creation ---
         mask_np = np.array(mask)
@@ -180,13 +186,13 @@ class BUID(Dataset):
         if self.num_classes == 2:
             # 0/255 -> 0/1 float
             mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)          # [H, W], float 0/1
+            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
 
             # low-res mask
             low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
             low_res_np = np.array(low_res_mask_img)
             low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)    # [h, w], float 0/1
+            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
         else:
             # multi-class
             mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
@@ -234,6 +240,7 @@ class BUID(Dataset):
 
         return image, label
 
+
 class BUS_UCLM(Dataset):
     """
     BUS-UCLM Dataset
@@ -246,6 +253,7 @@ class BUS_UCLM(Dataset):
         Black (0, 0, 0) -> Background/Normal (class 0)
     - Split: Pre-defined train/test split in partitions folder
     """
+
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         self.cfg = cfg
         self.num_classes = cfg.num_classes
@@ -256,96 +264,130 @@ class BUS_UCLM(Dataset):
         self.image_size = (cfg.img_size, cfg.img_size)
 
         self.root = Path(cfg.path.root)
-        self.partition_dir = getattr(cfg, 'partition_dir', 'partitions')
-        self.seed = getattr(cfg, 'seed', 42)
-        self.extensions = getattr(cfg, 'extensions', ('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))
-        self.normalization = getattr(cfg, 'normalization', 'imagenet')
-        self.filter_empty_masks = getattr(cfg, 'filter_empty_masks', False) # New attribute
+        self.partition_dir = getattr(cfg, "partition_dir", "partitions")
+        self.seed = getattr(cfg, "seed", 42)
+        self.extensions = getattr(
+            cfg, "extensions", (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+        )
+        self.normalization = getattr(cfg, "normalization", "imagenet")
+        self.filter_empty_masks = getattr(
+            cfg, "filter_empty_masks", False
+        )  # New attribute
 
-        if self.cfg.usage == 'train':
+        if self.cfg.usage == "train":
             # Support both 'val' and 'valid'
-            target_split = 'val' if split in ['val', 'valid'] else split
+            target_split = "val" if split in ["val", "valid"] else split
 
-            if target_split in ['train', 'val']:
-                self.image_dir = self.root / self.partition_dir / 'train' / 'images'
-                self.mask_dir = self.root / self.partition_dir / 'train' / 'masks'
+            if target_split in ["train", "val"]:
+                self.image_dir = self.root / self.partition_dir / "train" / "images"
+                self.mask_dir = self.root / self.partition_dir / "train" / "masks"
 
                 if not self.image_dir.exists():
-                    raise ValueError(f"Image directory does not exist: {self.image_dir}")
+                    raise ValueError(
+                        f"Image directory does not exist: {self.image_dir}"
+                    )
                 if not self.mask_dir.exists():
                     raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
 
-                all_image_files, all_mask_files = self._get_paired_files(self.image_dir, self.mask_dir, self.extensions)
+                all_image_files, all_mask_files = self._get_paired_files(
+                    self.image_dir, self.mask_dir, self.extensions
+                )
 
-                if target_split == 'train':
-                    self.image_files, self.mask_files = self._split_train_val(all_image_files, all_mask_files, self.split)
+                if target_split == "train":
+                    self.image_files, self.mask_files = self._split_train_val(
+                        all_image_files, all_mask_files, self.split
+                    )
                 else:  # val
-                    self.image_files, self.mask_files = self._split_train_val(all_image_files, all_mask_files, self.split)
+                    self.image_files, self.mask_files = self._split_train_val(
+                        all_image_files, all_mask_files, self.split
+                    )
             else:  # test
-                self.image_dir = self.root / self.partition_dir / 'test' / 'images'
-                self.mask_dir = self.root / self.partition_dir / 'test' / 'masks'
+                self.image_dir = self.root / self.partition_dir / "test" / "images"
+                self.mask_dir = self.root / self.partition_dir / "test" / "masks"
 
                 if not self.image_dir.exists():
-                    raise ValueError(f"Image directory does not exist: {self.image_dir}")
+                    raise ValueError(
+                        f"Image directory does not exist: {self.image_dir}"
+                    )
                 if not self.mask_dir.exists():
                     raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
 
-                self.image_files, self.mask_files = self._get_paired_files(self.image_dir, self.mask_dir, self.extensions)
-        else: # external validation - use all data
-            self.image_dir = self.root / 'data' / 'images'
-            self.mask_dir = self.root / 'data' / 'masks'
+                self.image_files, self.mask_files = self._get_paired_files(
+                    self.image_dir, self.mask_dir, self.extensions
+                )
+        else:  # external validation - use all data
+            self.image_dir = self.root / "data" / "images"
+            self.mask_dir = self.root / "data" / "masks"
 
             if not self.image_dir.exists():
                 raise ValueError(f"Image directory does not exist: {self.image_dir}")
             if not self.mask_dir.exists():
                 raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
 
-            self.image_files, self.mask_files = self._get_paired_files(self.image_dir, self.mask_dir, self.extensions)
+            self.image_files, self.mask_files = self._get_paired_files(
+                self.image_dir, self.mask_dir, self.extensions
+            )
 
         # Apply filtering if requested (only for train split usually, but logic allows any)
-        if self.filter_empty_masks:
-             self.image_files, self.mask_files = self._filter_empty_masks(self.image_files, self.mask_files)
+        # Always store unfiltered version first
+        self.image_files_unfiltered = list(self.image_files)
+        self.mask_files_unfiltered = list(self.mask_files)
 
-    def _get_paired_files(self, image_dir: Path, mask_dir: Path, extensions: Tuple[str, ...]) -> Tuple[List[Path], List[Path]]:
+        if self.filter_empty_masks:
+            self.image_files, self.mask_files = self._filter_empty_masks(
+                self.image_files, self.mask_files
+            )
+
+    def _get_paired_files(
+        self, image_dir: Path, mask_dir: Path, extensions: Tuple[str, ...]
+    ) -> Tuple[List[Path], List[Path]]:
         pairs = []
         for ext in extensions:
             # Find all images
-            for img_path in image_dir.glob(f'*{ext}'):
+            for img_path in image_dir.glob(f"*{ext}"):
                 # Assumes mask has SAME filename as image
                 mask_path = mask_dir / img_path.name
                 if not mask_path.exists():
                     # Try uppercase extension just in case
-                    mask_path_upper = mask_dir / f"{img_path.stem}{img_path.suffix.upper()}"
+                    mask_path_upper = (
+                        mask_dir / f"{img_path.stem}{img_path.suffix.upper()}"
+                    )
                     if mask_path_upper.exists():
                         mask_path = mask_path_upper
                     else:
-                        print(f"Warning: Mask not found for {img_path.name} in {mask_dir}")
+                        print(
+                            f"Warning: Mask not found for {img_path.name} in {mask_dir}"
+                        )
                         continue
-                
+
                 pairs.append((img_path, mask_path))
-            
+
             # Also check uppercase extension for images
-            for img_path in image_dir.glob(f'*{ext.upper()}'):
-                 # Avoid duplicates if case-insensitive filesystem or extensions overlap
-                 if any(str(p[0]) == str(img_path) for p in pairs):
-                     continue
-                     
-                 mask_path = mask_dir / img_path.name
-                 if not mask_path.exists():
-                     mask_path_lower = mask_dir / f"{img_path.stem}{img_path.suffix.lower()}"
-                     if mask_path_lower.exists():
-                         mask_path = mask_path_lower
-                     else:
-                        print(f"Warning: Mask not found for {img_path.name} in {mask_dir}")
+            for img_path in image_dir.glob(f"*{ext.upper()}"):
+                # Avoid duplicates if case-insensitive filesystem or extensions overlap
+                if any(str(p[0]) == str(img_path) for p in pairs):
+                    continue
+
+                mask_path = mask_dir / img_path.name
+                if not mask_path.exists():
+                    mask_path_lower = (
+                        mask_dir / f"{img_path.stem}{img_path.suffix.lower()}"
+                    )
+                    if mask_path_lower.exists():
+                        mask_path = mask_path_lower
+                    else:
+                        print(
+                            f"Warning: Mask not found for {img_path.name} in {mask_dir}"
+                        )
                         continue
-                 pairs.append((img_path, mask_path))
+                pairs.append((img_path, mask_path))
 
         # Sort pairs by image path
         pairs.sort(key=lambda x: str(x[0]))
-        
+
         if not pairs:
             return [], []
-            
+
         images, masks = zip(*pairs)
         return list(images), list(masks)
 
@@ -358,7 +400,7 @@ class BUS_UCLM(Dataset):
             image_files, mask_files, test_size=0.2, random_state=self.seed
         )
 
-        if split_type == 'train':
+        if split_type == "train":
             return train_imgs, train_masks
         else:  # val
             return val_imgs, val_masks
@@ -368,27 +410,34 @@ class BUS_UCLM(Dataset):
         print(f"Filtering empty masks... (Total before: {len(image_files)})")
         filtered_images = []
         filtered_masks = []
-        
+
         # This might be slow if dataset is huge, but for ~600 images it's fine.
         # Use tqdm if available or just print progress
         try:
             from tqdm import tqdm
-            iterator = tqdm(zip(image_files, mask_files), total=len(image_files), desc="Filtering masks")
+
+            iterator = tqdm(
+                zip(image_files, mask_files),
+                total=len(image_files),
+                desc="Filtering masks",
+            )
         except ImportError:
             iterator = zip(image_files, mask_files)
-            
+
         for img_path, mask_path in iterator:
             try:
                 # We need to check if the mask has any non-zero values
                 # Reading as grayscale/RGB is fine as long as we detect non-black
-                mask = Image.open(mask_path).convert('L')
+                mask = Image.open(mask_path).convert("L")
                 if np.array(mask).max() > 0:
-                     filtered_images.append(img_path)
-                     filtered_masks.append(mask_path)
+                    filtered_images.append(img_path)
+                    filtered_masks.append(mask_path)
             except Exception as e:
                 print(f"Warning: Error reading mask {mask_path} during filtering: {e}")
-                
-        print(f"Filtering complete. Kept {len(filtered_images)} pairs (Removed {len(image_files) - len(filtered_images)})")
+
+        print(
+            f"Filtering complete. Kept {len(filtered_images)} pairs (Removed {len(image_files) - len(filtered_images)})"
+        )
         return filtered_images, filtered_masks
 
     def _convert_rgb_mask_to_classes(self, mask_rgb: np.ndarray) -> np.ndarray:
@@ -401,11 +450,19 @@ class BUS_UCLM(Dataset):
         mask = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
 
         # Check for malignant (red)
-        red_mask = (mask_rgb[:,:,0] == 255) & (mask_rgb[:,:,1] == 0) & (mask_rgb[:,:,2] == 0)
+        red_mask = (
+            (mask_rgb[:, :, 0] == 255)
+            & (mask_rgb[:, :, 1] == 0)
+            & (mask_rgb[:, :, 2] == 0)
+        )
         mask[red_mask] = 2
 
         # Check for benign (green)
-        green_mask = (mask_rgb[:,:,0] == 0) & (mask_rgb[:,:,1] == 255) & (mask_rgb[:,:,2] == 0)
+        green_mask = (
+            (mask_rgb[:, :, 0] == 0)
+            & (mask_rgb[:, :, 1] == 255)
+            & (mask_rgb[:, :, 2] == 0)
+        )
         mask[green_mask] = 1
 
         # Background (black) is already 0
@@ -421,13 +478,13 @@ class BUS_UCLM(Dataset):
 
         # Load image
         try:
-            image = Image.open(image_path).convert('RGB')
+            image = Image.open(image_path).convert("RGB")
         except Exception as e:
             raise ValueError(f"Error loading image {image_path}: {e}")
 
         # Load RGB mask and convert to class labels
         try:
-            mask_rgb = Image.open(mask_path).convert('RGB')
+            mask_rgb = Image.open(mask_path).convert("RGB")
             mask_rgb_array = np.array(mask_rgb)
             mask_array = self._convert_rgb_mask_to_classes(mask_rgb_array)
             mask = Image.fromarray(mask_array)
@@ -443,9 +500,12 @@ class BUS_UCLM(Dataset):
 
         # --- Image tensorization and normalization ---
         image_tensor = TF.to_tensor(image)
-        if self.normalization == 'imagenet':
-            image_tensor = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])(image_tensor)  # [C, H, W]
+        if self.normalization == "imagenet":
+            image_tensor = T.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )(
+                image_tensor
+            )  # [C, H, W]
 
         # --- Mask tensor and low_res_label creation ---
         mask_np = np.array(mask)
@@ -454,13 +514,13 @@ class BUS_UCLM(Dataset):
             # 0/1/2 -> 0/1 float (if malignant/benign are both foreground)
             # Based on UltrasoundSegmentationDataset reference: everything >0 to 1
             mask_np = (mask_np > 0).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)          # [H, W], float 0/1
+            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
 
             # low-res mask
             low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
             low_res_np = np.array(low_res_mask_img)
             low_res_np = (low_res_np > 0).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)    # [h, w], float 0/1
+            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
         else:
             # multi-class
             mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
@@ -507,6 +567,7 @@ class BUS_UCLM(Dataset):
             image = contr_tf(image)
 
         return image, label
+
 
 class BUSI(Dataset):
     """
@@ -531,12 +592,12 @@ class BUSI(Dataset):
         # BUSI-specific configuration
         self.root = Path(cfg.path.root)
         self.classes = cfg.classes
-        self.image_suffix = getattr(cfg, 'image_suffix', '')
-        self.mask_suffix = getattr(cfg, 'mask_suffix', '_mask')
-        self.extensions = getattr(cfg, 'extensions', ['.png'])
-        self.seed = getattr(cfg, 'seed', 42)
-        self.combine_multiple_masks = getattr(cfg, 'combine_multiple_masks', True)
-        self.normalization = getattr(cfg, 'normalization', 'imagenet')
+        self.image_suffix = getattr(cfg, "image_suffix", "")
+        self.mask_suffix = getattr(cfg, "mask_suffix", "_mask")
+        self.extensions = getattr(cfg, "extensions", [".png"])
+        self.seed = getattr(cfg, "seed", 42)
+        self.combine_multiple_masks = getattr(cfg, "combine_multiple_masks", True)
+        self.normalization = getattr(cfg, "normalization", "imagenet")
 
         self.image_size = (cfg.img_size, cfg.img_size)
 
@@ -547,49 +608,49 @@ class BUSI(Dataset):
         self.image_files, self.mask_files = self._split_data_by_class(
             all_image_files, all_mask_files, self.split
         )
-    
+
     def _split_data_by_class(self, image_files, mask_files, split_type):
         """클래스별로 데이터를 분할"""
         random.seed(self.seed)
-        
+
         # 클래스별로 파일들을 그룹화
         class_groups = {}
         for img_path, mask_path in zip(image_files, mask_files):
             class_name = img_path.parent.name
             if class_name not in class_groups:
-                class_groups[class_name] = {'images': [], 'masks': []}
-            class_groups[class_name]['images'].append(img_path)
-            class_groups[class_name]['masks'].append(mask_path)
-        
+                class_groups[class_name] = {"images": [], "masks": []}
+            class_groups[class_name]["images"].append(img_path)
+            class_groups[class_name]["masks"].append(mask_path)
+
         split_images, split_masks = [], []
         # Support both 'val' and 'valid'
-        target_split = 'val' if split_type in ['val', 'valid'] else split_type
-        
+        target_split = "val" if split_type in ["val", "valid"] else split_type
+
         for class_name, files in class_groups.items():
-            images = files['images']
-            masks = files['masks']
-            
+            images = files["images"]
+            masks = files["masks"]
+
             # 80% train, 20% val (Internal Validation)
             train_imgs, val_imgs, train_masks, val_masks = train_test_split(
                 images, masks, test_size=0.2, random_state=self.seed
             )
-            
-            if target_split == 'train':
+
+            if target_split == "train":
                 split_images.extend(train_imgs)
                 split_masks.extend(train_masks)
-            elif target_split == 'val':
+            elif target_split == "val":
                 split_images.extend(val_imgs)
                 split_masks.extend(val_masks)
-            elif target_split == 'test':
-                 # BUSI doesn't have a separate test set in this 80/20 split config
-                 # Returning val set as test set, or could raise error
-                 split_images.extend(val_imgs)
-                 split_masks.extend(val_masks)
-        
+            elif target_split == "test":
+                # BUSI doesn't have a separate test set in this 80/20 split config
+                # Returning val set as test set, or could raise error
+                split_images.extend(val_imgs)
+                split_masks.extend(val_masks)
+
         return sorted(split_images), sorted(split_masks)
-    
+
         return sorted(split_images), sorted(split_masks)
-    
+
     def _get_busi_files(self) -> Tuple[List[Path], List[List[Path]]]:
         """
         BUSI 데이터셋의 클래스별 디렉토리에서 이미지와 마스크 파일들을 찾아 반환
@@ -613,7 +674,7 @@ class BUSI(Dataset):
                 for file_path in class_dir.glob(pattern):
                     # 마스크 파일이 아닌 경우만 이미지로 간주
                     if self.mask_suffix not in file_path.stem:
-                        
+
                         # 대응되는 모든 마스크 파일 찾기
                         # _mask.png, _mask_1.png, _mask_2.png 등
                         base_name = file_path.stem
@@ -646,7 +707,7 @@ class BUSI(Dataset):
 
         # Sort pairs by image path
         pairs.sort(key=lambda x: str(x[0]))
-        
+
         if not pairs:
             return [], []
 
@@ -662,7 +723,7 @@ class BUSI(Dataset):
 
         # Load image
         try:
-            image = Image.open(image_path).convert('RGB')
+            image = Image.open(image_path).convert("RGB")
         except Exception as e:
             raise ValueError(f"Error loading image {image_path}: {e}")
 
@@ -671,7 +732,7 @@ class BUSI(Dataset):
             combined_mask = None
 
             for mask_path in mask_paths:
-                mask = Image.open(mask_path).convert('L')
+                mask = Image.open(mask_path).convert("L")
                 mask_array = np.array(mask, dtype=np.uint8)
 
                 if combined_mask is None:
@@ -697,22 +758,25 @@ class BUSI(Dataset):
             image, mask = self._joint_transform(image, mask)
 
         image_tensor = TF.to_tensor(image)
-        if self.normalization == 'imagenet':
-            image_tensor = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])(image_tensor)  # [C, H, W]
+        if self.normalization == "imagenet":
+            image_tensor = T.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )(
+                image_tensor
+            )  # [C, H, W]
 
         mask_np = np.array(mask)
 
         if self.num_classes == 2:
             # 0/255 -> 0/1 float
             mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)          # [H, W], float 0/1
+            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
 
             # low-res mask
             low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
             low_res_np = np.array(low_res_mask_img)
             low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)    # [h, w], float 0/1
+            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
         else:
             # multi-class
             mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
@@ -760,6 +824,7 @@ class BUSI(Dataset):
 
         return image, label
 
+
 class BUSBRA(Dataset):
     """
     BUSBRA Dataset (Breast Ultrasound Brazil)
@@ -776,8 +841,8 @@ class BUSBRA(Dataset):
         self.cfg = cfg
         self.num_classes = cfg.num_classes
         self.split = split
-        self.seed = getattr(cfg, 'seed', 42)
-        self.normalization = getattr(cfg, 'normalization', 'imagenet')
+        self.seed = getattr(cfg, "seed", 42)
+        self.normalization = getattr(cfg, "normalization", "imagenet")
         self.transform = transform
 
         # low-res label size
@@ -785,16 +850,16 @@ class BUSBRA(Dataset):
 
         # BUSBRA-specific configuration
         self.root = Path(cfg.path.root)
-        self.image_prefix = getattr(cfg, 'image_prefix', 'bus_')
-        self.mask_prefix = getattr(cfg, 'mask_prefix', 'mask_')
-        self.extensions = getattr(cfg, 'extensions', ['.png'])
+        self.image_prefix = getattr(cfg, "image_prefix", "bus_")
+        self.mask_prefix = getattr(cfg, "mask_prefix", "mask_")
+        self.extensions = getattr(cfg, "extensions", [".png"])
 
-        image_dir_name = getattr(cfg, 'image_dir', 'Images')
-        mask_dir_name = getattr(cfg, 'mask_dir', 'Masks')
+        image_dir_name = getattr(cfg, "image_dir", "Images")
+        mask_dir_name = getattr(cfg, "mask_dir", "Masks")
 
         self.image_dir = self.root / image_dir_name
         self.mask_dir = self.root / mask_dir_name
-        
+
         self.image_size = (cfg.img_size, cfg.img_size)
 
         # 1. Scan directory for all images
@@ -804,27 +869,33 @@ class BUSBRA(Dataset):
         for ext in self.extensions:
             # Find all images in sorted order first
             image_candidates = sorted(self.image_dir.glob(f"*{ext}"))
-            
+
             for img_path in image_candidates:
                 filename = img_path.stem
                 if filename.startswith(self.image_prefix):
-                    base_content = filename[len(self.image_prefix):]
+                    base_content = filename[len(self.image_prefix) :]
                     mask_filename = f"{self.mask_prefix}{base_content}{img_path.suffix}"
                     mask_path = self.mask_dir / mask_filename
-                    
+
                     if mask_path.exists():
                         pairs.append((img_path, mask_path))
                     else:
-                        print(f"Warning: Mask not found for {img_path}: expected {mask_path}")
+                        print(
+                            f"Warning: Mask not found for {img_path}: expected {mask_path}"
+                        )
                 else:
-                    print(f"Warning: Image {filename} does not start with prefix {self.image_prefix}")
-        
+                    print(
+                        f"Warning: Image {filename} does not start with prefix {self.image_prefix}"
+                    )
+
         # Sort pairs by image path
         pairs.sort(key=lambda x: str(x[0]))
-        
+
         if pairs:
             all_image_files, all_mask_files = zip(*pairs)
-            all_image_files, all_mask_files = list(all_image_files), list(all_mask_files)
+            all_image_files, all_mask_files = list(all_image_files), list(
+                all_mask_files
+            )
         else:
             all_image_files, all_mask_files = [], []
 
@@ -833,62 +904,62 @@ class BUSBRA(Dataset):
         self.image_list, self.mask_list = self._split_by_patient(
             all_image_files, all_mask_files, self.split
         )
-    
+
     def _split_by_patient(self, image_files, mask_files, split_type):
         random.seed(self.seed)
-        
+
         # Extract patient IDs
         # bus_1234-l.png -> 1234
-        patient_map = {} # patient_id -> list of indices
-        
+        patient_map = {}  # patient_id -> list of indices
+
         for idx, img_path in enumerate(image_files):
-            filename = img_path.stem # bus_1234-l
+            filename = img_path.stem  # bus_1234-l
             # Remove prefix
             if filename.startswith(self.image_prefix):
-                core_name = filename[len(self.image_prefix):] # 1234-l
+                core_name = filename[len(self.image_prefix) :]  # 1234-l
                 # Split by '-' to get ID
-                parts = core_name.split('-')
+                parts = core_name.split("-")
                 if len(parts) >= 1:
-                    patient_id = parts[0] # 1234
-                    
+                    patient_id = parts[0]  # 1234
+
                     if patient_id not in patient_map:
                         patient_map[patient_id] = []
                     patient_map[patient_id].append(idx)
-        
+
         patient_ids = sorted(list(patient_map.keys()))
-        
+
         # Split patients 80/20
         train_pids, val_pids = train_test_split(
             patient_ids, test_size=0.2, random_state=self.seed
         )
-        
+
         # Support both 'val' and 'valid'
-        target_split = 'val' if split_type in ['val', 'valid'] else split_type
-        
+        target_split = "val" if split_type in ["val", "valid"] else split_type
+
         selected_indices = []
-        if target_split == 'train':
+        if target_split == "train":
             for pid in train_pids:
                 selected_indices.extend(patient_map[pid])
-        elif target_split in ['val', 'test']: 
+        elif target_split in ["val", "test"]:
             # Use val set for test as well since we only have 80/20 split
             for pid in val_pids:
                 selected_indices.extend(patient_map[pid])
-        
+
         final_images = [str(image_files[i]) for i in sorted(selected_indices)]
         final_masks = [str(mask_files[i]) for i in sorted(selected_indices)]
-        
+
         return final_images, final_masks
 
     def __len__(self):
         return len(self.image_list)
-    
+
     def __getitem__(self, index):
         img_path = self.image_list[index]
         mask_path = self.mask_list[index]
 
-        image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')  # Grayscale mask
-        
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")  # Grayscale mask
+
         image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
         mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
 
@@ -896,21 +967,24 @@ class BUSBRA(Dataset):
             image, mask = self._joint_transform(image, mask)
 
         image_tensor = TF.to_tensor(image)
-        if self.normalization == 'imagenet':
-            image_tensor = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])(image_tensor)  # [C, H, W]
+        if self.normalization == "imagenet":
+            image_tensor = T.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )(
+                image_tensor
+            )  # [C, H, W]
         mask_np = np.array(mask)
 
         if self.num_classes == 2:
             # 0/255 -> 0/1 float
             mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)          # [H, W], float 0/1
+            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
 
             # low-res mask
             low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
             low_res_np = np.array(low_res_mask_img)
             low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)    # [h, w], float 0/1
+            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
         else:
             # multi-class
             mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
@@ -920,7 +994,7 @@ class BUSBRA(Dataset):
             low_res_tensor = torch.from_numpy(low_res_np).long()
 
         return image_tensor, mask_tensor, low_res_tensor
-    
+
     def _joint_transform(self, image, label):
         if self.task_type == "tumor":
             if random.random() > 0.5:
@@ -935,14 +1009,14 @@ class BUSBRA(Dataset):
             angle = random.uniform(-30, 30)
             image = TF.rotate(image, angle)
             label = TF.rotate(label, angle)
-        
+
         if random.random() > 0.5:
             g = np.random.randint(10, 25) / 10.0
             image_np = np.array(image)
             image_np = (np.power(image_np / 255, 1.0 / g)) * 255
             image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)  
-        
+            image = Image.fromarray(image_np)
+
         if random.random() > 0.5:
             scale = np.random.uniform(1, 1.3)
             h, w = self.image_size
@@ -958,27 +1032,40 @@ class BUSBRA(Dataset):
             image = contr_tf(image)
 
         return image, label
-    
+
+
 class BUSBRA_SegFormer(BUSBRA):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
-        self.image_processor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b2-finetuned-ade-512-512")
-        
+        self.image_processor = SegformerImageProcessor.from_pretrained(
+            "nvidia/segformer-b2-finetuned-ade-512-512"
+        )
+
     def __getitem__(self, index):
         img_path = self.image_list[index]
         mask_path = self.mask_list[index]
 
-        image = np.array(Image.open(img_path).convert('RGB'))
-        mask = np.array(Image.open(mask_path).convert('L'))
-        inputs = self.image_processor(images=image, segmentation_maps=mask, return_tensors="np")
+        image = np.array(Image.open(img_path).convert("RGB"))
+        mask = np.array(Image.open(mask_path).convert("L"))
+        inputs = self.image_processor(
+            images=image, segmentation_maps=mask, return_tensors="np"
+        )
         for k in inputs:
             inputs[k] = inputs[k].squeeze(0)
-        
+
         return inputs["pixel_values"], inputs["labels"]
-        
+
 
 class UltrasoundSegmentationDataset(Dataset):
-    def __init__(self, image_dir: str, label_dir: str, num_classes: int, transform: Optional[bool] = False, image_size: Tuple[int, int] = (512, 512), task_type: str = "tumor"):
+    def __init__(
+        self,
+        image_dir: str,
+        label_dir: str,
+        num_classes: int,
+        transform: Optional[bool] = False,
+        image_size: Tuple[int, int] = (512, 512),
+        task_type: str = "tumor",
+    ):
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
         self.transform = transform
@@ -986,13 +1073,17 @@ class UltrasoundSegmentationDataset(Dataset):
         self.num_classes = num_classes
         self.task_type = task_type
 
-        self.image_files = sorted([
-            f.name for f in self.image_dir.iterdir()
-            if f.suffix.lower() in ('.png', '.jpg', '.jpeg')
-        ])
+        self.image_files = sorted(
+            [
+                f.name
+                for f in self.image_dir.iterdir()
+                if f.suffix.lower() in (".png", ".jpg", ".jpeg")
+            ]
+        )
 
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+        self.normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
 
         assert len(self.image_files) > 0, "No image files found"
 
@@ -1003,8 +1094,8 @@ class UltrasoundSegmentationDataset(Dataset):
         img_path = self.image_dir / self.image_files[idx]
         label_path = self.label_dir / self.image_files[idx]
 
-        image = Image.open(img_path).convert('RGB')
-        label = Image.open(label_path).convert('L') 
+        image = Image.open(img_path).convert("RGB")
+        label = Image.open(label_path).convert("L")
 
         image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
         label = TF.resize(label, self.image_size, interpolation=Image.NEAREST)
@@ -1014,10 +1105,10 @@ class UltrasoundSegmentationDataset(Dataset):
 
         image = TF.to_tensor(image)
         image = self.normalize(image)  # [C, H, W]
-        
+
         if self.num_classes == 2:
-            label = torch.from_numpy(np.array(label)).float() / 255.0  
-            label = (label > 0.5).float()  
+            label = torch.from_numpy(np.array(label)).float() / 255.0
+            label = (label > 0.5).float()
         else:
             label = torch.from_numpy(np.array(label)).long()
         return image, label
@@ -1036,14 +1127,14 @@ class UltrasoundSegmentationDataset(Dataset):
             angle = random.uniform(-30, 30)
             image = TF.rotate(image, angle)
             label = TF.rotate(label, angle)
-        
+
         if random.random() > 0.5:
             g = np.random.randint(10, 25) / 10.0
             image_np = np.array(image)
             image_np = (np.power(image_np / 255, 1.0 / g)) * 255
             image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)  
-        
+            image = Image.fromarray(image_np)
+
         if random.random() > 0.5:
             scale = np.random.uniform(1, 1.3)
             h, w = self.image_size
@@ -1060,6 +1151,7 @@ class UltrasoundSegmentationDataset(Dataset):
 
         return image, label
 
+
 class B(Dataset):
     """
     Dataset B
@@ -1070,6 +1162,7 @@ class B(Dataset):
         GT/ (Masks)
     - Random split: 80% train, 20% val
     """
+
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         self.cfg = cfg
         self.num_classes = cfg.num_classes
@@ -1080,14 +1173,14 @@ class B(Dataset):
         self.image_size = (cfg.img_size, cfg.img_size)
 
         self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, 'seed', 42)
-        self.normalization = getattr(cfg, 'normalization', 'imagenet')
-        self.extensions = getattr(cfg, 'extensions', ['.png'])
+        self.seed = getattr(cfg, "seed", 42)
+        self.normalization = getattr(cfg, "normalization", "imagenet")
+        self.extensions = getattr(cfg, "extensions", [".png"])
 
         # Directory structure from yaml or default
-        self.image_dir_name = getattr(cfg, 'image_dir', 'original')
-        self.mask_dir_name = getattr(cfg, 'mask_dir', 'GT')
-        
+        self.image_dir_name = getattr(cfg, "image_dir", "original")
+        self.mask_dir_name = getattr(cfg, "mask_dir", "GT")
+
         self.image_dir = self.root / self.image_dir_name
         self.mask_dir = self.root / self.mask_dir_name
 
@@ -1098,7 +1191,7 @@ class B(Dataset):
 
         # Collect paired files
         images, masks = self._collect_paired_files()
-        
+
         # Split dataset
         self.images, self.masks = self._split_dataset(images, masks)
 
@@ -1109,7 +1202,7 @@ class B(Dataset):
             for img_path in self.image_dir.glob(f"*{ext}"):
                 # Assumes mask has SAME filename as image
                 mask_path = self.mask_dir / img_path.name
-                
+
                 if mask_path.exists():
                     pairs.append((img_path, mask_path))
                 else:
@@ -1118,28 +1211,28 @@ class B(Dataset):
 
         # Sort for deterministic split
         pairs.sort(key=lambda x: str(x[0]))
-        
+
         if not pairs:
             return [], []
-            
+
         images, masks = zip(*pairs)
         return list(images), list(masks)
 
     def _split_dataset(self, images, masks):
         if not images:
             return [], []
-            
+
         # 80% train, 20% val
         train_imgs, val_imgs, train_masks, val_masks = train_test_split(
             images, masks, test_size=0.2, random_state=self.seed
         )
 
         # Support both 'val' and 'valid'
-        target_split = 'val' if self.split in ['val', 'valid'] else self.split
+        target_split = "val" if self.split in ["val", "valid"] else self.split
 
-        if target_split == 'train':
+        if target_split == "train":
             return train_imgs, train_masks
-        elif target_split == 'val':
+        elif target_split == "val":
             return val_imgs, val_masks
         else:
             return val_imgs, val_masks
@@ -1153,13 +1246,13 @@ class B(Dataset):
 
         # Load image
         try:
-            image = Image.open(image_path).convert('RGB')
+            image = Image.open(image_path).convert("RGB")
         except Exception as e:
             raise ValueError(f"Error loading image {image_path}: {e}")
 
         # Load mask
         try:
-            mask = Image.open(mask_path).convert('L')
+            mask = Image.open(mask_path).convert("L")
         except Exception as e:
             raise ValueError(f"Error loading mask {mask_path}: {e}")
 
@@ -1173,9 +1266,10 @@ class B(Dataset):
 
         # Tensorize and Normalize Image
         image_tensor = TF.to_tensor(image)
-        if self.normalization == 'imagenet':
-            image_tensor = T.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])(image_tensor)
+        if self.normalization == "imagenet":
+            image_tensor = T.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            )(image_tensor)
 
         # Format Mask
         mask_np = np.array(mask)
@@ -1188,7 +1282,7 @@ class B(Dataset):
             low_res_np = (low_res_np > 127).astype(np.float32)
             low_res_tensor = torch.from_numpy(low_res_np)
         else:
-             # multi-class assumption: pixel values are classes
+            # multi-class assumption: pixel values are classes
             mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
 
             low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
@@ -1233,73 +1327,116 @@ class B(Dataset):
             image = contr_tf(image)
 
         return image, label
+
+
 class SegDatasetProcessor:
     @staticmethod
     def build_dataset(cfg):
-        # Case 1: Combined Dataset (Multi-dataset training)
-        if hasattr(cfg.data, 'type') and cfg.data.type == 'Combined':
+        # Case 1: Dynamic/Combined Dataset (Multi-dataset support)
+        # Check if train/test are lists rather than just looking at type
+        is_list_train = hasattr(cfg.data, "train") and isinstance(
+            cfg.data.train, (list, ListConfig)
+        )
+        is_combined_type = hasattr(cfg.data, "type") and cfg.data.type in [
+            "Combined",
+            "Dynamic",
+        ]
+
+        if is_list_train or is_combined_type:
             from pathlib import Path
+
             # Helper to load dataset config and instantiate
             def load_single_dataset(name, split):
-                # Load dataset-specific config
-                # Assuming configs are in config/data/{name}.yaml
-                # We need to find where the original config was loaded from or assume structure
-                # Since we are inside generic python code, we might not know the exact path easily
-                # BUT, typically Hydra composes it. Here we might need to load manually if not provided.
-                
-                # However, usually 'cfg' passed here is the full config.
-                # If cfg.data.type is Combined, then cfg.data.train is a list of names.
-                # We need to load their configs.
-                
                 config_path = Path(f"config/data/{name}.yaml")
                 if not config_path.exists():
                     raise ValueError(f"Config for {name} not found at {config_path}")
-                
+
                 data_cfg = OmegaConf.load(config_path)
-                
-                # Override specific global settings if needed (like img_size)
-                if hasattr(cfg.data, 'img_size'):
+
+                # Override specific global settings if needed
+                if hasattr(cfg.data, "img_size"):
                     data_cfg.img_size = cfg.data.img_size
-                if hasattr(cfg.data, 'num_classes'):
+                if hasattr(cfg.data, "num_classes"):
                     data_cfg.num_classes = cfg.data.num_classes
-                    
+                if hasattr(cfg.data, "normalization"):
+                    data_cfg.normalization = cfg.data.normalization
+
+                # Test datasets should use full data (external validation)
+                if split == "test":
+                    data_cfg.usage = "external"
+
                 dataset_class = eval(data_cfg.name)
                 return dataset_class(data_cfg, split=split)
 
             # 1. Train Sets
             train_datasets = []
-            for name in cfg.data.train:
+            train_list = cfg.data.train if is_list_train else []
+            for name in train_list:
                 print(f"Loading Train dataset: {name}")
-                train_datasets.append(load_single_dataset(name, split='train'))
+                train_datasets.append(load_single_dataset(name, split="train"))
+
+            if not train_datasets:
+                raise ValueError("No training datasets specified in config.")
             train_dataset = ConcatDataset(train_datasets)
 
             # 2. Validation Sets (Internal)
             val_datasets = []
-            for name in cfg.data.val:
+            val_list = getattr(cfg.data, "val", None)
+            if (
+                val_list is None
+                or not isinstance(val_list, (list, ListConfig))
+                or len(val_list) == 0
+            ):
+                # Default to same as train if not specified
+                val_list = train_list
+
+            for name in val_list:
                 print(f"Loading Val dataset: {name}")
-                val_datasets.append(load_single_dataset(name, split='val'))
+                val_datasets.append(load_single_dataset(name, split="val"))
             val_dataset = ConcatDataset(val_datasets)
 
             # 3. Test Sets (External Validation) - Keep Separate
+            # If filter_empty_masks is enabled, store both filtered and unfiltered versions
             test_datasets = {}
-            for name in cfg.data.test:
+            test_list = getattr(cfg.data, "test", [])
+            def add_test_dataset_with_unfiltered(name):
+                """Load test dataset and add unfiltered version if filter_empty_masks is enabled."""
                 print(f"Loading Test dataset: {name}")
-                test_datasets[name] = load_single_dataset(name, split='test')
-            
+                ds = load_single_dataset(name, split="test")
+                test_datasets[name] = ds
+                # If dataset has filter_empty_masks enabled, also add unfiltered version
+                if hasattr(ds, "filter_empty_masks") and ds.filter_empty_masks:
+                    # Use copy to avoid reloading and re-filtering
+                    import copy
+                    ds_unfiltered = copy.copy(ds)
+                    # Restore original unfiltered file lists
+                    ds_unfiltered.image_files = list(ds.image_files_unfiltered)
+                    ds_unfiltered.mask_files = list(ds.mask_files_unfiltered)
+                    test_datasets[f"{name}_unfiltered"] = ds_unfiltered
+                    print(f"  -> Also added {name}_unfiltered (original: {len(ds_unfiltered)} samples)")
+
+            if isinstance(test_list, (list, ListConfig)):
+                for name in test_list:
+                    add_test_dataset_with_unfiltered(name)
+            elif isinstance(test_list, str):
+                add_test_dataset_with_unfiltered(test_list)
+
             return train_dataset, val_dataset, test_datasets
 
         # Case 2: Single Dataset (Legacy/Simple)
         else:
             dataset_class = eval(cfg.data.name)
             print(f"{dataset_class} is used for segmentation task.")
-            train_dataset = dataset_class(cfg.data, split='train')
-            val_dataset = dataset_class(cfg.data, split='valid')
-            test_dataset = dataset_class(cfg.data, split='test')
+            train_dataset = dataset_class(cfg.data, split="train")
+            val_dataset = dataset_class(cfg.data, split="valid")
+            test_dataset = dataset_class(cfg.data, split="test")
             return train_dataset, val_dataset, test_dataset
-    
+
     @staticmethod
     def build_data_loaders(cfg):
-        train_dataset, val_dataset, test_dataset = SegDatasetProcessor.build_dataset(cfg)
+        train_dataset, val_dataset, test_dataset = SegDatasetProcessor.build_dataset(
+            cfg
+        )
 
         def worker_init_fn(worker_id):
             seed = 42 + worker_id
@@ -1313,7 +1450,7 @@ class SegDatasetProcessor:
             shuffle=True,
             num_workers=cfg.training.num_workers,
             pin_memory=True,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
         )
 
         val_loader = DataLoader(
@@ -1321,7 +1458,7 @@ class SegDatasetProcessor:
             batch_size=cfg.training.batch_size,
             shuffle=False,
             num_workers=cfg.training.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
         # Handle Test Loader (Single vs Multiple)
@@ -1334,22 +1471,27 @@ class SegDatasetProcessor:
                     batch_size=cfg.training.batch_size,
                     shuffle=False,
                     num_workers=cfg.training.num_workers,
-                    pin_memory=True
+                    pin_memory=True,
                 )
                 test_loader[name] = loader
                 total_test_samples += len(ds)
-            print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples (Total): {total_test_samples}")
+            print(
+                f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples (Total): {total_test_samples}"
+            )
         else:
             test_loader = DataLoader(
                 test_dataset,
                 batch_size=cfg.training.batch_size,
                 shuffle=False,
                 num_workers=cfg.training.num_workers,
-                pin_memory=True
+                pin_memory=True,
             )
-            print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
+            print(
+                f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}"
+            )
 
         return train_loader, val_loader, test_loader
+
 
 class DataProcessor:
     @staticmethod
@@ -1363,28 +1505,28 @@ class DataProcessor:
         data_dir = Path(args.data_dir)
 
         train_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / 'train' / 'img'),
-            str(data_dir / 'train' / 'label'),
+            str(data_dir / "train" / "img"),
+            str(data_dir / "train" / "label"),
             args.num_classes,
             transform=True,
             image_size=(args.img_size, args.img_size),
-            task_type = args.task_type
+            task_type=args.task_type,
         )
 
         val_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / 'val' / 'img'),
-            str(data_dir / 'val' / 'label'),
+            str(data_dir / "val" / "img"),
+            str(data_dir / "val" / "label"),
             args.num_classes,
             transform=False,
-            image_size=(args.img_size, args.img_size)
+            image_size=(args.img_size, args.img_size),
         )
 
         test_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / 'test' / 'img'),
-            str(data_dir / 'test' / 'label'),
+            str(data_dir / "test" / "img"),
+            str(data_dir / "test" / "label"),
             args.num_classes,
             transform=False,
-            image_size=(args.img_size, args.img_size)
+            image_size=(args.img_size, args.img_size),
         )
 
         train_loader = DataLoader(
@@ -1393,7 +1535,7 @@ class DataProcessor:
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=True,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
         )
 
         val_loader = DataLoader(
@@ -1401,7 +1543,7 @@ class DataProcessor:
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
         test_loader = DataLoader(
@@ -1409,7 +1551,7 @@ class DataProcessor:
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
         return train_loader, val_loader, test_loader

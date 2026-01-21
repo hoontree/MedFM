@@ -1,0 +1,34 @@
+name: "BUS_UCLM"
+type: "SegBase"
+path:
+  root: "/home/hheo/data/Ultrasound/seg/breast/BUS-UCLM"
+  split:
+    train: "train"
+    val: "valid"
+    test: "test"
+    vis:
+      samples: 16
+      interval: 10
+num_classes: 2
+img_size: 224
+extensions: [".png"]
+partition_dir: "partitions"  # train/test split directory
+seed: 42
+usage: train # train or external
+filter_empty_masks: true # Filter out images with empty masks (Normal cases) to balance training
+normalization: "min_max" # Options: "imagenet", "min_max"
+
+# Color to class mapping
+# Red (255, 0, 0) -> Malignant (1)
+# Green (0, 255, 0) -> Benign (2)
+# Black (0, 0, 0) -> Background/Normal (0)
+class_colors:
+  malignant: [255, 0, 0]
+  benign: [0, 255, 0]
+  background: [0, 0, 0]
+
+# Dataset info
+total_images: 683
+patients: 38
+# Normal: 419, Benign: 174, Malignant: 90
+# Image size: 768x1024 -> resized to 512x512

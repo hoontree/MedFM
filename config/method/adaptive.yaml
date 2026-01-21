@@ -1,0 +1,20 @@
+name: adaptive_layer
+temperature: 4.0
+alpha: 0.3
+beta: 0.3
+gamma: 0.4
+adaptive_weights: true
+layer_mapping:
+  student.backbone.blocks.2: sam.image_encoder.blocks.2
+  student.backbone.blocks.5: sam.image_encoder.blocks.5
+  student.backbone.blocks.8: sam.image_encoder.blocks.8
+  student.backbone.blocks.11: sam.image_encoder.blocks.11
+layer_channels:
+  student.backbone.blocks.2: 192
+  student.backbone.blocks.5: 192
+  student.backbone.blocks.8: 192
+  student.backbone.blocks.11: 192
+  sam.image_encoder.blocks.2: 256
+  sam.image_encoder.blocks.5: 256
+  sam.image_encoder.blocks.8: 256
+  sam.image_encoder.blocks.11: 256

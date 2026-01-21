@@ -1,0 +1,9 @@
+name: BUSI+BUSBRA
+type: Combined
+train: [BUSI, BUSBRA]
+val: [BUSI, BUSBRA]
+test: [BUID, BUS_UCLM]
+
+num_classes: 2
+img_size: 224  # Default size, can be overridden by model config
+normalization: "imagenet" # Options: "imagenet", "min_max"

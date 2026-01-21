@@ -1,0 +1,61 @@
+# @package _global_
+
+multimask_output: false
+
+# Training configuration
+training:
+  num_epochs: 1000
+  lr: 0.0001
+  warmup_epochs: 2
+  batch_size: 4
+  num_workers: 4
+  limit_train_batches: null
+  dice_weight: 0.8
+  # Compatibility aliases for trainers that expect legacy keys
+  max_epochs: ${training.num_epochs}
+  base_lr: ${training.lr}
+  dice_param: ${training.dice_weight}
+  # Iter-based warmup used by some trainers (kept in sync with scheduler.warmup_iters)
+  warmup: true
+  warmup_period: ${scheduler.warmup_iters}
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.0001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW
+  weight_decay: 0.01
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+  # Compatibility alias
+  grad_clip: ${optimizer.gradient_clip}
+
+# Scheduler configuration
+scheduler:
+  use_reduce_on_plateau: false
+  warmup_iters: 200
+  total_iters: 5000
+  power: 0.9
+  min_lr: 1e-6
+
+# Hardware configuration
+hardware:
+  gpu_ids: [0]
+  seed: 42
+
+# Output configuration
+output:
+  dir: logs
+
+# Visualization
+visualization:
+  num_samples: 10
+
+# Wandb configuration
+wandb:
+  project: medical_foundation_models
+  entity: hheo
+  log_model: true

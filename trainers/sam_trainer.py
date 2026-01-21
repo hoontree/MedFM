@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.nn.modules.loss import CrossEntropyLoss
 from tqdm import tqdm
 from importlib import import_module
+import wandb
 
 from .base_trainer import BaseTrainer
 from model.segment_anything import sam_model_registry
@@ -34,40 +35,111 @@ class SAMTrainer(BaseTrainer):
         self.multimask_output = False
         self.img_size = cfg.model.img_size
 
+    def _get_config_value(self, section: str, keys: list, default, cast_type=float):
+        """Get config value with multiple key fallbacks."""
+        cfg_section = self.cfg.get(section, {})
+        for key in keys:
+            if (value := cfg_section.get(key)) is not None:
+                return cast_type(value)
+        return default
+
+    def _get_num_epochs(self) -> int:
+        """Get number of training epochs."""
+        return self._get_config_value('training', ['num_epochs', 'max_epochs'], 100, int)
+
+    def _get_base_lr(self) -> float:
+        """Get base learning rate."""
+        return self._get_config_value('training', ['base_lr', 'lr'], 1e-4, float)
+
+    def _get_dice_weight(self) -> float:
+        """Get dice loss weight."""
+        return self._get_config_value('training', ['dice_param', 'dice_weight'], 0.8, float)
+
+    def _get_grad_clip_config(self) -> Dict:
+        # Support both optimizer.grad_clip (legacy) and optimizer.gradient_clip (new)
+        opt_cfg = self.cfg.get('optimizer', {})
+        return opt_cfg.get('grad_clip', opt_cfg.get('gradient_clip', {}))
+
+    def _get_n_gpus(self) -> int:
+        """Get number of GPUs from config."""
+        hw = self.cfg.get('hardware', {})
+        # Try direct keys first
+        for key in ['n_gpu', 'n_gpus']:
+            if (value := hw.get(key)) is not None:
+                return int(value)
+        # Try gpu_ids list
+        if (gpu_ids := hw.get('gpu_ids')) and isinstance(gpu_ids, (list, tuple)):
+            return len(gpu_ids)
+        return 1
+
+    def _get_warmup_config(self) -> Dict[str, int | bool]:
+        """Get warmup configuration with clear priority order."""
+        training = self.cfg.get('training', {})
+        scheduler = self.cfg.get('scheduler', {})
+        
+        # Priority 1: warmup_epochs (most specific)
+        if (warmup_epochs := training.get('warmup_epochs')) and int(warmup_epochs) > 0:
+            return {"enabled": True, "steps": int(warmup_epochs) * len(self.train_loader)}
+        
+        # Priority 2: warmup_period or warmup_iters
+        warmup_steps = training.get('warmup_period') or scheduler.get('warmup_iters')
+        if warmup_steps and int(warmup_steps) > 0:
+            return {"enabled": True, "steps": int(warmup_steps)}
+        
+        # Priority 3: warmup flag only (no steps configured)
+        if training.get('warmup', False):
+            self.logger.warning("Warmup enabled but no steps configured. Disabling warmup.")
+        
+        return {"enabled": False, "steps": 0}
+
     def _create_model(self):
-        """Create SAM model with LoRA."""
+        """Create SAM model with LoRA or hybrid adapter."""
+        # Get SAM type (vit_b, vit_l, vit_h)
+        sam_type = self.cfg.model.get('sam_type', 'vit_b')
+        if sam_type not in sam_model_registry:
+            # Fallback: check if model name itself is a valid sam type
+            if self.cfg.model.name in sam_model_registry:
+                sam_type = self.cfg.model.name
+            else:
+                sam_type = 'vit_b'
+
+        # Get checkpoint path
+        checkpoint = self.cfg.model.get('sam_checkpoint', self.cfg.model.get('ckpt'))
+
         # Register SAM model
-        sam, img_embedding_size = sam_model_registry[self.cfg.model.name](
+        sam, _ = sam_model_registry[sam_type](
             image_size=self.cfg.model.img_size,
             num_classes=self.cfg.data.num_classes,
-            checkpoint=self.cfg.model.ckpt,
+            checkpoint=checkpoint,
             pixel_mean=[0, 0, 0],
             pixel_std=[1, 1, 1],
         )
 
-        # Load LoRA module
-        pkg = import_module(self.cfg.model.module)
-        self.model = pkg.LoRA_Sam(sam, self.cfg.model.rank).cuda()
+        # Load LoRA/Adapter module
+        module_path = self.cfg.model.get('module', 'model.sam_lora_image_encoder_mask_decoder')
+        pkg = import_module(module_path)
 
-        # Load LoRA checkpoint if provided
-        if self.cfg.model.get('lora_ckpt') is not None:
-            self.model.load_lora_parameters(self.cfg.model.lora_ckpt)
-            self.logger.info(f"Loaded LoRA checkpoint: {self.cfg.model.lora_ckpt}")
+        # Build kwargs for LoRA_Sam (supports both old and new config styles)
+        model_kwargs = {}
+        if self.cfg.model.get('adaptation_mode'):
+            model_kwargs['adaptation_mode'] = self.cfg.model.adaptation_mode
+
+        self.model = pkg.LoRA_Sam(sam, self.cfg.model.get('rank', 4), **model_kwargs).to(self.device)
+
+        # Load LoRA checkpoint if provided (support both config key names)
+        lora_ckpt = self.cfg.model.get('lora_checkpoint', self.cfg.model.get('lora_ckpt'))
+        if lora_ckpt is not None:
+            self.model.load_lora_parameters(lora_ckpt)
+            self.logger.info(f"Loaded LoRA checkpoint: {lora_ckpt}")
 
         # Setup DataParallel
-        if self.cfg.hardware.get('n_gpu', 1) > 1:
+        if self._get_n_gpus() > 1:
             self.model = nn.DataParallel(self.model)
-
-        # Setup losses
-        self.ce_loss = CrossEntropyLoss()
-
-        pos_weight = torch.tensor([5.0], device='cuda')
-        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        self.dice_loss = DiceLoss(self.cfg.data.num_classes)
+            
+        self._setup_loss_functions()
 
         # Set multimask output
-        self.multimask_output = self.cfg.data.num_classes > 2
+        self.multimask_output = self.cfg.get('multimask_output', False)
 
         # Log model info
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -80,76 +152,96 @@ class SAMTrainer(BaseTrainer):
         self.train_loader, self.val_loader, self.test_loader = SegDatasetProcessor.build_data_loaders(self.cfg)
         self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
         self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
+        
+        # Log test set sizes
         if isinstance(self.test_loader, dict):
             total_test = sum(len(loader.dataset) for loader in self.test_loader.values())
             self.logger.info(f"Test set size (Total): {total_test}")
-            for name, loader in self.test_loader.items():
-                self.logger.info(f"  - {name}: {len(loader.dataset)}")
-        else:
-            self.logger.info(f"Test set size: {len(self.test_loader.dataset)}")
+        for name, loader in self._iter_test_loaders():
+            prefix = "  - " if isinstance(self.test_loader, dict) else ""
+            self.logger.info(f"{prefix}{name}: {len(loader.dataset)}")
 
     def _create_optimizer(self):
         """Create optimizer."""
-        base_lr = self.cfg.training.base_lr
-        warmup = self.cfg.training.get('warmup', False)
-        warmup_period = self.cfg.training.get('warmup_period', 250)
-
-        # Adjust learning rate for warmup
-        b_lr = base_lr / warmup_period if warmup else base_lr
+        base_lr = self._get_base_lr()
 
         optimizer_name = self.cfg.optimizer.get('name', 'SGD')
 
         if optimizer_name == "AdamW":
             self.optimizer = optim.AdamW(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=b_lr,
+                lr=base_lr,
                 betas=(0.9, 0.999),
                 weight_decay=self.cfg.optimizer.get('weight_decay', 0.1)
             )
         else:
             self.optimizer = optim.SGD(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=b_lr,
+                lr=base_lr,
                 momentum=0.9,
                 weight_decay=0.0001
             )
 
-        self.logger.info(f"Optimizer: {optimizer_name}, Initial LR: {b_lr}")
+        self.logger.info(f"Optimizer: {optimizer_name}, Base LR: {base_lr}")
 
     def _create_scheduler(self):
-        """Create learning rate scheduler (using manual update in train_epoch)."""
-        # SAM uses custom polynomial decay scheduler updated in train_epoch
-        pass
+        """Create learning rate scheduler with warmup and polynomial decay."""
+        warmup_cfg = self._get_warmup_config()
+        warmup_steps = warmup_cfg['steps']
+        warmup_enabled = warmup_cfg['enabled']
 
-    def _update_learning_rate(self, iter_num: int):
-        """Update learning rate with warmup and polynomial decay."""
-        base_lr = self.cfg.training.base_lr
-        warmup = self.cfg.training.get('warmup', False)
-        warmup_period = self.cfg.training.get('warmup_period', 250)
-        max_iterations = self.cfg.training.max_epochs * len(self.train_loader)
+        max_epochs = self._get_num_epochs()
+        total_iters = max_epochs * len(self.train_loader)
+        power = float(self.cfg.get('scheduler', {}).get('power', 0.9))
 
-        if warmup and iter_num < warmup_period:
-            # Warmup phase
-            lr = base_lr * ((iter_num + 1) / warmup_period)
-        else:
+        # Minimum learning rate ratio (prevents LR from reaching 0)
+        base_lr = self._get_base_lr()
+        min_lr = float(self.cfg.get('scheduler', {}).get('min_lr', 1e-6))
+        min_lr_ratio = min_lr / base_lr
+
+        def lr_lambda(current_step: int) -> float:
+            """Calculate learning rate multiplier for given step."""
+            # Warmup phase: linear increase
+            if warmup_enabled and warmup_steps > 0 and current_step < warmup_steps:
+                return (current_step + 1) / warmup_steps
+
             # Polynomial decay phase
-            if warmup:
-                shift_iter = iter_num - warmup_period
-                shift_iter = max(0, shift_iter)
-            else:
-                shift_iter = iter_num
+            shift_iter = current_step - warmup_steps if (warmup_enabled and warmup_steps > 0) else current_step
+            shift_iter = min(max(0, shift_iter), total_iters)  # Clamp to valid range
+            decay = (1.0 - shift_iter / total_iters) ** power
+            return max(min_lr_ratio, decay)
 
-            current_iter = min(shift_iter, max_iterations)
-            lr = base_lr * (1.0 - current_iter / max_iterations) ** 0.9
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        self.logger.info(f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, max_iterations={total_iters}, power={power}, min_lr={min_lr}")
+    def _get_current_lr(self) -> float:
+        """Get current learning rate from optimizer."""
+        return self.optimizer.param_groups[0]['lr']
 
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+    def _get_base_model(self):
+        """Get base model (handle DataParallel wrapper)."""
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-        return lr
+    def _iter_test_loaders(self):
+        """Iterate over test loaders with names."""
+        if isinstance(self.test_loader, dict):
+            for name, loader in self.test_loader.items():
+                yield name, loader
+        else:
+            yield "test", self.test_loader
+            
+    def _setup_loss_functions(self):
+        """Setup loss functions based on number of classes."""
+        # Setup loss functions
+        self.ce_loss = CrossEntropyLoss()
+
+        pos_weight = torch.tensor([5.0], device=self.device)
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        self.dice_loss = DiceLoss(self.cfg.data.num_classes)
 
     def _calc_loss(self, outputs, label_batch, low_res_label_batch):
         """Calculate loss based on number of classes."""
-        dice_weight = self.cfg.training.get('dice_param', 0.8)
+        dice_weight = self._get_dice_weight()
 
         if self.cfg.data.num_classes == 2:
             # Binary segmentation
@@ -182,15 +274,15 @@ class SAMTrainer(BaseTrainer):
         total_ce_loss = 0.0
         total_dice_loss = 0.0
 
-        train_pbar = tqdm(self.train_loader, desc=f'Epoch {epoch + 1}/{self.cfg.training.max_epochs}')
+        train_pbar = tqdm(self.train_loader, desc=f'Epoch {epoch + 1}/{self._get_num_epochs()}')
 
-        for batch_idx, (image_batch, label_batch, low_res_label_batch) in enumerate(train_pbar):
-            image_batch = image_batch.cuda()
-            label_batch = label_batch.cuda()
-            low_res_label_batch = low_res_label_batch.cuda()
+        for image_batch, label_batch, low_res_label_batch in train_pbar:
+            image_batch = image_batch.to(self.device)
+            label_batch = label_batch.to(self.device)
+            low_res_label_batch = low_res_label_batch.to(self.device)
 
             # Forward pass
-            outputs = self.model(image_batch, False, self.img_size)
+            outputs = self.model(image_batch, self.multimask_output, self.img_size)
 
             # Calculate loss
             loss, loss_ce, loss_dice = self._calc_loss(outputs, label_batch, low_res_label_batch)
@@ -198,17 +290,18 @@ class SAMTrainer(BaseTrainer):
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-
+            
             # Gradient clipping
-            grad_clip_config = self.cfg.get('optimizer', {}).get('grad_clip', {})
+            grad_clip_config = self._get_grad_clip_config()
             if grad_clip_config.get('enabled', False):
                 max_norm = grad_clip_config.get('max_norm', 1.0)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
 
             self.optimizer.step()
+            self.scheduler.step()
 
-            # Update learning rate
-            lr = self._update_learning_rate(self.global_step)
+            # Get current learning rate
+            lr = self._get_current_lr()
 
             # Update metrics
             total_loss += loss.item()
@@ -221,21 +314,15 @@ class SAMTrainer(BaseTrainer):
                 'lr': f'{lr:.6f}'
             })
 
-            # Log to tensorboard and wandb
+            # Log to wandb (step-level metrics)
             if self.global_step % 10 == 0:
-                if self.writer is not None:
-                    self.writer.add_scalar('info/lr', lr, self.global_step)
-                    self.writer.add_scalar('info/total_loss', loss.item(), self.global_step)
-                    self.writer.add_scalar('info/loss_ce', loss_ce.item(), self.global_step)
-                    self.writer.add_scalar('info/loss_dice', loss_dice.item(), self.global_step)
-
-                import wandb
                 wandb.log({
-                    'train/loss': loss.item(),
-                    'train/loss_ce': loss_ce.item(),
-                    'train/loss_dice': loss_dice.item(),
-                    'learning_rate': lr
-                }, step=self.global_step)
+                    'step_train/loss': loss.item(),
+                    'step_train/loss_ce': loss_ce.item(),
+                    'step_train/loss_dice': loss_dice.item(),
+                    'step_train/learning_rate': lr,
+                    'global_step': self.global_step
+                })
 
             self.global_step += 1
 
@@ -266,92 +353,94 @@ class SAMTrainer(BaseTrainer):
         return val_metrics
 
     def test(self) -> Dict[str, float]:
-        """Test model."""
+        """Test model and visualize predictions using cached inference results."""
         self.model.eval()
 
         test_metrics = {}
+        # Store predictions for visualization (avoid redundant forward pass)
+        predictions_cache = {}
 
-        if isinstance(self.test_loader, dict):
-            for name, loader in self.test_loader.items():
+        for name, loader in self._iter_test_loaders():
+            if isinstance(self.test_loader, dict):
                 self.logger.info(f"Testing on dataset: {name}")
-                metrics = self.evaluator.evaluate_model_sam(
-                    self.model,
-                    loader,
-                    self.device,
-                    self.cfg.data.num_classes,
-                    img_size=self.img_size
-                )
-                self.evaluator.print_metrics(metrics, phase=f'test_{name}')
-                
-                # Prefix metrics
-                for k, v in metrics.items():
-                    test_metrics[f"{name}/{k}"] = v
-        else:
-            test_metrics = self.evaluator.evaluate_model_sam(
+
+            # Get metrics and predictions in one forward pass
+            result = self.evaluator.evaluate_model_sam(
                 self.model,
-                self.test_loader,
+                loader,
                 self.device,
                 self.cfg.data.num_classes,
-                img_size=self.img_size
+                img_size=self.img_size,
+                return_predictions=True
             )
-            self.evaluator.print_metrics(test_metrics, phase='test')
+            metrics, images_list, preds_list, masks_list = result
 
-        # Visualize predictions
-        self._visualize_predictions()
+            self.evaluator.print_metrics(metrics, phase=f'test_{name}' if isinstance(self.test_loader, dict) else 'test')
+
+            # Store metrics with appropriate keys
+            if isinstance(self.test_loader, dict):
+                for k, v in metrics.items():
+                    test_metrics[f"{name}/{k}"] = v
+            else:
+                test_metrics = metrics
+
+            # Cache predictions for visualization
+            predictions_cache[name] = (images_list, preds_list, masks_list)
+
+        # Visualize predictions using cached results
+        self._visualize_predictions(predictions_cache)
 
         return test_metrics
 
-    def _visualize_predictions(self):
-        """Visualize test predictions."""
-        from utils.visualize import visualize_predictions
+    def _visualize_predictions(self, predictions_cache: Dict = None):
+        """Visualize test predictions using pre-computed results."""
+        from utils.visualize import visualize_from_predictions
 
-        vis_dir = self.exp_dir / "visualizations"
-        num_vis_samples = self.cfg.get('visualization', {}).get('num_samples', 10)
+        # Create epoch-specific visualization directory
+        vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+        num_vis_samples = self.cfg.get('visualization', {}).get('num_samples', None)
 
-        self.logger.info(f"Generating {num_vis_samples} visualizations...")
+        sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
+        self.logger.info(f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}...")
 
-        if isinstance(self.test_loader, dict):
-            for name, loader in self.test_loader.items():
-                start_dir = vis_dir / name
+        for name, loader in self._iter_test_loaders():
+            save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
+            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+
+            if predictions_cache and name in predictions_cache:
+                # Use cached predictions (no additional forward pass)
+                images_list, preds_list, masks_list = predictions_cache[name]
+                visualize_from_predictions(
+                    images_list,
+                    preds_list,
+                    masks_list,
+                    self.cfg.data.num_classes,
+                    save_dir,
+                    num_samples=num_vis_samples,
+                    phase_name=phase_name
+                )
+            else:
+                # Fallback to original method if no cache
+                from utils.visualize import visualize_predictions
                 visualize_predictions(
                     self.model,
                     loader,
                     self.device,
                     self.cfg.data.num_classes,
-                    start_dir,
+                    save_dir,
                     num_samples=num_vis_samples,
                     model_type='sam',
                     img_size=self.img_size,
-                    phase_name=f"test_{name}"
+                    phase_name=phase_name
                 )
-        else:
-            visualize_predictions(
-                self.model,
-                self.test_loader,
-                self.device,
-                self.cfg.data.num_classes,
-                vis_dir,
-                num_samples=num_vis_samples,
-                model_type='sam',
-                img_size=self.img_size,
-                phase_name="test"
-            )
 
         self.logger.info(f"Visualizations saved to {vis_dir}")
 
     def _save_model(self, path: Path):
         """Save SAM model (LoRA parameters)."""
-        try:
-            self.model.save_lora_parameters(str(path))
-        except AttributeError:
-            # Handle DataParallel
-            self.model.module.save_lora_parameters(str(path))
+        self._get_base_model().save_lora_parameters(str(path))
 
     def _load_checkpoint(self, path: Path):
         """Load SAM model checkpoint."""
         self.logger.info(f"Loading checkpoint: {path}")
-        try:
-            self.model.load_lora_parameters(str(path))
-        except AttributeError:
-            # Handle DataParallel
-            self.model.module.load_lora_parameters(str(path))
+        self._get_base_model().load_lora_parameters(str(path))
