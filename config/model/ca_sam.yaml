@@ -16,7 +16,7 @@ model:
   img_size: 224
 
   # Training mode
-  mode: single_task                  # single_task or continual
+  mode: continual                  # single_task or continual
 
   # Alignment Layer configuration (paper: 3.54M params with 4 blocks)
   alignment:

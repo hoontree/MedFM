@@ -1,0 +1,16 @@
+name: hybrid
+temperature: 4.0
+
+# Loss weights (Ablation study possible by setting these to 0)
+alpha: 1.0        # Task loss (GT Dice/CE)
+beta: 1.0         # Logit KD (KL Divergence)
+gamma_attn: 0.7   # Attention Map MSE
+gamma_align: 0.3  # Alignment Feature MSE
+
+# Task loss components
+use_dice: true
+use_ce: true
+
+# Feature alignment channels (used for proj layer in distiller)
+student_channels: 48
+teacher_alignment_channels: 256

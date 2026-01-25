@@ -27,7 +27,7 @@ from model.ca_sam import (
     BCEDiceLoss,
     compute_iou,
     compute_boundary_iou,
-    MetricsTracker
+    MetricsTracker,
 )
 from utils.data_processing_seg import SegDatasetProcessor
 
@@ -52,7 +52,7 @@ class CASAMTrainer(BaseTrainer):
         super().__init__(cfg)
 
         # CA-SAM specific attributes
-        self.ca_sam_model: Optional[CASAM] = None
+
         self.current_task_id: int = 0
         self.task_features: Dict[int, torch.Tensor] = {}  # For VAE training
 
@@ -60,8 +60,8 @@ class CASAMTrainer(BaseTrainer):
         self.criterion = None
 
         # Training mode
-        self.training_mode = cfg.model.get('mode', 'single_task')
-        self.img_size = cfg.model.get('img_size', 224)
+        self.training_mode = cfg.model.get("mode", "single_task")
+        self.img_size = cfg.model.get("img_size", 224)
 
         # Metrics tracker
         self.train_metrics = MetricsTracker()
@@ -77,48 +77,50 @@ class CASAMTrainer(BaseTrainer):
 
     def _get_num_epochs(self) -> int:
         """Get number of training epochs."""
-        return self._get_config_value('training', ['num_epochs', 'max_epochs'], 24, int)
+        return self._get_config_value("training", ["num_epochs", "max_epochs"], 24, int)
 
     def _get_base_lr(self) -> float:
         """Get base learning rate."""
-        return self._get_config_value('training', ['base_lr', 'lr'], 1e-4, float)
+        return self._get_config_value("training", ["base_lr", "lr"], 1e-4, float)
 
     def _get_alignment_config(self) -> Dict:
         """Get Alignment Layer configuration."""
-        alignment_cfg = self.cfg.model.get('alignment', {})
+        alignment_cfg = self.cfg.model.get("alignment", {})
         return {
-            'hidden_dim': alignment_cfg.get('hidden_dim', 256),
-            'num_blocks': alignment_cfg.get('num_blocks', 4),
+            "hidden_dim": alignment_cfg.get("hidden_dim", 256),
+            "num_blocks": alignment_cfg.get("num_blocks", 4),
         }
 
     def _get_vae_config(self) -> Dict:
         """Get VAE Router configuration."""
-        vae_cfg = self.cfg.model.get('vae', {})
+        vae_cfg = self.cfg.model.get("vae", {})
         return {
-            'latent_dim': vae_cfg.get('latent_dim', 64),
-            'beta': vae_cfg.get('beta', 16.5),
-            'temperature': vae_cfg.get('temperature', 1.0),
-            'threshold_percentile': vae_cfg.get('threshold_percentile', 97),
+            "latent_dim": vae_cfg.get("latent_dim", 64),
+            "beta": vae_cfg.get("beta", 16.5),
+            "temperature": vae_cfg.get("temperature", 1.0),
+            "threshold_percentile": vae_cfg.get("threshold_percentile", 97),
         }
 
     def _get_n_gpus(self) -> int:
         """Get number of GPUs from config."""
-        hw = self.cfg.get('hardware', {})
-        for key in ['n_gpu', 'n_gpus']:
+        hw = self.cfg.get("hardware", {})
+        for key in ["n_gpu", "n_gpus"]:
             if (value := hw.get(key)) is not None:
                 return int(value)
-        if (gpu_ids := hw.get('gpu_ids')) and isinstance(gpu_ids, (list, tuple)):
+        if (gpu_ids := hw.get("gpu_ids")) and isinstance(gpu_ids, (list, tuple)):
             return len(gpu_ids)
         return 1
 
     def _create_model(self):
         """Create CA-SAM model with frozen SAM and trainable Alignment Layer."""
         # Get SAM configuration
-        sam_type = self.cfg.model.get('sam_type', 'vit_b')
+        sam_type = self.cfg.model.get("sam_type", "vit_b")
         if sam_type not in sam_model_registry:
-            sam_type = 'vit_b'
+            sam_type = "vit_b"
 
-        sam_checkpoint = self.cfg.model.get('sam_checkpoint', self.cfg.model.get('ckpt'))
+        sam_checkpoint = self.cfg.model.get(
+            "sam_checkpoint", self.cfg.model.get("ckpt")
+        )
 
         self.logger.info(f"Loading SAM model: {sam_type}")
         self.logger.info(f"SAM checkpoint: {sam_checkpoint}")
@@ -134,9 +136,9 @@ class CASAMTrainer(BaseTrainer):
 
         # Get encoder output dimension based on SAM type
         encoder_dim_map = {
-            'vit_b': 256,
-            'vit_l': 256,
-            'vit_h': 256,
+            "vit_b": 256,
+            "vit_l": 256,
+            "vit_h": 256,
         }
         encoder_output_dim = encoder_dim_map.get(sam_type, 256)
 
@@ -152,11 +154,11 @@ class CASAMTrainer(BaseTrainer):
             sam_encoder=sam.image_encoder,
             sam_decoder=sam.mask_decoder,
             encoder_output_dim=encoder_output_dim,
-            alignment_hidden_dim=alignment_cfg['hidden_dim'],
-            alignment_num_blocks=alignment_cfg['num_blocks'],
-            vae_latent_dim=vae_cfg['latent_dim'],
-            vae_beta=vae_cfg['beta'],
-            attention_temperature=vae_cfg['temperature'],
+            alignment_hidden_dim=alignment_cfg["hidden_dim"],
+            alignment_num_blocks=alignment_cfg["num_blocks"],
+            vae_latent_dim=vae_cfg["latent_dim"],
+            vae_beta=vae_cfg["beta"],
+            attention_temperature=vae_cfg["temperature"],
         )
 
         # Store prompt encoder for generating prompts
@@ -181,8 +183,12 @@ class CASAMTrainer(BaseTrainer):
 
         # Log model info
         total_params = sum(p.numel() for p in self.ca_sam_model.parameters())
-        trainable_params = sum(p.numel() for p in self.ca_sam_model.parameters() if p.requires_grad)
-        alignment_params = self.ca_sam_model.get_num_trainable_params(self.current_task_id)
+        trainable_params = sum(
+            p.numel() for p in self.ca_sam_model.parameters() if p.requires_grad
+        )
+        alignment_params = self.ca_sam_model.get_num_trainable_params(
+            self.current_task_id
+        )
 
         self.logger.info(f"Total parameters: {total_params:,}")
         self.logger.info(f"Trainable parameters: {trainable_params:,}")
@@ -190,34 +196,61 @@ class CASAMTrainer(BaseTrainer):
 
     def _create_dataloaders(self):
         """Create data loaders using SegDatasetProcessor."""
-        self.train_loader, self.val_loader, self.test_loader = \
-            SegDatasetProcessor.build_data_loaders(self.cfg)
-
-        self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
-        self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
-
-        # Log test set sizes
-        if isinstance(self.test_loader, dict):
-            for name, loader in self.test_loader.items():
-                self.logger.info(f"Test set ({name}): {len(loader.dataset)}")
+        if self.training_mode == "continual":
+            # In continual mode, we don't load all data at once
+            # Data will be loaded per task in _setup_task_data
+            pass
         else:
-            self.logger.info(f"Test set size: {len(self.test_loader.dataset)}")
+            self.train_loader, self.val_loader, self.test_loader = (
+                SegDatasetProcessor.build_data_loaders(self.cfg)
+            )
+
+            self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
+            self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
+
+            # Log test set sizes
+            if isinstance(self.test_loader, dict):
+                for name, loader in self.test_loader.items():
+                    self.logger.info(f"Test set ({name}): {len(loader.dataset)}")
+            else:
+                self.logger.info(f"Test set size: {len(self.test_loader.dataset)}")
+
+    def setup(self, mode: str = "train"):
+        """Setup training environment with support for continual learning."""
+        # For continual mode, we defer optimizer/scheduler/dataloaders setup
+        # but we still need model and basic directories
+        if self.training_mode == "continual" and mode == "train":
+            # Run basic setup from BaseTrainer (seeds, dirs, logger)
+            self._set_seed()
+            self._setup_directories(mode)
+            self._setup_logger()
+            self._setup_wandb()
+
+            # Create model (but no task-specific loaders yet)
+            self._create_model()
+
+            self.logger.info(f"Continual Learning setup completed for {mode} mode")
+        else:
+            # Standard setup
+            super().setup(mode=mode)
 
     def _create_optimizer(self):
         """Create optimizer for Alignment Layer parameters only."""
         base_lr = self._get_base_lr()
 
         # Only optimize current task's Alignment Layer
-        trainable_params = self.ca_sam_model.alignment_layers[self.current_task_id].parameters()
+        trainable_params = self.ca_sam_model.alignment_layers[
+            self.current_task_id
+        ].parameters()
 
-        optimizer_name = self.cfg.get('optimizer', {}).get('name', 'Adam')
+        optimizer_name = self.cfg.get("optimizer", {}).get("name", "Adam")
 
         if optimizer_name == "AdamW":
             self.optimizer = optim.AdamW(
                 trainable_params,
                 lr=base_lr,
                 betas=(0.9, 0.999),
-                weight_decay=self.cfg.get('optimizer', {}).get('weight_decay', 0.01)
+                weight_decay=self.cfg.get("optimizer", {}).get("weight_decay", 0.01),
             )
         else:
             self.optimizer = optim.Adam(
@@ -235,21 +268,17 @@ class CASAMTrainer(BaseTrainer):
 
         # Cosine annealing scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=total_iters,
-            eta_min=1e-6
+            self.optimizer, T_max=total_iters, eta_min=1e-6
         )
 
         self.logger.info(f"Scheduler: CosineAnnealingLR, T_max={total_iters}")
 
     def _get_current_lr(self) -> float:
         """Get current learning rate from optimizer."""
-        return self.optimizer.param_groups[0]['lr']
+        return self.optimizer.param_groups[0]["lr"]
 
     def _forward_with_prompts(
-        self,
-        images: torch.Tensor,
-        task_id: Optional[int] = None
+        self, images: torch.Tensor, task_id: Optional[int] = None
     ) -> torch.Tensor:
         """
         Forward pass through CA-SAM with automatic prompt generation.
@@ -308,8 +337,8 @@ class CASAMTrainer(BaseTrainer):
         pred_masks = F.interpolate(
             low_res_masks,
             size=(self.img_size, self.img_size),
-            mode='bilinear',
-            align_corners=False
+            mode="bilinear",
+            align_corners=False,
         )
 
         return pred_masks
@@ -325,7 +354,7 @@ class CASAMTrainer(BaseTrainer):
 
         train_pbar = tqdm(
             self.train_loader,
-            desc=f'Epoch {epoch + 1}/{self._get_num_epochs()} [Train]'
+            desc=f"Epoch {epoch + 1}/{self._get_num_epochs()} [Train]",
         )
 
         for batch_idx, batch in enumerate(train_pbar):
@@ -340,12 +369,16 @@ class CASAMTrainer(BaseTrainer):
             masks = masks.to(self.device)
 
             # Forward pass
-            pred_logits = self._forward_with_prompts(images, task_id=self.current_task_id)
+            pred_logits = self._forward_with_prompts(
+                images, task_id=self.current_task_id
+            )
 
             # Prepare target
             target = masks.unsqueeze(1).float() if masks.dim() == 3 else masks.float()
             if target.shape[-2:] != pred_logits.shape[-2:]:
-                target = F.interpolate(target, size=pred_logits.shape[-2:], mode='nearest')
+                target = F.interpolate(
+                    target, size=pred_logits.shape[-2:], mode="nearest"
+                )
             target = (target > 0.5).float()
 
             # Compute loss
@@ -356,12 +389,14 @@ class CASAMTrainer(BaseTrainer):
             loss.backward()
 
             # Gradient clipping
-            grad_clip_cfg = self.cfg.get('optimizer', {}).get('grad_clip', {})
-            if grad_clip_cfg.get('enabled', False):
-                max_norm = grad_clip_cfg.get('max_norm', 1.0)
+            grad_clip_cfg = self.cfg.get("optimizer", {}).get("grad_clip", {})
+            if grad_clip_cfg.get("enabled", False):
+                max_norm = grad_clip_cfg.get("max_norm", 1.0)
                 torch.nn.utils.clip_grad_norm_(
-                    self.ca_sam_model.alignment_layers[self.current_task_id].parameters(),
-                    max_norm
+                    self.ca_sam_model.alignment_layers[
+                        self.current_task_id
+                    ].parameters(),
+                    max_norm,
                 )
 
             self.optimizer.step()
@@ -378,30 +413,34 @@ class CASAMTrainer(BaseTrainer):
 
             # Update progress bar
             avg_loss, avg_iou, avg_biou = self.train_metrics.get_average()
-            train_pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'iou': f'{avg_iou:.4f}',
-                'lr': f'{self._get_current_lr():.6f}'
-            })
+            train_pbar.set_postfix(
+                {
+                    "loss": f"{avg_loss:.4f}",
+                    "iou": f"{avg_iou:.4f}",
+                    "lr": f"{self._get_current_lr():.6f}",
+                }
+            )
 
             # Log to wandb
             if self.global_step % 10 == 0:
-                wandb.log({
-                    'step_train/loss': loss.item(),
-                    'step_train/iou': iou,
-                    'step_train/biou': biou,
-                    'step_train/learning_rate': self._get_current_lr(),
-                    'global_step': self.global_step
-                })
+                wandb.log(
+                    {
+                        "step_train/loss": loss.item(),
+                        "step_train/iou": iou,
+                        "step_train/biou": biou,
+                        "step_train/learning_rate": self._get_current_lr(),
+                        "global_step": self.global_step,
+                    }
+                )
 
             self.global_step += 1
 
         # Return epoch metrics
         avg_loss, avg_iou, avg_biou = self.train_metrics.get_average()
         return {
-            'loss': avg_loss,
-            'IoU': avg_iou,
-            'BIoU': avg_biou,
+            "loss": avg_loss,
+            "IoU": avg_iou,
+            "BIoU": avg_biou,
         }
 
     @torch.no_grad()
@@ -411,8 +450,7 @@ class CASAMTrainer(BaseTrainer):
         self.val_metrics.reset()
 
         val_pbar = tqdm(
-            self.val_loader,
-            desc=f'Epoch {epoch + 1}/{self._get_num_epochs()} [Val]'
+            self.val_loader, desc=f"Epoch {epoch + 1}/{self._get_num_epochs()} [Val]"
         )
 
         for batch in val_pbar:
@@ -425,12 +463,16 @@ class CASAMTrainer(BaseTrainer):
             masks = masks.to(self.device)
 
             # Forward pass
-            pred_logits = self._forward_with_prompts(images, task_id=self.current_task_id)
+            pred_logits = self._forward_with_prompts(
+                images, task_id=self.current_task_id
+            )
 
             # Prepare target
             target = masks.unsqueeze(1).float() if masks.dim() == 3 else masks.float()
             if target.shape[-2:] != pred_logits.shape[-2:]:
-                target = F.interpolate(target, size=pred_logits.shape[-2:], mode='nearest')
+                target = F.interpolate(
+                    target, size=pred_logits.shape[-2:], mode="nearest"
+                )
             target = (target > 0.5).float()
 
             # Compute loss and metrics
@@ -443,19 +485,21 @@ class CASAMTrainer(BaseTrainer):
 
             # Update progress bar
             avg_loss, avg_iou, avg_biou = self.val_metrics.get_average()
-            val_pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'iou': f'{avg_iou:.4f}',
-            })
+            val_pbar.set_postfix(
+                {
+                    "loss": f"{avg_loss:.4f}",
+                    "iou": f"{avg_iou:.4f}",
+                }
+            )
 
         avg_loss, avg_iou, avg_biou = self.val_metrics.get_average()
 
         # Use IoU as Dice for compatibility with BaseTrainer
         return {
-            'loss': avg_loss,
-            'IoU': avg_iou,
-            'BIoU': avg_biou,
-            'Dice': avg_iou,  # For early stopping compatibility
+            "loss": avg_loss,
+            "IoU": avg_iou,
+            "BIoU": avg_biou,
+            "Dice": avg_iou,  # For early stopping compatibility
         }
 
     @torch.no_grad()
@@ -480,7 +524,7 @@ class CASAMTrainer(BaseTrainer):
         """Test on a single data loader."""
         test_metrics = MetricsTracker()
 
-        for batch in tqdm(loader, desc=f'Testing [{name}]'):
+        for batch in tqdm(loader, desc=f"Testing [{name}]"):
             if len(batch) == 3:
                 images, masks, _ = batch
             else:
@@ -490,12 +534,16 @@ class CASAMTrainer(BaseTrainer):
             masks = masks.to(self.device)
 
             # Forward pass
-            pred_logits = self._forward_with_prompts(images, task_id=self.current_task_id)
+            pred_logits = self._forward_with_prompts(
+                images, task_id=self.current_task_id
+            )
 
             # Prepare target
             target = masks.unsqueeze(1).float() if masks.dim() == 3 else masks.float()
             if target.shape[-2:] != pred_logits.shape[-2:]:
-                target = F.interpolate(target, size=pred_logits.shape[-2:], mode='nearest')
+                target = F.interpolate(
+                    target, size=pred_logits.shape[-2:], mode="nearest"
+                )
             target = (target > 0.5).float()
 
             # Compute metrics
@@ -510,21 +558,21 @@ class CASAMTrainer(BaseTrainer):
         self.logger.info(f"Test [{name}] - IoU: {avg_iou:.4f}, BIoU: {avg_biou:.4f}")
 
         return {
-            'IoU': avg_iou,
-            'BIoU': avg_biou,
-            'Dice': avg_iou,
+            "IoU": avg_iou,
+            "BIoU": avg_biou,
+            "Dice": avg_iou,
         }
 
     def _save_model(self, path: Path):
         """Save CA-SAM model (Alignment Layer and VAE Router)."""
         save_dict = {
-            'task_id': self.current_task_id,
-            'alignment_layers': {
+            "task_id": self.current_task_id,
+            "alignment_layers": {
                 i: layer.state_dict()
                 for i, layer in enumerate(self.ca_sam_model.alignment_layers)
             },
-            'vae_router': self.ca_sam_model.vae_router.state_dict(),
-            'thresholds': self.ca_sam_model.vae_router.task_thresholds,
+            "vae_router": self.ca_sam_model.vae_router.state_dict(),
+            "thresholds": self.ca_sam_model.vae_router.task_thresholds,
         }
         torch.save(save_dict, str(path))
 
@@ -534,19 +582,19 @@ class CASAMTrainer(BaseTrainer):
         checkpoint = torch.load(str(path), map_location=self.device)
 
         # Load alignment layers
-        for i, state_dict in checkpoint['alignment_layers'].items():
+        for i, state_dict in checkpoint["alignment_layers"].items():
             if int(i) < len(self.ca_sam_model.alignment_layers):
                 self.ca_sam_model.alignment_layers[int(i)].load_state_dict(state_dict)
 
         # Load VAE router
-        if 'vae_router' in checkpoint:
-            self.ca_sam_model.vae_router.load_state_dict(checkpoint['vae_router'])
+        if "vae_router" in checkpoint:
+            self.ca_sam_model.vae_router.load_state_dict(checkpoint["vae_router"])
 
         # Load thresholds
-        if 'thresholds' in checkpoint:
-            self.ca_sam_model.vae_router.task_thresholds = checkpoint['thresholds']
+        if "thresholds" in checkpoint:
+            self.ca_sam_model.vae_router.task_thresholds = checkpoint["thresholds"]
 
-        self.current_task_id = checkpoint.get('task_id', 0)
+        self.current_task_id = checkpoint.get("task_id", 0)
 
     # ==================== VAE Training Methods ====================
 
@@ -557,13 +605,15 @@ class CASAMTrainer(BaseTrainer):
         Returns:
             features: Tensor of encoder features [N, C, H, W]
         """
-        self.logger.info(f"Collecting encoder features for Task {self.current_task_id}...")
+        self.logger.info(
+            f"Collecting encoder features for Task {self.current_task_id}..."
+        )
         self.ca_sam_model.eval()
 
         all_features = []
 
         with torch.no_grad():
-            for batch in tqdm(self.train_loader, desc='Collecting features'):
+            for batch in tqdm(self.train_loader, desc="Collecting features"):
                 if len(batch) == 3:
                     images, _, _ = batch
                 else:
@@ -574,7 +624,9 @@ class CASAMTrainer(BaseTrainer):
                 all_features.append(encoder_output.cpu())
 
         features = torch.cat(all_features, dim=0)
-        self.logger.info(f"Collected {len(features)} features with shape {features.shape}")
+        self.logger.info(
+            f"Collected {len(features)} features with shape {features.shape}"
+        )
 
         # Cache for later use
         self.task_features[self.current_task_id] = features
@@ -599,9 +651,9 @@ class CASAMTrainer(BaseTrainer):
         self.ca_sam_model.train_vae_for_task(
             task_id=self.current_task_id,
             train_features=features,
-            num_epochs=self.cfg.training.get('vae_epochs', 10),
-            learning_rate=self.cfg.training.get('vae_lr', 5e-4),
-            batch_size=32
+            num_epochs=self.cfg.training.get("vae_epochs", 10),
+            learning_rate=self.cfg.training.get("vae_lr", 5e-4),
+            batch_size=32,
         )
 
         # Calibrate threshold
@@ -609,10 +661,12 @@ class CASAMTrainer(BaseTrainer):
         threshold = self.ca_sam_model.calibrate_task_threshold(
             task_id=self.current_task_id,
             train_features=features,
-            percentile=vae_cfg['threshold_percentile']
+            percentile=vae_cfg["threshold_percentile"],
         )
 
-        self.logger.info(f"Task {self.current_task_id} VAE training completed. Threshold: {threshold:.4f}")
+        self.logger.info(
+            f"Task {self.current_task_id} VAE training completed. Threshold: {threshold:.4f}"
+        )
 
     # ==================== Continual Learning Methods ====================
 
@@ -627,9 +681,252 @@ class CASAMTrainer(BaseTrainer):
         self._create_scheduler()
 
         self.logger.info(f"Added new task: {task_id}")
-        self.logger.info(f"Alignment Layer parameters: {self.ca_sam_model.get_num_trainable_params(task_id):,}")
+        self.logger.info(
+            f"Alignment Layer parameters: {self.ca_sam_model.get_num_trainable_params(task_id):,}"
+        )
 
         return task_id
+
+    def train(self):
+        """Main training loop."""
+        if self.training_mode == "continual":
+            self.train_continual()
+        else:
+            super().train()
+
+    def train_continual(self):
+        """Sequential training across multiple tasks."""
+        self.logger.info("Starting Continual Learning...")
+
+        # Get list of tasks from config
+        tasks = self.cfg.data.get("train", [])
+        if isinstance(tasks, str):
+            tasks = [tasks]
+
+        self.logger.info(f"Task sequence: {tasks}")
+
+        # Dictionary to store performance on all tasks
+        self.cl_metrics = {task: [] for task in tasks}
+
+        for task_idx, task_name in enumerate(tasks):
+            self.logger.info(f"\n{'='*20} Task {task_idx}: {task_name} {'='*20}")
+
+            # 1. Prepare Model & Optimizer
+            if task_idx > 0:
+                self.add_new_task()
+            else:
+                self._create_optimizer()
+
+            # 2. Setup Data (needs optimizer for scheduler)
+            self._setup_task_data(task_name)
+
+            # 3. Train Alignment Layer
+            self.logger.info(
+                f"Training Alignment Layer for Task {task_idx} ({task_name})..."
+            )
+
+            # Reset early stopping for new task
+            self._setup_early_stopping()
+            self.best_metric = 0.0  # Reset best metric
+
+            # Reuse base train loop for epochs
+            # We override the inner loop control slightly by calling methods directly
+            num_epochs = self._get_num_epochs()
+
+            for epoch in range(num_epochs):
+                self.current_epoch = epoch
+
+                # Train
+                train_metrics = self.train_epoch(epoch)
+
+                # Validate (on current task)
+                val_metrics = self.validate(epoch)
+
+                # Log
+                self._log_metrics(epoch, train_metrics, val_metrics)
+
+                # Save checkpoint
+                self._save_checkpoint(epoch, val_metrics)
+
+                # Early stopping
+                if self.early_stopping is not None:
+                    self.early_stopping(
+                        val_metrics.get("Dice", val_metrics.get("dice", 0.0))
+                    )
+                    if self.early_stopping.should_stop():
+                        self.logger.info(
+                            f"Early stopping triggered at epoch {epoch + 1}"
+                        )
+                        break
+
+            # Load best model for this task before VAE training
+            if self.best_model_path:
+                self._load_checkpoint(self.best_model_path)
+
+            # 4. Train VAE for current task
+            self.train_vae_for_current_task()
+
+            # 5. Evaluate on ALL tasks seen so far
+            self.evaluate_all_tasks(tasks[: task_idx + 1])
+
+            # Save task-specific checkpoint
+            task_ckpt_path = (
+                self.ckpt_dir / f"task_{task_idx}_{task_name}_completed.pth"
+            )
+            self._save_model(task_ckpt_path)
+            self.logger.info(f"Saved completed task model: {task_ckpt_path}")
+
+        self.logger.info("Continual Learning Completed!")
+
+    def _setup_task_data(self, task_name: str):
+        """Setup data loaders for a specific task."""
+        self.logger.info(f"Setting up data for task: {task_name}")
+
+        # Use our new static method from SegDatasetProcessor
+        self.train_loader, self.val_loader, self.test_loader = (
+            SegDatasetProcessor.build_continual_data_loaders(self.cfg, task_name)
+        )
+
+        self.logger.info(f"Train size: {len(self.train_loader.dataset)}")
+        self.logger.info(f"Val size: {len(self.val_loader.dataset)}")
+        self.logger.info(f"Test size: {len(self.test_loader.dataset)}")
+
+        # Update scheduler for new data size
+        self.scheduler = None
+        self._create_scheduler()
+
+    def evaluate_all_tasks(self, tasks_so_far: List[str]):
+        """Evaluate model on all tasks seen so far."""
+        self.logger.info(f"\nEvaluating on all tasks seen so far: {tasks_so_far}")
+        self.ca_sam_model.eval()
+
+        current_step_metrics = {}
+
+        for task_idx, task_name in enumerate(tasks_so_far):
+            self.logger.info(f"Evaluating Task {task_idx} ({task_name})...")
+
+            # Load test data for this specific task
+            # (Inefficient to reload every time, but safe)
+            test_ds = SegDatasetProcessor.load_dataset_from_config(
+                self.cfg, task_name, split="test"
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_ds,
+                batch_size=self.cfg.training.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.training.num_workers,
+            )
+
+            # 1. Evaluate with Oracle (Correct Task ID)
+            metrics_oracle = self._test_with_task_id(
+                test_loader, task_id=task_idx, name=f"{task_name}_oracle"
+            )
+
+            # 2. Evaluate with Automatic Routing (VAE)
+            metrics_auto = self._test_with_routing(
+                test_loader, name=f"{task_name}_auto"
+            )
+
+            # Log metrics
+            prefix = f"Task{self.current_task_id}_Eval/T{task_idx}_{task_name}"
+            for k, v in metrics_oracle.items():
+                current_step_metrics[f"{prefix}_Oracle_{k}"] = v
+            for k, v in metrics_auto.items():
+                current_step_metrics[f"{prefix}_Auto_{k}"] = v
+
+        # Log to wandb
+        wandb.log(current_step_metrics)
+
+    def _test_with_task_id(self, loader, task_id, name):
+        """Evaluate with specific task ID."""
+        test_metrics = MetricsTracker()
+
+        for batch in tqdm(loader, desc=f"Testing [{name}]"):
+            if len(batch) == 3:
+                images, masks, _ = batch
+            else:
+                images, masks = batch[:2]
+
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+
+            # Prepare target
+            target = masks.unsqueeze(1).float() if masks.dim() == 3 else masks.float()
+            target = (target > 0.5).float()
+
+            # Forward with specific task ID
+            pred_logits = self._forward_with_prompts(images, task_id=task_id)
+            pred_probs = torch.sigmoid(pred_logits)
+
+            # Resizing target to prediction size if needed
+            if target.shape[-2:] != pred_probs.shape[-2:]:
+                target = F.interpolate(
+                    target, size=pred_probs.shape[-2:], mode="nearest"
+                )
+
+            iou = compute_iou(pred_probs, target)
+            biou = compute_boundary_iou(pred_probs, target)
+            test_metrics.update(0.0, iou, biou)
+
+        avg_loss, avg_iou, avg_biou = test_metrics.get_average()
+        return {"IoU": avg_iou, "BIoU": avg_biou}
+
+    def _test_with_routing(self, loader, name):
+        """Evaluate with automatic VAE routing."""
+        test_metrics = MetricsTracker()
+        task_correct = 0
+        total_samples = 0
+
+        for batch in tqdm(loader, desc=f"Testing [{name}]"):
+            if len(batch) == 3:
+                images, masks, _ = batch
+            else:
+                images, masks = batch[:2]
+
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+
+            # Prepare target
+            target = masks.unsqueeze(1).float() if masks.dim() == 3 else masks.float()
+            target = (target > 0.5).float()
+
+            # Forward with routing (task_id=None)
+            # _forward_with_prompts logic does not currently support `return_task_id` natively
+            # We need to manually call model to get task ID for accuracy checking
+
+            # 1. Get manually routed task ID
+            with torch.no_grad():
+                encoder_output = self.ca_sam_model.sam_encoder(images)
+                _, selected_task_ids = self.ca_sam_model.forward_alignment(
+                    encoder_output, task_id=None
+                )
+
+            # Note: selected_task_ids might be a scalar if batch processing assumes same task?
+            # actually VAE router processes batch. `forward_alignment` returns `task_id`.
+            # If `training_mode` is False, it routes.
+            # But CA-SAM `forward_alignment` implementation for inference:
+            # task_id, _ = self.vae_router.route_task(encoder_output)
+            # It returns a single task_id for the whole batch? Checking `ca_sam.py`...
+            # Yes: "route_task" does "return best_task_idx, prob_map". It seems it picks one task for the batch?
+            # Or does it handle item-wise?
+            # Let's check `vae_router.py` later. Assuming batch-wise for now or simple int.
+
+            # 2. Forward for segmentation
+            pred_logits = self._forward_with_prompts(images, task_id=None)
+            pred_probs = torch.sigmoid(pred_logits)
+
+            # Resizing target to prediction size if needed
+            if target.shape[-2:] != pred_probs.shape[-2:]:
+                target = F.interpolate(
+                    target, size=pred_probs.shape[-2:], mode="nearest"
+                )
+
+            iou = compute_iou(pred_probs, target)
+            biou = compute_boundary_iou(pred_probs, target)
+            test_metrics.update(0.0, iou, biou)
+
+        avg_loss, avg_iou, avg_biou = test_metrics.get_average()
+        return {"IoU": avg_iou, "BIoU": avg_biou}
 
     def get_num_tasks(self) -> int:
         """Get number of trained tasks."""

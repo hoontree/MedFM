@@ -105,11 +105,15 @@ class ModelBuilder:
                 "module", "model.sam_lora_image_encoder_mask_decoder"
             )
             pkg = import_module(module_path)
-            # Create a dict of all config items to pass as kwargs
-            model_kwargs = {
-                k: v for k, v in model_cfg.items() if k not in ["module", "name"]
-            }
-            model = pkg.LoRA_Sam(sam, model_cfg.get("rank", 4), **model_kwargs)
+
+            # Build kwargs for LoRA_Sam - only pass supported parameters
+            lora_sam_kwargs = {}
+            if model_cfg.get("adaptation_mode"):
+                lora_sam_kwargs["adaptation_mode"] = model_cfg.adaptation_mode
+            if model_cfg.get("lora_layer"):
+                lora_sam_kwargs["lora_layer"] = model_cfg.lora_layer
+
+            model = pkg.LoRA_Sam(sam, model_cfg.get("rank", 4), **lora_sam_kwargs)
 
             lora_ckpt = model_cfg.get("lora_checkpoint", model_cfg.get("lora_ckpt"))
             if lora_ckpt:

@@ -421,13 +421,14 @@ class Evaluator_seg:
         device: torch.device,
         num_classes: int = 2,
         threshold: float = 0.5,
-    ) -> Dict[str, float]:
+        return_predictions: bool = False,
+    ) -> Dict[str, float] | tuple:
         model.eval()
         if num_classes == 2:
-            return Evaluator_seg._evaluate_binary(model, data_loader, device, threshold)
+            return Evaluator_seg._evaluate_binary(model, data_loader, device, threshold, return_predictions)
         else:
             return Evaluator_seg._evaluate_multiclass(
-                model, data_loader, device, num_classes
+                model, data_loader, device, num_classes, return_predictions
             )
 
     @staticmethod
@@ -466,20 +467,20 @@ class Evaluator_seg:
             )
 
     @staticmethod
-    def _evaluate_binary(model, data_loader, device, threshold):
+    def _evaluate_binary(model, data_loader, device, threshold, return_predictions=False):
         dice_list = []
         hd95_list = []
         iou_list = []
         sensitivity_list = []
         specificity_list = []
         pixel_acc_list = []
-
-        # Let's collect a subset or just compute ECE per batch and average? No, ECE is global.
-        # We can collect flattened probs and labels.
-
+        bf_score_list = []
         all_probs = []
         all_labels = []
-        bf_score_list = []
+        
+        images_list = [] if return_predictions else None
+        preds_list = [] if return_predictions else None
+        masks_list = [] if return_predictions else None
 
         with torch.no_grad():
             for images, labels, _ in data_loader:
@@ -497,6 +498,11 @@ class Evaluator_seg:
                 # Collect for ECE
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.cpu().numpy().flatten())
+                
+                if return_predictions:
+                    images_list.append(images.cpu())
+                    preds_list.append(preds.cpu())
+                    masks_list.append(labels.cpu())
 
                 for pred, gt in zip(preds, labels):
                     pred_np = pred.squeeze().cpu().numpy().astype(bool)
@@ -522,27 +528,6 @@ class Evaluator_seg:
                     specificity_list.append(spec)
                     pixel_acc_list.append(pixel_acc)
                     bf_score_list.append(bf_score)
-
-        if len(dice_list) == 0:
-            logger.warning("No valid samples found evaluation.")
-            return {
-                "Dice": 0.0,
-                "Dice_std": 0.0,
-                "HD95": 0.0,
-                "HD95_std": 0.0,
-                "IoU": 0.0,
-                "IoU_std": 0.0,
-                "Sensitivity": 0.0,
-                "Sensitivity_std": 0.0,
-                "Specificity": 0.0,
-                "Specificity_std": 0.0,
-                "PixelAcc": 0.0,
-                "PixelAcc_std": 0.0,
-                "BFScore": 0.0,
-                "BFScore_std": 0.0,
-                "ECE": 0.0,
-            }
-
         all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)
         ece = Evaluator_seg.compute_ece(all_probs, all_labels)
@@ -564,22 +549,8 @@ class Evaluator_seg:
             "BFScore_std": np.std(bf_score_list),
             "ECE": ece,
         }
-        return metrics
-        metrics = {
-            "Dice": np.mean(dice_list),
-            "Dice_std": np.std(dice_list),
-            "HD95": np.mean(hd95_list),
-            "HD95_std": np.std(hd95_list),
-            "IoU": np.mean(iou_list),
-            "IoU_std": np.std(iou_list),
-            "Sensitivity": np.mean(sensitivity_list),
-            "Sensitivity_std": np.std(sensitivity_list),
-            "Specificity": np.mean(specificity_list),
-            "Specificity_std": np.std(specificity_list),
-            "PixelAcc": np.mean(pixel_acc_list),
-            "PixelAcc_std": np.std(pixel_acc_list),
-        }
-
+        if return_predictions:
+            return metrics, images_list, preds_list, masks_list
         return metrics
 
     @staticmethod

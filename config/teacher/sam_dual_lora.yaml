@@ -1,0 +1,10 @@
+name: sam_hybrid
+module: model.sam_hybrid_adapter
+sam_type: vit_b
+adaptation_mode: dual_lora
+img_size: 224
+rank: 4
+sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+# Set to checkpoint path for distillation, e.g.:
+# lora_checkpoint: logs/dual_lora/BUSBRA+BUSI+B/20260121_220310_bs4_lr0.0001/checkpoints/best_epoch_9_dice0.8025.pth
+lora_checkpoint: null

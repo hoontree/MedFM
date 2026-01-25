@@ -124,6 +124,12 @@ class SAMTrainer(BaseTrainer):
         if self.cfg.model.get('adaptation_mode'):
             model_kwargs['adaptation_mode'] = self.cfg.model.adaptation_mode
 
+        # Alignment layer configuration (for encoder_frozen_alignment_* modes)
+        if self.cfg.model.get('alignment_num_blocks'):
+            model_kwargs['alignment_num_blocks'] = self.cfg.model.alignment_num_blocks
+        if self.cfg.model.get('alignment_hidden_channels'):
+            model_kwargs['alignment_hidden_channels'] = self.cfg.model.alignment_hidden_channels
+
         self.model = pkg.LoRA_Sam(sam, self.cfg.model.get('rank', 4), **model_kwargs).to(self.device)
 
         # Load LoRA checkpoint if provided (support both config key names)
@@ -148,11 +154,51 @@ class SAMTrainer(BaseTrainer):
         self.logger.info(f"Trainable parameters: {trainable_params:,}")
 
     def _create_dataloaders(self):
-        """Create data loaders."""
-        self.train_loader, self.val_loader, self.test_loader = SegDatasetProcessor.build_data_loaders(self.cfg)
+        """Create data loaders.
+
+        Supports two modes:
+        - Normal mode: Uses full dataset for training
+        - Distillation mode: Uses split dataset (adaptation or distillation subset)
+          Configure via cfg.distillation.enabled and cfg.distillation.phase
+        """
+        distill_cfg = self.cfg.get('distillation', {})
+        distill_enabled = distill_cfg.get('enabled', False)
+
+        if distill_enabled:
+            # Distillation mode: use split datasets
+            phase = distill_cfg.get('phase', 'adaptation')  # 'adaptation' or 'distillation'
+            adaptation_ratio = distill_cfg.get('adaptation_ratio', 0.5)
+            split_seed = distill_cfg.get('split_seed', 42)
+            split_file = distill_cfg.get('split_file', None)
+
+            self.logger.info(f"=== Distillation Mode: {phase} ===")
+            self.logger.info(f"Adaptation ratio: {adaptation_ratio}, Seed: {split_seed}")
+
+            loaders = SegDatasetProcessor.build_distillation_data_loaders(
+                self.cfg,
+                adaptation_ratio=adaptation_ratio,
+                seed=split_seed,
+                split_file=split_file,
+            )
+
+            # Select appropriate loaders based on phase
+            if phase == 'adaptation':
+                self.train_loader = loaders['adaptation_train']
+                self.val_loader = loaders['adaptation_val']
+            else:  # 'distillation'
+                self.train_loader = loaders['distillation_train']
+                self.val_loader = loaders['distillation_val']
+
+            self.test_loader = loaders['test']
+
+            self.logger.info(f"Using {phase} split:")
+        else:
+            # Normal mode: use full dataset
+            self.train_loader, self.val_loader, self.test_loader = SegDatasetProcessor.build_data_loaders(self.cfg)
+
         self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
         self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
-        
+
         # Log test set sizes
         if isinstance(self.test_loader, dict):
             total_test = sum(len(loader.dataset) for loader in self.test_loader.values())

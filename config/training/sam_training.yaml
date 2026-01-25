@@ -59,3 +59,16 @@ wandb:
   project: medical_foundation_models
   entity: hheo
   log_model: true
+
+# Distillation dataset split configuration
+# When enabled, splits training data into adaptation/distillation subsets
+distillation:
+  enabled: true
+  # Phase: 'adaptation' (teacher fine-tuning) or 'distillation' (student training)
+  phase: adaptation
+  # Ratio of data for adaptation (teacher fine-tuning)
+  adaptation_ratio: 0.3
+  # Random seed for reproducible splitting
+  split_seed: 42
+  # Optional: explicit path to split file (auto-generated if null)
+  split_file: null

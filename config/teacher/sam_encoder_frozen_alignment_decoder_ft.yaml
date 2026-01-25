@@ -1,0 +1,15 @@
+name: sam_hybrid
+module: model.sam_hybrid_adapter
+sam_type: vit_b
+adaptation_mode: encoder_frozen_alignment_decoder_ft
+img_size: 224
+rank: 4
+sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+
+# Alignment layer configuration
+alignment_num_blocks: 4
+alignment_hidden_channels: 256
+
+# Set to checkpoint path for distillation, e.g.:
+# lora_checkpoint: logs/encoder_frozen_alignment_decoder_ft/.../best_epoch_XX_diceX.XXXX.pth
+lora_checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_alignment_decoder_ft/BUSBRA+BUSI+B/20260122_065224_bs4_lr0.0001/checkpoints/best_epoch_63_dice0.7504.pth

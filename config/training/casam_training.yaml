@@ -45,6 +45,6 @@ visualization:
 
 # WandB configuration
 wandb:
-  project: TinyUSFM
+  project: medical_foundation_models
   entity: hheo
   log_model: true

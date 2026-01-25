@@ -5,4 +5,6 @@ adaptation_mode: encoder_frozen_decoder_lora
 img_size: 224
 rank: 4
 sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-lora_checkpoint: null
+# Set to checkpoint path for distillation, e.g.:
+# lora_checkpoint: logs/encoder_frozen_decoder_lora/BUSBRA+BUSI+B/20260121_220309_bs4_lr0.0001/checkpoints/best_epoch_192_dice0.7424.pth
+lora_checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_decoder_lora/BUSBRA+BUSI+B/20260122_072819_bs4_lr0.0001/checkpoints/best_epoch_27_dice0.7129.pth

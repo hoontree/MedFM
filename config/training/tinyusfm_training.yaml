@@ -1,0 +1,55 @@
+# @package _global_
+
+# Training settings
+training:
+  lr: 0.0001                      # Learning rate
+  batch_size: 64
+  num_epochs: 500
+  warmup_epochs: 5
+  num_workers: 8
+  save_interval: 20               # Save checkpoint every N epochs
+  limit_train_batches: null       # For debugging purposes, limit number of batches per epoch
+  dice_weight: 0.8                # Weight for Dice loss in combined loss
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0001
+
+# Optimizer configuration
+optimizer:
+  name: AdamW
+  weight_decay: 0.01
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+
+# Scheduler settings
+scheduler:
+  use_reduce_on_plateau: true
+  patience: 20
+  factor: 0.5
+  min_lr: 1e-7
+
+hardware:
+  n_gpus: 1
+  seed: 1234
+  deterministic: 1
+  gpu_ids: [0]
+
+# Output configuration
+output:
+  dir: logs
+  is_pretrain: true               # Pretrained or scratch
+
+# Task settings
+task:
+  type: organ                     # tumor or organ
+
+# Visualization
+visualization:
+  num_samples: 10                 # Number of samples to visualize during test
+
+# WandB configuration
+wandb:
+  project: medfm
+  entity: hheo

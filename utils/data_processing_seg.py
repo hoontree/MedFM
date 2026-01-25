@@ -1,19 +1,36 @@
 import random
 import numpy as np
-from PIL import Image
-from typing import Tuple, Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Type
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
-import logging
-from sklearn.model_selection import train_test_split
-from transformers import SegformerImageProcessor
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from omegaconf import OmegaConf, ListConfig
+import json
+import copy
 
-logger = logging.getLogger(__name__)
+from utils.ultrasound_datasets import BUID, BUS_UCLM, BUSI, BUSBRA, UltrasoundSegmentationDataset, B
+
+
+# Dataset class registry - safer than eval()
+DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
+    "BUID": BUID,
+    "BUS_UCLM": BUS_UCLM,
+    "BUSI": BUSI,
+    "BUSBRA": BUSBRA,
+    "UltrasoundSegmentationDataset": UltrasoundSegmentationDataset,
+    "B": B,
+}
+
+
+def get_dataset_class(name: str) -> Type[Dataset]:
+    """Get dataset class from registry by name."""
+    if name not in DATASET_REGISTRY:
+        available = ", ".join(DATASET_REGISTRY.keys())
+        raise ValueError(
+            f"Unknown dataset class: {name}. Available: {available}"
+        )
+    return DATASET_REGISTRY[name]
 
 
 def set_seed(seed=42):
@@ -25,1313 +42,42 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-class BUID(Dataset):
-    """
-    BUID Dataset (Breast Ultrasound Images Dataset)
-    - Total: 232 cases (109 Benign, 123 Malignant)
-    - Binary segmentation: background (0), lesion (1)
-    - RGB images with sizes 590x590 or 600x600
-    - File structure:
-        Benign/
-            XXX Benign Image.bmp
-            XXX Benign Mask.tif (binary mask)
-            XXX Benign Lesion.bmp (not used)
-        Malignant/
-            XXX Malignant Image.bmp
-            XXX Malignant Mask.tif (binary mask)
-            XXX Malignant Lesion.bmp (not used)
-    - Random split by class: 70% train, 15% val, 15% test
-    """
-
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, "seed", 42)
-        self.classes = cfg.classes
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.usage = getattr(cfg, "usage", "external")
-        if self.usage == "external":
-            # Get all image and mask files from both classes
-            self.images, self.masks = self._unzip_pairs(self._collect_paired_files())
-        else:
-            # split into train/val/test: 70/15/15
-            self.images, self.masks = self._unzip_pairs(self._collect_paired_files())
-            self.images, self.masks = self._split_dataset(self.images, self.masks)
-
-    def _split_dataset(self, images, masks):
-        # Group by class
-        benign_pairs = []
-        malignant_pairs = []
-
-        for img, msk in zip(images, masks):
-            if "Benign" in str(img):
-                benign_pairs.append((img, msk))
-            elif "Malignant" in str(img):
-                malignant_pairs.append((img, msk))
-            else:
-                # Fallback if naming convention is different
-                benign_pairs.append((img, msk))
-
-        # Split each class separately to ensure balance
-        # 70% train, 15% val, 15% test
-        def split_class(pairs, seed):
-            if not pairs:
-                return [], [], []
-
-            # First split: 70% train, 30% temp
-            train, temp = train_test_split(pairs, test_size=0.3, random_state=seed)
-            # Second split: 50% val, 50% test (from 30% temp -> 15% each)
-            val, test = train_test_split(temp, test_size=0.5, random_state=seed)
-            return train, val, test
-
-        b_train, b_val, b_test = split_class(benign_pairs, self.seed)
-        m_train, m_val, m_test = split_class(malignant_pairs, self.seed)
-
-        # Combine
-        train_pairs = b_train + m_train
-        val_pairs = b_val + m_val
-        test_pairs = b_test + m_test
-
-        # Support both 'val' and 'valid'
-        target_split = "val" if self.split in ["val", "valid"] else self.split
-
-        if target_split == "train":
-            selected = train_pairs
-        elif target_split == "val":
-            selected = val_pairs
-        elif target_split == "test":
-            selected = test_pairs
-        else:
-            raise ValueError(f"Invalid split: {self.split}")
-
-        # Sort for consistency
-        selected.sort(key=lambda x: str(x[0]))
-
-        return self._unzip_pairs(selected)
-
-    def _collect_paired_files(self) -> List[Tuple[Path, Path]]:
-        pairs = []
-        for class_dir_name in self.classes.values():
-            class_dir = self.root / class_dir_name
-            if not class_dir.exists():
-                print(f"Warning: Class directory does not exist: {class_dir}")
-                continue
-
-            image_pattern = f"* {class_dir_name} Image.bmp"
-            for img_path in class_dir.glob(image_pattern):
-                base_name = img_path.stem.replace(" Image", " Mask")
-                mask_path = class_dir / f"{base_name}.tif"
-
-                if mask_path.exists():
-                    pairs.append((img_path, mask_path))
-                else:
-                    print(f"Warning: Mask file not found: {mask_path}")
-
-        # Sort pairs by image path to ensure consistent ordering
-        pairs.sort(key=lambda x: str(x[0]))
-        return pairs
-
-    def _unzip_pairs(self, pairs):
-        if not pairs:
-            return [], []
-        images, masks = zip(*pairs)
-        return list(images), list(masks)
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        image_path = self.images[idx]
-        mask_path = self.masks[idx]
-
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
-
-        # Load mask (binary mask from .tif file)
-        try:
-            mask = Image.open(mask_path).convert("L")
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
-
-        # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        if self.transform:
-            image, mask = self._joint_transform(image, mask)
-
-        # --- Image tensorization and normalization ---
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_np = np.array(mask)
-
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
-class BUS_UCLM(Dataset):
-    """
-    BUS-UCLM Dataset
-    - Total: 683 images from 38 patients
-    - Classes: Normal (419), Benign (174), Malignant (90)
-    - Image size: 768x1024 (resized to config.img_size)
-    - Mask encoding:
-        Red (255, 0, 0) -> Malignant (class 2)
-        Green (0, 255, 0) -> Benign (class 1)
-        Black (0, 0, 0) -> Background/Normal (class 0)
-    - Split: Pre-defined train/test split in partitions folder
-    """
-
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        self.root = Path(cfg.path.root)
-        self.partition_dir = getattr(cfg, "partition_dir", "partitions")
-        self.seed = getattr(cfg, "seed", 42)
-        self.extensions = getattr(
-            cfg, "extensions", (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
-        )
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.filter_empty_masks = getattr(
-            cfg, "filter_empty_masks", False
-        )  # New attribute
-
-        if self.cfg.usage == "train":
-            # Support both 'val' and 'valid'
-            target_split = "val" if split in ["val", "valid"] else split
-
-            if target_split in ["train", "val"]:
-                self.image_dir = self.root / self.partition_dir / "train" / "images"
-                self.mask_dir = self.root / self.partition_dir / "train" / "masks"
-
-                if not self.image_dir.exists():
-                    raise ValueError(
-                        f"Image directory does not exist: {self.image_dir}"
-                    )
-                if not self.mask_dir.exists():
-                    raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
-
-                all_image_files, all_mask_files = self._get_paired_files(
-                    self.image_dir, self.mask_dir, self.extensions
-                )
-
-                if target_split == "train":
-                    self.image_files, self.mask_files = self._split_train_val(
-                        all_image_files, all_mask_files, self.split
-                    )
-                else:  # val
-                    self.image_files, self.mask_files = self._split_train_val(
-                        all_image_files, all_mask_files, self.split
-                    )
-            else:  # test
-                self.image_dir = self.root / self.partition_dir / "test" / "images"
-                self.mask_dir = self.root / self.partition_dir / "test" / "masks"
-
-                if not self.image_dir.exists():
-                    raise ValueError(
-                        f"Image directory does not exist: {self.image_dir}"
-                    )
-                if not self.mask_dir.exists():
-                    raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
-
-                self.image_files, self.mask_files = self._get_paired_files(
-                    self.image_dir, self.mask_dir, self.extensions
-                )
-        else:  # external validation - use all data
-            self.image_dir = self.root / "data" / "images"
-            self.mask_dir = self.root / "data" / "masks"
-
-            if not self.image_dir.exists():
-                raise ValueError(f"Image directory does not exist: {self.image_dir}")
-            if not self.mask_dir.exists():
-                raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
-
-            self.image_files, self.mask_files = self._get_paired_files(
-                self.image_dir, self.mask_dir, self.extensions
-            )
-
-        # Apply filtering if requested (only for train split usually, but logic allows any)
-        # Always store unfiltered version first
-        self.image_files_unfiltered = list(self.image_files)
-        self.mask_files_unfiltered = list(self.mask_files)
-
-        if self.filter_empty_masks:
-            self.image_files, self.mask_files = self._filter_empty_masks(
-                self.image_files, self.mask_files
-            )
-
-    def _get_paired_files(
-        self, image_dir: Path, mask_dir: Path, extensions: Tuple[str, ...]
-    ) -> Tuple[List[Path], List[Path]]:
-        pairs = []
-        for ext in extensions:
-            # Find all images
-            for img_path in image_dir.glob(f"*{ext}"):
-                # Assumes mask has SAME filename as image
-                mask_path = mask_dir / img_path.name
-                if not mask_path.exists():
-                    # Try uppercase extension just in case
-                    mask_path_upper = (
-                        mask_dir / f"{img_path.stem}{img_path.suffix.upper()}"
-                    )
-                    if mask_path_upper.exists():
-                        mask_path = mask_path_upper
-                    else:
-                        print(
-                            f"Warning: Mask not found for {img_path.name} in {mask_dir}"
-                        )
-                        continue
-
-                pairs.append((img_path, mask_path))
-
-            # Also check uppercase extension for images
-            for img_path in image_dir.glob(f"*{ext.upper()}"):
-                # Avoid duplicates if case-insensitive filesystem or extensions overlap
-                if any(str(p[0]) == str(img_path) for p in pairs):
-                    continue
-
-                mask_path = mask_dir / img_path.name
-                if not mask_path.exists():
-                    mask_path_lower = (
-                        mask_dir / f"{img_path.stem}{img_path.suffix.lower()}"
-                    )
-                    if mask_path_lower.exists():
-                        mask_path = mask_path_lower
-                    else:
-                        print(
-                            f"Warning: Mask not found for {img_path.name} in {mask_dir}"
-                        )
-                        continue
-                pairs.append((img_path, mask_path))
-
-        # Sort pairs by image path
-        pairs.sort(key=lambda x: str(x[0]))
-
-        if not pairs:
-            return [], []
-
-        images, masks = zip(*pairs)
-        return list(images), list(masks)
-
-    def _split_train_val(self, image_files, mask_files, split_type):
-        """Split train partition into train/val"""
-        random.seed(self.seed)
-
-        # 80% train, 20% val
-        train_imgs, val_imgs, train_masks, val_masks = train_test_split(
-            image_files, mask_files, test_size=0.2, random_state=self.seed
-        )
-
-        if split_type == "train":
-            return train_imgs, train_masks
-        else:  # val
-            return val_imgs, val_masks
-
-    def _filter_empty_masks(self, image_files, mask_files):
-        """Filter out pairs where the mask is completely empty (background only)"""
-        print(f"Filtering empty masks... (Total before: {len(image_files)})")
-        filtered_images = []
-        filtered_masks = []
-
-        # This might be slow if dataset is huge, but for ~600 images it's fine.
-        # Use tqdm if available or just print progress
-        try:
-            from tqdm import tqdm
-
-            iterator = tqdm(
-                zip(image_files, mask_files),
-                total=len(image_files),
-                desc="Filtering masks",
-            )
-        except ImportError:
-            iterator = zip(image_files, mask_files)
-
-        for img_path, mask_path in iterator:
-            try:
-                # We need to check if the mask has any non-zero values
-                # Reading as grayscale/RGB is fine as long as we detect non-black
-                mask = Image.open(mask_path).convert("L")
-                if np.array(mask).max() > 0:
-                    filtered_images.append(img_path)
-                    filtered_masks.append(mask_path)
-            except Exception as e:
-                print(f"Warning: Error reading mask {mask_path} during filtering: {e}")
-
-        print(
-            f"Filtering complete. Kept {len(filtered_images)} pairs (Removed {len(image_files) - len(filtered_images)})"
-        )
-        return filtered_images, filtered_masks
-
-    def _convert_rgb_mask_to_classes(self, mask_rgb: np.ndarray) -> np.ndarray:
-        """
-        Convert RGB mask to class labels
-        Red (255, 0, 0) -> 2 (Malignant)
-        Green (0, 255, 0) -> 1 (Benign)
-        Black (0, 0, 0) -> 0 (Background/Normal)
-        """
-        mask = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
-
-        # Check for malignant (red)
-        red_mask = (
-            (mask_rgb[:, :, 0] == 255)
-            & (mask_rgb[:, :, 1] == 0)
-            & (mask_rgb[:, :, 2] == 0)
-        )
-        mask[red_mask] = 2
-
-        # Check for benign (green)
-        green_mask = (
-            (mask_rgb[:, :, 0] == 0)
-            & (mask_rgb[:, :, 1] == 255)
-            & (mask_rgb[:, :, 2] == 0)
-        )
-        mask[green_mask] = 1
-
-        # Background (black) is already 0
-
-        return mask
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        image_path = self.image_files[idx]
-        mask_path = self.mask_files[idx]
-
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
-
-        # Load RGB mask and convert to class labels
-        try:
-            mask_rgb = Image.open(mask_path).convert("RGB")
-            mask_rgb_array = np.array(mask_rgb)
-            mask_array = self._convert_rgb_mask_to_classes(mask_rgb_array)
-            mask = Image.fromarray(mask_array)
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
-
-        # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        if self.transform:
-            image, mask = self._joint_transform(image, mask)
-
-        # --- Image tensorization and normalization ---
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_np = np.array(mask)
-
-        if self.num_classes == 2:
-            # 0/1/2 -> 0/1 float (if malignant/benign are both foreground)
-            # Based on UltrasoundSegmentationDataset reference: everything >0 to 1
-            mask_np = (mask_np > 0).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 0).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
-class BUSI(Dataset):
-    """
-    BUSI Dataset (Breast Ultrasound Images)
-    - Total: 780 images (437 Benign, 210 Malignant, 133 Normal)
-    - Binary segmentation: background (0), lesion (1)
-    - RGB images with varying sizes
-    - Class directories: benign, malignant, normal
-    - Some images have multiple masks (_mask.png, _mask_1.png) that need to be combined
-    - Random split by class: 70% train, 15% val, 15% test
-    """
-
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        # low-res label 크기
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-
-        # BUSI-specific configuration
-        self.root = Path(cfg.path.root)
-        self.classes = cfg.classes
-        self.image_suffix = getattr(cfg, "image_suffix", "")
-        self.mask_suffix = getattr(cfg, "mask_suffix", "_mask")
-        self.extensions = getattr(cfg, "extensions", [".png"])
-        self.seed = getattr(cfg, "seed", 42)
-        self.combine_multiple_masks = getattr(cfg, "combine_multiple_masks", True)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        # BUSI 데이터셋은 클래스별 하위 디렉토리 구조를 가짐
-        all_image_files, all_mask_files = self._get_busi_files()
-
-        # Split data by class (random split)
-        self.image_files, self.mask_files = self._split_data_by_class(
-            all_image_files, all_mask_files, self.split
-        )
-
-    def _split_data_by_class(self, image_files, mask_files, split_type):
-        """클래스별로 데이터를 분할"""
-        random.seed(self.seed)
-
-        # 클래스별로 파일들을 그룹화
-        class_groups = {}
-        for img_path, mask_path in zip(image_files, mask_files):
-            class_name = img_path.parent.name
-            if class_name not in class_groups:
-                class_groups[class_name] = {"images": [], "masks": []}
-            class_groups[class_name]["images"].append(img_path)
-            class_groups[class_name]["masks"].append(mask_path)
-
-        split_images, split_masks = [], []
-        # Support both 'val' and 'valid'
-        target_split = "val" if split_type in ["val", "valid"] else split_type
-
-        for class_name, files in class_groups.items():
-            images = files["images"]
-            masks = files["masks"]
-
-            # 80% train, 20% val (Internal Validation)
-            train_imgs, val_imgs, train_masks, val_masks = train_test_split(
-                images, masks, test_size=0.2, random_state=self.seed
-            )
-
-            if target_split == "train":
-                split_images.extend(train_imgs)
-                split_masks.extend(train_masks)
-            elif target_split == "val":
-                split_images.extend(val_imgs)
-                split_masks.extend(val_masks)
-            elif target_split == "test":
-                # BUSI doesn't have a separate test set in this 80/20 split config
-                # Returning val set as test set, or could raise error
-                split_images.extend(val_imgs)
-                split_masks.extend(val_masks)
-
-        return sorted(split_images), sorted(split_masks)
-
-        return sorted(split_images), sorted(split_masks)
-
-    def _get_busi_files(self) -> Tuple[List[Path], List[List[Path]]]:
-        """
-        BUSI 데이터셋의 클래스별 디렉토리에서 이미지와 마스크 파일들을 찾아 반환
-        일부 이미지는 여러 마스크를 가지므로 mask_files는 리스트의 리스트
-        Strict pairing: image -> multiple masks
-        """
-        pairs = []
-
-        # 각 클래스 디렉토리를 순회
-        for class_name in self.classes.values():
-            class_dir = self.root / class_name
-
-            if not class_dir.exists():
-                print(f"Warning: Class directory does not exist: {class_dir}")
-                continue
-
-            # 해당 클래스 디렉토리에서 파일들 찾기
-            for ext in self.extensions:
-                # 이미지 파일들 찾기 (마스크가 아닌 것들)
-                pattern = f"*{self.image_suffix}{ext}"
-                for file_path in class_dir.glob(pattern):
-                    # 마스크 파일이 아닌 경우만 이미지로 간주
-                    if self.mask_suffix not in file_path.stem:
-
-                        # 대응되는 모든 마스크 파일 찾기
-                        # _mask.png, _mask_1.png, _mask_2.png 등
-                        base_name = file_path.stem
-                        masks_for_image = []
-
-                        # 기본 마스크
-                        mask_name = f"{base_name}{self.mask_suffix}{ext}"
-                        mask_path = class_dir / mask_name
-                        if mask_path.exists():
-                            masks_for_image.append(mask_path)
-
-                        # 추가 마스크 (_mask_1, _mask_2, ...)
-                        if self.combine_multiple_masks:
-                            # 1부터 9까지 체크
-                            for i in range(1, 10):
-                                mask_name_i = f"{base_name}{self.mask_suffix}_{i}{ext}"
-                                mask_path_i = class_dir / mask_name_i
-                                if mask_path_i.exists():
-                                    masks_for_image.append(mask_path_i)
-                                # Skip finding if not strictly consecutive? Implementation was breaking before.
-                                # To be safe, we check them all or stop at first missing?
-                                # Original logic stopped at break. We keep "break".
-                                else:
-                                    break
-
-                        if masks_for_image:
-                            pairs.append((file_path, masks_for_image))
-                        else:
-                            print(f"Warning: No mask file found for {file_path}")
-
-        # Sort pairs by image path
-        pairs.sort(key=lambda x: str(x[0]))
-
-        if not pairs:
-            return [], []
-
-        images, masks = zip(*pairs)
-        return list(images), list(masks)
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, index):
-        image_path = self.image_files[index]
-        mask_paths = self.mask_files[index]  # List of mask paths
-
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
-
-        # Load and combine multiple masks
-        try:
-            combined_mask = None
-
-            for mask_path in mask_paths:
-                mask = Image.open(mask_path).convert("L")
-                mask_array = np.array(mask, dtype=np.uint8)
-
-                if combined_mask is None:
-                    combined_mask = mask_array
-                else:
-                    # Combine masks using OR operation
-                    combined_mask = combined_mask | mask_array
-
-            if combined_mask is None:
-                raise ValueError(f"No masks found for image {image_path}")
-
-            # Convert to PIL Image
-            mask = Image.fromarray(combined_mask)
-
-        except Exception as e:
-            raise ValueError(f"Error loading masks for {image_path}: {e}")
-
-        # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        if self.transform:
-            image, mask = self._joint_transform(image, mask)
-
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        mask_np = np.array(mask)
-
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
-class BUSBRA(Dataset):
-    """
-    BUSBRA Dataset (Breast Ultrasound Brazil)
-    - Total: 1875 images (left/right breast images)
-    - Binary segmentation: background (0), lesion (1)
-    - Grayscale images with varying sizes
-    - Naming convention:
-        Images: bus_XXXX-{l|r}.png (l=left, r=right)
-        Masks: mask_XXXX-{l|r}.png
-    - Split: Pre-defined split using busbra_{split}.txt files
-    """
-
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.split = split
-        self.seed = getattr(cfg, "seed", 42)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.transform = transform
-
-        # low-res label size
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-
-        # BUSBRA-specific configuration
-        self.root = Path(cfg.path.root)
-        self.image_prefix = getattr(cfg, "image_prefix", "bus_")
-        self.mask_prefix = getattr(cfg, "mask_prefix", "mask_")
-        self.extensions = getattr(cfg, "extensions", [".png"])
-
-        image_dir_name = getattr(cfg, "image_dir", "Images")
-        mask_dir_name = getattr(cfg, "mask_dir", "Masks")
-
-        self.image_dir = self.root / image_dir_name
-        self.mask_dir = self.root / mask_dir_name
-
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        # 1. Scan directory for all images
-        # 1. Scan directory for all images and pair with masks
-        # Find all images first, then find corresponding mask
-        pairs = []
-        for ext in self.extensions:
-            # Find all images in sorted order first
-            image_candidates = sorted(self.image_dir.glob(f"*{ext}"))
-
-            for img_path in image_candidates:
-                filename = img_path.stem
-                if filename.startswith(self.image_prefix):
-                    base_content = filename[len(self.image_prefix) :]
-                    mask_filename = f"{self.mask_prefix}{base_content}{img_path.suffix}"
-                    mask_path = self.mask_dir / mask_filename
-
-                    if mask_path.exists():
-                        pairs.append((img_path, mask_path))
-                    else:
-                        print(
-                            f"Warning: Mask not found for {img_path}: expected {mask_path}"
-                        )
-                else:
-                    print(
-                        f"Warning: Image {filename} does not start with prefix {self.image_prefix}"
-                    )
-
-        # Sort pairs by image path
-        pairs.sort(key=lambda x: str(x[0]))
-
-        if pairs:
-            all_image_files, all_mask_files = zip(*pairs)
-            all_image_files, all_mask_files = list(all_image_files), list(
-                all_mask_files
-            )
-        else:
-            all_image_files, all_mask_files = [], []
-
-        # 2. Split by Patient ID (80/20)
-        # Naming convention: bus_XXXX-{l|r} -> Patient ID is XXXX
-        self.image_list, self.mask_list = self._split_by_patient(
-            all_image_files, all_mask_files, self.split
-        )
-
-    def _split_by_patient(self, image_files, mask_files, split_type):
-        random.seed(self.seed)
-
-        # Extract patient IDs
-        # bus_1234-l.png -> 1234
-        patient_map = {}  # patient_id -> list of indices
-
-        for idx, img_path in enumerate(image_files):
-            filename = img_path.stem  # bus_1234-l
-            # Remove prefix
-            if filename.startswith(self.image_prefix):
-                core_name = filename[len(self.image_prefix) :]  # 1234-l
-                # Split by '-' to get ID
-                parts = core_name.split("-")
-                if len(parts) >= 1:
-                    patient_id = parts[0]  # 1234
-
-                    if patient_id not in patient_map:
-                        patient_map[patient_id] = []
-                    patient_map[patient_id].append(idx)
-
-        patient_ids = sorted(list(patient_map.keys()))
-
-        # Split patients 80/20
-        train_pids, val_pids = train_test_split(
-            patient_ids, test_size=0.2, random_state=self.seed
-        )
-
-        # Support both 'val' and 'valid'
-        target_split = "val" if split_type in ["val", "valid"] else split_type
-
-        selected_indices = []
-        if target_split == "train":
-            for pid in train_pids:
-                selected_indices.extend(patient_map[pid])
-        elif target_split in ["val", "test"]:
-            # Use val set for test as well since we only have 80/20 split
-            for pid in val_pids:
-                selected_indices.extend(patient_map[pid])
-
-        final_images = [str(image_files[i]) for i in sorted(selected_indices)]
-        final_masks = [str(mask_files[i]) for i in sorted(selected_indices)]
-
-        return final_images, final_masks
-
-    def __len__(self):
-        return len(self.image_list)
-
-    def __getitem__(self, index):
-        img_path = self.image_list[index]
-        mask_path = self.mask_list[index]
-
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")  # Grayscale mask
-
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        if self.transform:
-            image, mask = self._joint_transform(image, mask)
-
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-        mask_np = np.array(mask)
-
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if self.task_type == "tumor":
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-                label = TF.hflip(label)
-
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-                label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
-class BUSBRA_SegFormer(BUSBRA):
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        super().__init__(cfg, split, transform)
-        self.image_processor = SegformerImageProcessor.from_pretrained(
-            "nvidia/segformer-b2-finetuned-ade-512-512"
-        )
-
-    def __getitem__(self, index):
-        img_path = self.image_list[index]
-        mask_path = self.mask_list[index]
-
-        image = np.array(Image.open(img_path).convert("RGB"))
-        mask = np.array(Image.open(mask_path).convert("L"))
-        inputs = self.image_processor(
-            images=image, segmentation_maps=mask, return_tensors="np"
-        )
-        for k in inputs:
-            inputs[k] = inputs[k].squeeze(0)
-
-        return inputs["pixel_values"], inputs["labels"]
-
-
-class UltrasoundSegmentationDataset(Dataset):
-    def __init__(
-        self,
-        image_dir: str,
-        label_dir: str,
-        num_classes: int,
-        transform: Optional[bool] = False,
-        image_size: Tuple[int, int] = (512, 512),
-        task_type: str = "tumor",
-    ):
-        self.image_dir = Path(image_dir)
-        self.label_dir = Path(label_dir)
-        self.transform = transform
-        self.image_size = image_size
-        self.num_classes = num_classes
-        self.task_type = task_type
-
-        self.image_files = sorted(
-            [
-                f.name
-                for f in self.image_dir.iterdir()
-                if f.suffix.lower() in (".png", ".jpg", ".jpeg")
-            ]
-        )
-
-        self.normalize = T.Normalize(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
-
-        assert len(self.image_files) > 0, "No image files found"
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_path = self.image_dir / self.image_files[idx]
-        label_path = self.label_dir / self.image_files[idx]
-
-        image = Image.open(img_path).convert("RGB")
-        label = Image.open(label_path).convert("L")
-
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        label = TF.resize(label, self.image_size, interpolation=Image.NEAREST)
-
-        if self.transform:
-            image, label = self._joint_transform(image, label)
-
-        image = TF.to_tensor(image)
-        image = self.normalize(image)  # [C, H, W]
-
-        if self.num_classes == 2:
-            label = torch.from_numpy(np.array(label)).float() / 255.0
-            label = (label > 0.5).float()
-        else:
-            label = torch.from_numpy(np.array(label)).long()
-        return image, label
-
-    def _joint_transform(self, image, label):
-        if self.task_type == "tumor":
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-                label = TF.hflip(label)
-
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-                label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
-class B(Dataset):
-    """
-    Dataset B
-    - Total: 163 images
-    - Binary segmentation: background (0), lesion (1)
-    - File structure:
-        original/ (Images)
-        GT/ (Masks)
-    - Random split: 80% train, 20% val
-    """
-
-    def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, "seed", 42)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.extensions = getattr(cfg, "extensions", [".png"])
-
-        # Directory structure from yaml or default
-        self.image_dir_name = getattr(cfg, "image_dir", "original")
-        self.mask_dir_name = getattr(cfg, "mask_dir", "GT")
-
-        self.image_dir = self.root / self.image_dir_name
-        self.mask_dir = self.root / self.mask_dir_name
-
-        if not self.image_dir.exists():
-            raise ValueError(f"Image directory does not exist: {self.image_dir}")
-        if not self.mask_dir.exists():
-            raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
-
-        # Collect paired files
-        images, masks = self._collect_paired_files()
-
-        # Split dataset
-        self.images, self.masks = self._split_dataset(images, masks)
-
-    def _collect_paired_files(self):
-        pairs = []
-        for ext in self.extensions:
-            # Find all images
-            for img_path in self.image_dir.glob(f"*{ext}"):
-                # Assumes mask has SAME filename as image
-                mask_path = self.mask_dir / img_path.name
-
-                if mask_path.exists():
-                    pairs.append((img_path, mask_path))
-                else:
-                    # Check for case sensitivity issues if needed, but assuming strict for now
-                    print(f"Warning: Mask not found for {img_path.name}")
-
-        # Sort for deterministic split
-        pairs.sort(key=lambda x: str(x[0]))
-
-        if not pairs:
-            return [], []
-
-        images, masks = zip(*pairs)
-        return list(images), list(masks)
-
-    def _split_dataset(self, images, masks):
-        if not images:
-            return [], []
-
-        # 80% train, 20% val
-        train_imgs, val_imgs, train_masks, val_masks = train_test_split(
-            images, masks, test_size=0.2, random_state=self.seed
-        )
-
-        # Support both 'val' and 'valid'
-        target_split = "val" if self.split in ["val", "valid"] else self.split
-
-        if target_split == "train":
-            return train_imgs, train_masks
-        elif target_split == "val":
-            return val_imgs, val_masks
-        else:
-            return val_imgs, val_masks
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        image_path = self.images[idx]
-        mask_path = self.masks[idx]
-
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
-
-        # Load mask
-        try:
-            mask = Image.open(mask_path).convert("L")
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
-
-        # Resize
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        # Transforms
-        if self.transform:
-            image, mask = self._joint_transform(image, mask)
-
-        # Tensorize and Normalize Image
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(image_tensor)
-
-        # Format Mask
-        mask_np = np.array(mask)
-        if self.num_classes == 2:
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)
-        else:
-            # multi-class assumption: pixel values are classes
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
-
-
 class SegDatasetProcessor:
     @staticmethod
-    def build_dataset(cfg):
+    def load_dataset_from_config(cfg, name, split):
+        """Helper to load dataset config and instantiate."""
+        from pathlib import Path
+
+        config_path = Path(f"config/data/{name}.yaml")
+        if not config_path.exists():
+            raise ValueError(f"Config for {name} not found at {config_path}")
+
+        data_cfg = OmegaConf.load(config_path)
+
+        # Override specific global settings if needed
+        if hasattr(cfg.data, "img_size"):
+            data_cfg.img_size = cfg.data.img_size
+        if hasattr(cfg.data, "num_classes"):
+            data_cfg.num_classes = cfg.data.num_classes
+        if hasattr(cfg.data, "normalization"):
+            data_cfg.normalization = cfg.data.normalization
+
+        # Test datasets should use full data (external validation)
+        if split == "test":
+            data_cfg.usage = "external"
+
+        # Override usage if provided in cfg.data (e.g. for dynamic usage override)
+        if hasattr(cfg.data, "usage") and cfg.data.usage:
+            # Only override if not test logic above?
+            # Existing logic didn't do this, but for internal val splitting consistency it might be useful.
+            # Strict adherence to legacy logic:
+            pass
+
+        dataset_class = get_dataset_class(data_cfg.name)
+        return dataset_class(data_cfg, split=split)
+
+    @staticmethod
+    def build_dataset(cfg): 
         # Case 1: Dynamic/Combined Dataset (Multi-dataset support)
         # Check if train/test are lists rather than just looking at type
         is_list_train = hasattr(cfg.data, "train") and isinstance(
@@ -1343,42 +89,20 @@ class SegDatasetProcessor:
         ]
 
         if is_list_train or is_combined_type:
-            from pathlib import Path
-
-            # Helper to load dataset config and instantiate
-            def load_single_dataset(name, split):
-                config_path = Path(f"config/data/{name}.yaml")
-                if not config_path.exists():
-                    raise ValueError(f"Config for {name} not found at {config_path}")
-
-                data_cfg = OmegaConf.load(config_path)
-
-                # Override specific global settings if needed
-                if hasattr(cfg.data, "img_size"):
-                    data_cfg.img_size = cfg.data.img_size
-                if hasattr(cfg.data, "num_classes"):
-                    data_cfg.num_classes = cfg.data.num_classes
-                if hasattr(cfg.data, "normalization"):
-                    data_cfg.normalization = cfg.data.normalization
-
-                # Test datasets should use full data (external validation)
-                if split == "test":
-                    data_cfg.usage = "external"
-
-                dataset_class = eval(data_cfg.name)
-                return dataset_class(data_cfg, split=split)
-
             # 1. Train Sets
             train_datasets = []
             train_list = cfg.data.train if is_list_train else []
             for name in train_list:
-                print(f"Loading Train dataset: {name}")
-                train_datasets.append(load_single_dataset(name, split="train"))
+                train_datasets.append(
+                    SegDatasetProcessor.load_dataset_from_config(cfg, name, split="train")
+                )
 
             if not train_datasets:
                 raise ValueError("No training datasets specified in config.")
             train_dataset = ConcatDataset(train_datasets)
-
+            print(f"Using combined training dataset consisting of:{', '.join(train_list)}")
+            print(f"Total training samples: {len(train_dataset)}")
+            
             # 2. Validation Sets (Internal)
             val_datasets = []
             val_list = getattr(cfg.data, "val", None)
@@ -1391,46 +115,37 @@ class SegDatasetProcessor:
                 val_list = train_list
 
             for name in val_list:
-                print(f"Loading Val dataset: {name}")
-                val_datasets.append(load_single_dataset(name, split="val"))
+                val_datasets.append(
+                    SegDatasetProcessor.load_dataset_from_config(cfg, name, split="val")
+                )
             val_dataset = ConcatDataset(val_datasets)
-
+            print(f"Using combined validation dataset consisting of:{', '.join(val_list)}")
+            print(f"Total validation samples: {len(val_dataset)}")
             # 3. Test Sets (External Validation) - Keep Separate
-            # If filter_empty_masks is enabled, store both filtered and unfiltered versions
             test_datasets = {}
             test_list = getattr(cfg.data, "test", [])
-            def add_test_dataset_with_unfiltered(name):
-                """Load test dataset and add unfiltered version if filter_empty_masks is enabled."""
-                print(f"Loading Test dataset: {name}")
-                ds = load_single_dataset(name, split="test")
-                test_datasets[name] = ds
-                # If dataset has filter_empty_masks enabled, also add unfiltered version
-                if hasattr(ds, "filter_empty_masks") and ds.filter_empty_masks:
-                    # Use copy to avoid reloading and re-filtering
-                    import copy
-                    ds_unfiltered = copy.copy(ds)
-                    # Restore original unfiltered file lists
-                    ds_unfiltered.image_files = list(ds.image_files_unfiltered)
-                    ds_unfiltered.mask_files = list(ds.mask_files_unfiltered)
-                    test_datasets[f"{name}_unfiltered"] = ds_unfiltered
-                    print(f"  -> Also added {name}_unfiltered (original: {len(ds_unfiltered)} samples)")
 
             if isinstance(test_list, (list, ListConfig)):
                 for name in test_list:
-                    add_test_dataset_with_unfiltered(name)
+                    SegDatasetProcessor._add_test_dataset_with_unfiltered(cfg, name, test_datasets)
             elif isinstance(test_list, str):
-                add_test_dataset_with_unfiltered(test_list)
+                SegDatasetProcessor._add_test_dataset_with_unfiltered(cfg, test_list, test_datasets)
 
             return train_dataset, val_dataset, test_datasets
 
-        # Case 2: Single Dataset (Legacy/Simple)
         else:
-            dataset_class = eval(cfg.data.name)
-            print(f"{dataset_class} is used for segmentation task.")
+            dataset_class = get_dataset_class(cfg.data.name)
+            print(f"{dataset_class.__name__} is used for segmentation task.")
             train_dataset = dataset_class(cfg.data, split="train")
-            val_dataset = dataset_class(cfg.data, split="valid")
-            test_dataset = dataset_class(cfg.data, split="test")
-            return train_dataset, val_dataset, test_dataset
+            val_dataset = dataset_class(cfg.data, split="val")
+
+            # Single dataset case for test should also follow the dictionary format with unfiltered support
+            test_datasets = {}
+            SegDatasetProcessor._add_test_dataset_with_unfiltered(
+                cfg, cfg.data.name, test_datasets
+            )
+
+            return train_dataset, val_dataset, test_datasets
 
     @staticmethod
     def build_data_loaders(cfg):
@@ -1492,66 +207,604 @@ class SegDatasetProcessor:
 
         return train_loader, val_loader, test_loader
 
-
-class DataProcessor:
     @staticmethod
-    def get_data_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    def _get_split_indices_path(cfg, seed: int) -> Path:
+        """Get the path for storing/loading split indices."""
+        # Create a unique identifier based on dataset config
+        dataset_id = getattr(cfg.data, "name", "unknown")
+        if hasattr(cfg.data, "train") and isinstance(
+            cfg.data.train, (list, ListConfig)
+        ):
+            dataset_id = "_".join(cfg.data.train)
+        return Path(f"splits/distillation_split_{dataset_id}_seed{seed}.json")
+
+    @staticmethod
+    def _save_split_indices(
+        path: Path,
+        adaptation_train_indices: List[int],
+        distillation_train_indices: List[int],
+        adaptation_val_indices: List[int],
+        distillation_val_indices: List[int],
+        adaptation_ratio: float,
+        seed: int,
+    ):
+        """Save split indices to JSON file for reproducibility across runs."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "seed": seed,
+            "adaptation_ratio": adaptation_ratio,
+            "adaptation_train_indices": adaptation_train_indices,
+            "distillation_train_indices": distillation_train_indices,
+            "adaptation_val_indices": adaptation_val_indices,
+            "distillation_val_indices": distillation_val_indices,
+            "n_train_total": len(adaptation_train_indices)
+            + len(distillation_train_indices),
+            "n_val_total": len(adaptation_val_indices) + len(distillation_val_indices),
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        print(f"Split indices saved to: {path}")
+
+    @staticmethod
+    def _load_split_indices(path: Path) -> Optional[Dict]:
+        """Load split indices from JSON file if exists."""
+        if not path.exists():
+            return None
+
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        print(f"Split indices loaded from: {path}")
+        return data
+
+    @staticmethod
+    def build_distillation_datasets(
+        cfg,
+        adaptation_ratio: float = 0.5,
+        seed: int = 42,
+        split_file: Optional[str] = None,
+        save_split: bool = True,
+    ) -> Dict[str, Union[Dataset, Dict[str, Dataset]]]:
+        """
+        Build non-overlapping datasets for knowledge distillation workflow.
+
+        Splits the training data into two disjoint sets:
+        - Adaptation set: Used for teacher fine-tuning (e.g., LoRA adaptation)
+        - Distillation set: Used for student training with teacher guidance
+
+        The split indices are saved to a JSON file to ensure consistency across
+        separate training and distillation runs.
+
+        Args:
+            cfg: Hydra configuration object
+            adaptation_ratio: Ratio of training data for adaptation (default: 0.5)
+            seed: Random seed for reproducible splitting
+            split_file: Optional path to split file. If None, auto-generated path is used.
+            save_split: Whether to save split indices to file (default: True)
+
+        Returns:
+            Dictionary containing:
+                - 'adaptation_train': Dataset for teacher adaptation training
+                - 'adaptation_val': Dataset for teacher adaptation validation
+                - 'distillation_train': Dataset for distillation training
+                - 'distillation_val': Dataset for distillation validation
+                - 'test': Test dataset(s) for final evaluation
+        """
+
+        # Build full dataset first
+        train_dataset, val_dataset, test_datasets = SegDatasetProcessor.build_dataset(
+            cfg
+        )
+
+        # Determine split file path
+        if split_file:
+            split_path = Path(split_file)
+        else:
+            split_path = SegDatasetProcessor._get_split_indices_path(cfg, seed)
+
+        # Try to load existing split
+        existing_split = SegDatasetProcessor._load_split_indices(split_path)
+
+        n_total = len(train_dataset)
+        n_val_total = len(val_dataset)
+
+        if existing_split is not None:
+            # Validate that the loaded split matches current dataset
+            if existing_split["n_train_total"] != n_total:
+                print(
+                    f"WARNING: Split file train size ({existing_split['n_train_total']}) "
+                    f"doesn't match current dataset ({n_total}). Regenerating split."
+                )
+                existing_split = None
+            elif existing_split["n_val_total"] != n_val_total:
+                print(
+                    f"WARNING: Split file val size ({existing_split['n_val_total']}) "
+                    f"doesn't match current dataset ({n_val_total}). Regenerating split."
+                )
+                existing_split = None
+            elif existing_split["seed"] != seed:
+                print(
+                    f"WARNING: Split file seed ({existing_split['seed']}) "
+                    f"doesn't match requested seed ({seed}). Regenerating split."
+                )
+                existing_split = None
+
+        if existing_split is not None:
+            # Use loaded indices
+            adaptation_train_indices = existing_split["adaptation_train_indices"]
+            distillation_train_indices = existing_split["distillation_train_indices"]
+            adaptation_val_indices = existing_split["adaptation_val_indices"]
+            distillation_val_indices = existing_split["distillation_val_indices"]
+            print(f"Using existing split from: {split_path}")
+        else:
+            # Generate new split
+            n_adaptation = int(n_total * adaptation_ratio)
+
+            # Create reproducible random indices
+            rng = np.random.default_rng(seed)
+            indices = rng.permutation(n_total)
+
+            adaptation_train_indices = indices[:n_adaptation].tolist()
+            distillation_train_indices = indices[n_adaptation:].tolist()
+
+            # Split validation set similarly
+            n_val_adaptation = int(n_val_total * adaptation_ratio)
+
+            val_indices = rng.permutation(n_val_total)
+            adaptation_val_indices = val_indices[:n_val_adaptation].tolist()
+            distillation_val_indices = val_indices[n_val_adaptation:].tolist()
+
+            # Save split for future runs
+            if save_split:
+                SegDatasetProcessor._save_split_indices(
+                    split_path,
+                    adaptation_train_indices,
+                    distillation_train_indices,
+                    adaptation_val_indices,
+                    distillation_val_indices,
+                    adaptation_ratio,
+                    seed,
+                )
+
+        # Create subset datasets
+        adaptation_train = Subset(train_dataset, adaptation_train_indices)
+        distillation_train = Subset(train_dataset, distillation_train_indices)
+        adaptation_val = Subset(val_dataset, adaptation_val_indices)
+        distillation_val = Subset(val_dataset, distillation_val_indices)
+
+        print(f"\n=== Distillation Dataset Split (seed={seed}) ===")
+        print(f"Total training samples: {n_total}")
+        print(
+            f"  Adaptation set: {len(adaptation_train)} ({len(adaptation_train)/n_total*100:.1f}%)"
+        )
+        print(
+            f"  Distillation set: {len(distillation_train)} ({len(distillation_train)/n_total*100:.1f}%)"
+        )
+        print(f"Total validation samples: {n_val_total}")
+        print(f"  Adaptation val: {len(adaptation_val)}")
+        print(f"  Distillation val: {len(distillation_val)}")
+
+        return {
+            "adaptation_train": adaptation_train,
+            "adaptation_val": adaptation_val,
+            "distillation_train": distillation_train,
+            "distillation_val": distillation_val,
+            "test": test_datasets,
+        }
+
+    @staticmethod
+    def build_distillation_data_loaders(
+        cfg,
+        adaptation_ratio: float = 0.5,
+        seed: int = 42,
+        split_file: Optional[str] = None,
+        save_split: bool = True,
+    ) -> Dict[str, Union[DataLoader, Dict[str, DataLoader]]]:
+        """
+        Build DataLoaders for knowledge distillation workflow.
+
+        Returns separate loaders for adaptation and distillation phases,
+        ensuring no data overlap between the two stages.
+
+        Args:
+            cfg: Hydra configuration object
+            adaptation_ratio: Ratio of training data for adaptation (default: 0.5)
+            seed: Random seed for reproducible splitting
+            split_file: Optional path to split file. If None, auto-generated path is used.
+            save_split: Whether to save split indices to file (default: True)
+
+        Returns:
+            Dictionary containing DataLoaders:
+                - 'adaptation_train': Loader for teacher adaptation training
+                - 'adaptation_val': Loader for teacher adaptation validation
+                - 'distillation_train': Loader for distillation training
+                - 'distillation_val': Loader for distillation validation
+                - 'test': Test loader(s) for final evaluation
+        """
+        datasets = SegDatasetProcessor.build_distillation_datasets_stratified(
+            cfg, adaptation_ratio, seed, split_file, save_split
+        )
+
         def worker_init_fn(worker_id):
-            seed = 42 + worker_id
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+            worker_seed = seed + worker_id
+            random.seed(worker_seed)
+            np.random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
 
-        data_dir = Path(args.data_dir)
+        batch_size = cfg.training.batch_size
+        num_workers = cfg.training.num_workers
 
-        train_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / "train" / "img"),
-            str(data_dir / "train" / "label"),
-            args.num_classes,
-            transform=True,
-            image_size=(args.img_size, args.img_size),
-            task_type=args.task_type,
-        )
-
-        val_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / "val" / "img"),
-            str(data_dir / "val" / "label"),
-            args.num_classes,
-            transform=False,
-            image_size=(args.img_size, args.img_size),
-        )
-
-        test_dataset = UltrasoundSegmentationDataset(
-            str(data_dir / "test" / "img"),
-            str(data_dir / "test" / "label"),
-            args.num_classes,
-            transform=False,
-            image_size=(args.img_size, args.img_size),
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
+        # Create loaders for adaptation phase
+        adaptation_train_loader = DataLoader(
+            datasets["adaptation_train"],
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
             worker_init_fn=worker_init_fn,
         )
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
+        adaptation_val_loader = DataLoader(
+            datasets["adaptation_val"],
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
         )
 
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
+        # Create loaders for distillation phase
+        distillation_train_loader = DataLoader(
+            datasets["distillation_train"],
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+        )
+
+        distillation_val_loader = DataLoader(
+            datasets["distillation_val"],
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
         )
 
-        return train_loader, val_loader, test_loader
+        # Handle test loaders (can be dict or single dataset)
+        test_datasets = datasets["test"]
+        if isinstance(test_datasets, dict):
+            test_loaders = {}
+            for name, ds in test_datasets.items():
+                test_loaders[name] = DataLoader(
+                    ds,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                )
+        else:
+            test_loaders = DataLoader(
+                test_datasets,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+
+        return {
+            "adaptation_train": adaptation_train_loader,
+            "adaptation_val": adaptation_val_loader,
+            "distillation_train": distillation_train_loader,
+            "distillation_val": distillation_val_loader,
+            "test": test_loaders,
+        }
+
+    @staticmethod
+    def _get_stratified_split_indices_path(cfg, seed: int) -> Path:
+        """Get the path for storing/loading stratified split indices."""
+        train_list = cfg.data.train if hasattr(cfg.data, "train") else []
+        if isinstance(train_list, (list, ListConfig)):
+            dataset_id = "_".join(train_list)
+        else:
+            dataset_id = getattr(cfg.data, "name", "unknown")
+        return Path(
+            f"splits/distillation_stratified_split_{dataset_id}_seed{seed}.json"
+        )
+
+    @staticmethod
+    def _save_stratified_split_indices(
+        path: Path,
+        train_splits: Dict[str, Dict[str, List[int]]],
+        val_splits: Dict[str, Dict[str, List[int]]],
+        adaptation_ratio: float,
+        seed: int,
+    ):
+        """Save stratified split indices to JSON file."""
+        
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "seed": seed,
+            "adaptation_ratio": adaptation_ratio,
+            "train_splits": train_splits,  # {dataset_name: {adapt_idx: [...], distill_idx: [...]}}
+            "val_splits": val_splits,
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        print(f"Stratified split indices saved to: {path}")
+
+    @staticmethod
+    def _load_stratified_split_indices(path: Path) -> Optional[Dict]:
+        """Load stratified split indices from JSON file if exists."""
+        
+
+        if not path.exists():
+            return None
+
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        print(f"Stratified split indices loaded from: {path}")
+        return data
+
+    @staticmethod
+    def build_distillation_datasets_stratified(
+        cfg,
+        adaptation_ratio: float = 0.5,
+        seed: int = 42,
+        split_file: Optional[str] = None,
+        save_split: bool = True,
+    ) -> Dict[str, Union[Dataset, Dict[str, Dataset]]]:
+        """
+        Build non-overlapping datasets with stratified splitting by dataset source.
+
+        When using ConcatDataset (multiple datasets), this ensures each source
+        dataset is split proportionally, maintaining dataset distribution balance.
+
+        The split indices are saved to a JSON file to ensure consistency across
+        separate training and distillation runs.
+
+        Args:
+            cfg: Hydra configuration object
+            adaptation_ratio: Ratio of training data for adaptation (default: 0.5)
+            seed: Random seed for reproducible splitting
+            split_file: Optional path to split file. If None, auto-generated path is used.
+            save_split: Whether to save split indices to file (default: True)
+
+        Returns:
+            Same structure as build_distillation_datasets()
+        """
+
+        # Check if using combined/dynamic datasets
+        is_list_train = hasattr(cfg.data, "train") and isinstance(
+            cfg.data.train, (list, ListConfig)
+        )
+        is_combined_type = hasattr(cfg.data, "type") and cfg.data.type in [
+            "Combined",
+            "Dynamic",
+        ]
+
+        if not (is_list_train or is_combined_type):
+            # Fall back to simple splitting for single dataset
+            return SegDatasetProcessor.build_distillation_datasets(
+                cfg, adaptation_ratio, seed, split_file, save_split
+            )
+
+        # Determine split file path
+        if split_file:
+            split_path = Path(split_file)
+        else:
+            split_path = SegDatasetProcessor._get_stratified_split_indices_path(
+                cfg, seed
+            )
+
+        # Try to load existing split
+        existing_split = SegDatasetProcessor._load_stratified_split_indices(split_path)
+
+        # Load individual datasets
+        train_list = cfg.data.train if is_list_train else []
+        val_list = getattr(cfg.data, "val", None)
+        if (
+            val_list is None
+            or not isinstance(val_list, (list, ListConfig))
+            or len(val_list) == 0
+        ):
+            val_list = train_list
+
+        # Load datasets first to validate against existing split
+        train_datasets = {}
+        val_datasets = {}
+
+        for name in train_list:
+            train_datasets[name] = SegDatasetProcessor.load_dataset_from_config(
+                cfg, name, split="train"
+            )
+
+        for name in val_list:
+            val_datasets[name] = SegDatasetProcessor.load_dataset_from_config(
+                cfg, name, split="val"
+            )
+
+        # Validate existing split if found
+        if existing_split is not None:
+            valid = True
+            # Check train datasets
+            for name in train_list:
+                if name not in existing_split["train_splits"]:
+                    print(
+                        f"WARNING: Dataset {name} not found in split file. Regenerating split."
+                    )
+                    valid = False
+                    break
+                expected_size = len(
+                    existing_split["train_splits"][name]["adapt_idx"]
+                ) + len(existing_split["train_splits"][name]["distill_idx"])
+                if expected_size != len(train_datasets[name]):
+                    print(
+                        f"WARNING: Dataset {name} size mismatch ({expected_size} vs {len(train_datasets[name])}). Regenerating split."
+                    )
+                    valid = False
+                    break
+
+            if valid and existing_split["seed"] != seed:
+                print(
+                    f"WARNING: Split file seed ({existing_split['seed']}) doesn't match requested seed ({seed}). Regenerating split."
+                )
+                valid = False
+
+            if not valid:
+                existing_split = None
+
+        adaptation_train_datasets = []
+        distillation_train_datasets = []
+        adaptation_val_datasets = []
+        distillation_val_datasets = []
+
+        print(f"\n=== Stratified Distillation Split (seed={seed}) ===")
+
+        if existing_split is not None:
+            # Use loaded indices
+            print("Using existing stratified split")
+
+            for name in train_list:
+                ds = train_datasets[name]
+                adapt_idx = existing_split["train_splits"][name]["adapt_idx"]
+                distill_idx = existing_split["train_splits"][name]["distill_idx"]
+
+                adaptation_train_datasets.append(Subset(ds, adapt_idx))
+                distillation_train_datasets.append(Subset(ds, distill_idx))
+
+                print(
+                    f"  {name} train: {len(ds)} -> adapt={len(adapt_idx)}, distill={len(distill_idx)}"
+                )
+
+            for name in val_list:
+                ds = val_datasets[name]
+                adapt_idx = existing_split["val_splits"][name]["adapt_idx"]
+                distill_idx = existing_split["val_splits"][name]["distill_idx"]
+
+                adaptation_val_datasets.append(Subset(ds, adapt_idx))
+                distillation_val_datasets.append(Subset(ds, distill_idx))
+
+                print(
+                    f"  {name} val: {len(ds)} -> adapt={len(adapt_idx)}, distill={len(distill_idx)}"
+                )
+        else:
+            # Generate new split
+            rng = np.random.default_rng(seed)
+
+            train_splits = {}
+            val_splits = {}
+
+            # Split each training dataset
+            for name in train_list:
+                ds = train_datasets[name]
+                n = len(ds)
+                n_adapt = int(n * adaptation_ratio)
+
+                indices = rng.permutation(n)
+                adapt_idx = indices[:n_adapt].tolist()
+                distill_idx = indices[n_adapt:].tolist()
+
+                train_splits[name] = {
+                    "adapt_idx": adapt_idx,
+                    "distill_idx": distill_idx,
+                }
+
+                adaptation_train_datasets.append(Subset(ds, adapt_idx))
+                distillation_train_datasets.append(Subset(ds, distill_idx))
+
+                print(
+                    f"  {name} train: {n} -> adapt={len(adapt_idx)}, distill={len(distill_idx)}"
+                )
+
+            # Split each validation dataset
+            for name in val_list:
+                ds = val_datasets[name]
+                n = len(ds)
+                n_adapt = int(n * adaptation_ratio)
+
+                indices = rng.permutation(n)
+                adapt_idx = indices[:n_adapt].tolist()
+                distill_idx = indices[n_adapt:].tolist()
+
+                val_splits[name] = {"adapt_idx": adapt_idx, "distill_idx": distill_idx}
+
+                adaptation_val_datasets.append(Subset(ds, adapt_idx))
+                distillation_val_datasets.append(Subset(ds, distill_idx))
+
+                print(
+                    f"  {name} val: {n} -> adapt={len(adapt_idx)}, distill={len(distill_idx)}"
+                )
+
+            # Save split for future runs
+            if save_split:
+                SegDatasetProcessor._save_stratified_split_indices(
+                    split_path,
+                    train_splits,
+                    val_splits,
+                    adaptation_ratio,
+                    seed,
+                )
+
+        # Combine into ConcatDatasets
+        adaptation_train = ConcatDataset(adaptation_train_datasets)
+        distillation_train = ConcatDataset(distillation_train_datasets)
+        adaptation_val = ConcatDataset(adaptation_val_datasets)
+        distillation_val = ConcatDataset(distillation_val_datasets)
+
+        # Load test datasets (unchanged)
+        test_datasets = {}
+        test_list = getattr(cfg.data, "test", [])
+
+        if isinstance(test_list, (list, ListConfig)):
+            for name in test_list:
+                SegDatasetProcessor._add_test_dataset_with_unfiltered(
+                    cfg, name, test_datasets
+                )
+        elif isinstance(test_list, str):
+            SegDatasetProcessor._add_test_dataset_with_unfiltered(
+                cfg, test_list, test_datasets
+            )
+
+        print(
+            f"\nTotal: adapt_train={len(adaptation_train)}, distill_train={len(distillation_train)}"
+        )
+        print(
+            f"       adapt_val={len(adaptation_val)}, distill_val={len(distillation_val)}"
+        )
+
+        return {
+            "adaptation_train": adaptation_train,
+            "adaptation_val": adaptation_val,
+            "distillation_train": distillation_train,
+            "distillation_val": distillation_val,
+            "test": test_datasets,  # Always return dict (empty if no test datasets)
+        }
+
+    @staticmethod
+    def _add_test_dataset_with_unfiltered(cfg, name, test_datasets_dict):
+        """Load test dataset and add unfiltered version if filter_empty_masks is enabled."""
+        print(f"Loading Test dataset: {name}")
+        ds: Dataset = SegDatasetProcessor.load_dataset_from_config(cfg, name, split="test")
+        test_datasets_dict[name] = ds
+
+        # If dataset has filter_empty_masks enabled, also add unfiltered version
+        if hasattr(ds, "filter_empty_masks") and ds.filter_empty_masks:
+            
+            # Use copy to avoid reloading and re-filtering
+            ds_unfiltered = copy.copy(ds)
+            
+            # Restore original unfiltered file lists
+            ds_unfiltered.image_files = list(ds.image_files_unfiltered)
+            ds_unfiltered.mask_files = list(ds.mask_files_unfiltered)
+            test_datasets_dict[f"{name}_unfiltered"] = ds_unfiltered
+            print(
+                f"  -> Also added {name}_unfiltered (original: {len(ds_unfiltered)} samples)"
+            )

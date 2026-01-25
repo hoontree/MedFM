@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig, OmegaConf, ListConfig
 from datetime import datetime
-from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -121,45 +120,49 @@ def save_experiment_summary(cfg: DictConfig, log_dir: Path):
 
     # Teacher SAM-specific info
     if cfg.teacher.name == "sam_hybrid":
-        lines.extend([
-            f"  Backbone: {cfg.teacher.get('sam_type', 'N/A')}",
-            f"  Adaptation: {cfg.teacher.get('adaptation_mode', 'N/A')}",
-            f"  LoRA Rank: {cfg.teacher.get('rank', 'N/A')}",
-        ])
+        lines.extend(
+            [
+                f"  Backbone: {cfg.teacher.get('sam_type', 'N/A')}",
+                f"  Adaptation: {cfg.teacher.get('adaptation_mode', 'N/A')}",
+                f"  LoRA Rank: {cfg.teacher.get('rank', 'N/A')}",
+            ]
+        )
     elif cfg.teacher.name.startswith("vit_"):
         lines.append(f"  Backbone: {cfg.teacher.name}")
 
-    lines.extend([
-        f"  Image Size: {cfg.teacher.get('img_size', 'N/A')}",
-        f"  LoRA Checkpoint: {cfg.teacher.get('lora_checkpoint', 'N/A')}",
-        "",
-        "[Student Model]",
-        f"  Name: {cfg.student.name}",
-        f"  Pretrained: {cfg.student.get('pretrained', 'N/A')}",
-        "",
-        "[Distillation Method]",
-        f"  Name: {cfg.method.name}",
-        f"  Temperature: {cfg.method.get('temperature', 'N/A')}",
-        f"  Alpha (task): {cfg.method.get('alpha', 'N/A')}",
-        f"  Beta (distill): {cfg.method.get('beta', 'N/A')}",
-        f"  Gamma (feature): {cfg.method.get('gamma', 'N/A')}",
-        "",
-        "[Dataset]",
-        f"  Name: {get_dataset_short_name(cfg)}",
-        f"  Num Classes: {cfg.data.get('num_classes', 'N/A')}",
-        "",
-        "[Training]",
-        f"  Epochs: {cfg.training.num_epochs}",
-        f"  Batch Size: {cfg.training.batch_size}",
-        f"  Learning Rate: {cfg.training.lr}",
-        f"  Early Stopping: {cfg.training.early_stopping.enabled} (patience={cfg.training.early_stopping.patience})",
-        "",
-        "[Hardware]",
-        f"  GPU IDs: {cfg.hardware.gpu_ids}",
-        f"  Seed: {cfg.hardware.seed}",
-        "",
-        "=" * 60,
-    ])
+    lines.extend(
+        [
+            f"  Image Size: {cfg.teacher.get('img_size', 'N/A')}",
+            f"  LoRA Checkpoint: {cfg.teacher.get('lora_checkpoint', 'N/A')}",
+            "",
+            "[Student Model]",
+            f"  Name: {cfg.student.name}",
+            f"  Pretrained: {cfg.student.get('pretrained', 'N/A')}",
+            "",
+            "[Distillation Method]",
+            f"  Name: {cfg.method.name}",
+            f"  Temperature: {cfg.method.get('temperature', 'N/A')}",
+            f"  Alpha (task): {cfg.method.get('alpha', 'N/A')}",
+            f"  Beta (distill): {cfg.method.get('beta', 'N/A')}",
+            f"  Gamma (feature): {cfg.method.get('gamma', 'N/A')}",
+            "",
+            "[Dataset]",
+            f"  Name: {get_dataset_short_name(cfg)}",
+            f"  Num Classes: {cfg.data.get('num_classes', 'N/A')}",
+            "",
+            "[Training]",
+            f"  Epochs: {cfg.training.num_epochs}",
+            f"  Batch Size: {cfg.training.batch_size}",
+            f"  Learning Rate: {cfg.training.lr}",
+            f"  Early Stopping: {cfg.training.early_stopping.enabled} (patience={cfg.training.early_stopping.patience})",
+            "",
+            "[Hardware]",
+            f"  GPU IDs: {cfg.hardware.gpu_ids}",
+            f"  Seed: {cfg.hardware.seed}",
+            "",
+            "=" * 60,
+        ]
+    )
 
     with open(summary_path, "w") as f:
         f.write("\n".join(lines))
@@ -174,11 +177,17 @@ def visualize_distillation(
     teacher_img_size,
     save_dir,
     num_samples=10,
+    epoch=None,
 ):
     """Visualize teacher vs student predictions."""
     teacher_model.eval()
     student_model.eval()
-    save_dir = Path(save_dir)
+
+    if epoch is not None:
+        save_dir = Path(save_dir) / f"epoch_{epoch+1}"
+    else:
+        save_dir = Path(save_dir)
+
     save_dir.mkdir(parents=True, exist_ok=True)
 
     sample_count = 0
@@ -263,10 +272,35 @@ def visualize_distillation(
                 sample_count += 1
 
 
+def run_evaluation(student, test_loader, evaluator, device, cfg, logger, phase="Test"):
+    """Helper to run evaluation on test loader(s)."""
+    all_metrics = {}
+    if isinstance(test_loader, dict):
+        for ds_name, loader in test_loader.items():
+            metrics = evaluator.evaluate_model(
+                student, loader, device, cfg.data.num_classes
+            )
+            logger.info(f"--- {phase} ({ds_name}) ---")
+            evaluator.print_metrics(metrics, phase=f"{phase}_{ds_name}")
+            for k, v in metrics.items():
+                if isinstance(v, (float, int)):
+                    all_metrics[f"{phase.lower()}/{ds_name}/{k.lower()}"] = v
+    else:
+        metrics = evaluator.evaluate_model(
+            student, test_loader, device, cfg.data.num_classes
+        )
+        logger.info(f"--- {phase} ---")
+        evaluator.print_metrics(metrics, phase=phase)
+        for k, v in metrics.items():
+            if isinstance(v, (float, int)):
+                all_metrics[f"{phase.lower()}/{k.lower()}"] = v
+    return all_metrics
+
+
 @hydra.main(version_base=None, config_path="config", config_name="distill")
 def main(cfg: DictConfig):
     # Set environment and seed
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, cfg.hardware.gpu_ids))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, cfg.gpu_ids))
     set_seed(cfg.hardware.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -302,7 +336,39 @@ def main(cfg: DictConfig):
     )
 
     # Load data
-    train_loader, val_loader, test_loader = SegDatasetProcessor.build_data_loaders(cfg)
+    distill_cfg = cfg.get("distillation", {})
+    distill_enabled = distill_cfg.get("enabled", False)
+
+    if distill_enabled:
+        # Distillation mode: use split datasets (distillation subset)
+        adaptation_ratio = distill_cfg.get("adaptation_ratio", 0.5)
+        split_seed = distill_cfg.get("split_seed", 42)
+        split_file = distill_cfg.get("split_file", None)
+
+        logger.info(f"=== Distillation Split Mode ===")
+        logger.info(f"Adaptation ratio: {adaptation_ratio}, Seed: {split_seed}")
+
+        loaders = SegDatasetProcessor.build_distillation_data_loaders(
+            cfg,
+            adaptation_ratio=adaptation_ratio,
+            seed=split_seed,
+            split_file=split_file,
+        )
+
+        # Distill.py always uses the distillation subset
+        train_loader = loaders["distillation_train"]
+        val_loader = loaders["distillation_val"]
+        test_loader = loaders["test"]
+
+        logger.info(f"Using distillation split:")
+        logger.info(
+            f"  Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)}"
+        )
+    else:
+        # Normal mode: use full dataset
+        train_loader, val_loader, test_loader = SegDatasetProcessor.build_data_loaders(
+            cfg
+        )
 
     # Create models
     teacher = ModelBuilder.create_model(cfg.teacher, cfg.data.num_classes, device)
@@ -355,6 +421,8 @@ def main(cfg: DictConfig):
 
     # Training loop
     best_dice = 0.0
+    best_model_path = None
+    global_step = 0
     for epoch in range(cfg.training.num_epochs):
         student.train()
         distiller.train()
@@ -386,9 +454,10 @@ def main(cfg: DictConfig):
                 if teacher_extractor:
                     teacher_outputs["layer_features"] = teacher_extractor.get_features()
 
+            s_model = student.module if hasattr(student, "module") else student
             student_raw = (
-                student(images, return_features=True)
-                if hasattr(student, "backbone")
+                s_model(images, return_features=True)
+                if hasattr(s_model, "backbone")
                 else student(images)
             )
             if isinstance(student_raw, tuple):
@@ -398,6 +467,43 @@ def main(cfg: DictConfig):
 
             if student_extractor:
                 student_outputs["layer_features"] = student_extractor.get_features()
+
+            # Hybrid Distillation: Collect attention maps and specific features
+            if cfg.method.name == "hybrid":
+                if cfg.method.get("gamma_attn", 0) > 0:
+                    # Collect student attention maps
+                    student_attn_maps = []
+                    s_model = student.module if hasattr(student, "module") else student
+                    # Student is SegmentationModel, its backbone is MAEBackbone
+                    if hasattr(s_model, "backbone") and hasattr(
+                        s_model.backbone, "blocks"
+                    ):
+                        for blk in s_model.backbone.blocks:
+                            if hasattr(blk, "attn") and hasattr(blk.attn, "last_attn"):
+                                student_attn_maps.append(blk.attn.last_attn)
+                    elif hasattr(s_model, "blocks"):
+                        for blk in s_model.blocks:
+                            if hasattr(blk, "attn") and hasattr(blk.attn, "last_attn"):
+                                student_attn_maps.append(blk.attn.last_attn)
+                    student_outputs["attn_maps"] = student_attn_maps
+
+                    # Collect teacher attention maps
+                    teacher_attn_maps = []
+                    t_model = teacher.module if hasattr(teacher, "module") else teacher
+                    # Teacher can be LoRA_Sam (with .sam) or just Sam
+                    image_encoder = None
+                    if hasattr(t_model, "sam") and hasattr(
+                        t_model.sam, "image_encoder"
+                    ):
+                        image_encoder = t_model.sam.image_encoder
+                    elif hasattr(t_model, "image_encoder"):
+                        image_encoder = t_model.image_encoder
+
+                    if image_encoder and hasattr(image_encoder, "blocks"):
+                        for blk in image_encoder.blocks:
+                            if hasattr(blk, "attn") and hasattr(blk.attn, "last_attn"):
+                                teacher_attn_maps.append(blk.attn.last_attn)
+                    teacher_outputs["attn_maps"] = teacher_attn_maps
 
             # Distillation Loss
             loss_dict = distiller(student_outputs, teacher_outputs, masks)
@@ -413,6 +519,15 @@ def main(cfg: DictConfig):
 
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+            # Step-level logging
+            if global_step % 10 == 0:
+                step_log = {"global_step": global_step}
+                for k, v in loss_dict.items():
+                    step_log[f"train_step/{k}"] = v.item()
+                step_log["train_step/lr"] = optimizer.param_groups[0]["lr"]
+                wandb.log(step_log)
+            global_step += 1
+
         # Validation
         student.eval()
         val_metrics = evaluator.evaluate_model(
@@ -423,11 +538,41 @@ def main(cfg: DictConfig):
         # Log to wandb
         log_data = {
             "epoch": epoch + 1,
-            "val/dice": val_metrics["Dice"],
             "lr": optimizer.param_groups[0]["lr"],
         }
+        # Add training losses (epoch average)
         for k, v in running_losses.items():
             log_data[f"train/{k}"] = v / len(train_loader)
+
+        # Add all val metrics
+        for k, v in val_metrics.items():
+            if isinstance(v, (float, int)):
+                log_data[f"val/{k.lower()}"] = v
+
+        # Test Every Epoch (All metrics)
+        test_metrics = run_evaluation(
+            student, test_loader, evaluator, device, cfg, logger, phase="Test"
+        )
+        log_data.update(test_metrics)
+
+        # Visualize Every Epoch
+        vis_loader = (
+            list(test_loader.values())[0]
+            if isinstance(test_loader, dict)
+            else test_loader
+        )
+        visualize_distillation(
+            teacher,
+            student,
+            vis_loader,
+            device,
+            cfg.data.num_classes,
+            cfg.teacher.img_size,
+            vis_dir,
+            num_samples=cfg.visualization.num_samples,
+            epoch=epoch,
+        )
+
         wandb.log(log_data)
 
         # Save best model and check early stopping
@@ -435,17 +580,27 @@ def main(cfg: DictConfig):
             if es_enabled and (val_metrics["Dice"] - best_dice) > min_delta:
                 es_counter = 0
 
+            # Delete previous best model to save space
+            if best_model_path and best_model_path.exists():
+                try:
+                    best_model_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Could not delete old best model: {e}")
+
             best_dice = val_metrics["Dice"]
-            save_path = models_dir / "best_model.pth"
+            best_model_path = (
+                models_dir / f"best_epoch_{epoch+1}_dice{best_dice:.4f}.pth"
+            )
             torch.save(
                 {
+                    "epoch": epoch + 1,
                     "model_state_dict": student.state_dict(),
                     "distiller_state_dict": distiller.state_dict(),
                     "dice": best_dice,
                 },
-                save_path,
+                best_model_path,
             )
-            logger.info(f"Saved best model to {save_path}")
+            logger.info(f"Saved best model to {best_model_path}")
         elif es_enabled:
             es_counter += 1
             if es_counter >= patience:
@@ -455,31 +610,15 @@ def main(cfg: DictConfig):
         scheduler.step()
 
     # Final Test
-    if (models_dir / "best_model.pth").exists():
-        checkpoint = torch.load(models_dir / "best_model.pth", weights_only=False)
+    if best_model_path and best_model_path.exists():
+        checkpoint = torch.load(best_model_path, weights_only=False)
         student.load_state_dict(checkpoint["model_state_dict"])
 
-        if isinstance(test_loader, dict):
-            for ds_name, loader in test_loader.items():
-                test_metrics = evaluator.evaluate_model(
-                    student, loader, device, cfg.data.num_classes
-                )
-                evaluator.print_metrics(test_metrics, phase=f"Test_{ds_name}")
-                # Log all metrics to wandb
-                for k, v in test_metrics.items():
-                    if not isinstance(v, (float, int)):
-                        continue
-                    wandb.log({f"test/{ds_name}/{k.lower()}": v})
-        else:
-            test_metrics = evaluator.evaluate_model(
-                student, test_loader, device, cfg.data.num_classes
-            )
-            evaluator.print_metrics(test_metrics, phase="Test")
-            # Log all metrics to wandb
-            for k, v in test_metrics.items():
-                if not isinstance(v, (float, int)):
-                    continue
-                wandb.log({f"test/{k.lower()}": v})
+        test_metrics = run_evaluation(
+            student, test_loader, evaluator, device, cfg, logger, phase="Final_Test"
+        )
+        # Log all metrics to wandb
+        wandb.log(test_metrics)
 
         # Final visualization
         vis_loader = (
@@ -495,6 +634,8 @@ def main(cfg: DictConfig):
             cfg.data.num_classes,
             cfg.teacher.img_size,
             vis_dir,
+            num_samples=cfg.visualization.num_samples,
+            epoch=None,  # Final one doesn't need epoch subfolder or we can use "final"
         )
 
     wandb.finish()
