@@ -2,6 +2,6 @@
 defaults:
   - _self_
   - data: dynamic
-  - model: TinyUSFM
+  - model: E0_AL_D0
 
-gpu_ids: [0]
+gpu_ids: [1]

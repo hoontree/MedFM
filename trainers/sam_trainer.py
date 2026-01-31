@@ -45,66 +45,75 @@ class SAMTrainer(BaseTrainer):
 
     def _get_num_epochs(self) -> int:
         """Get number of training epochs."""
-        return self._get_config_value('training', ['num_epochs', 'max_epochs'], 100, int)
+        return self._get_config_value(
+            "training", ["num_epochs", "max_epochs"], 100, int
+        )
 
     def _get_base_lr(self) -> float:
         """Get base learning rate."""
-        return self._get_config_value('training', ['base_lr', 'lr'], 1e-4, float)
+        return self._get_config_value("training", ["base_lr", "lr"], 1e-4, float)
 
     def _get_dice_weight(self) -> float:
         """Get dice loss weight."""
-        return self._get_config_value('training', ['dice_param', 'dice_weight'], 0.8, float)
+        return self._get_config_value(
+            "training", ["dice_param", "dice_weight"], 0.8, float
+        )
 
     def _get_grad_clip_config(self) -> Dict:
         # Support both optimizer.grad_clip (legacy) and optimizer.gradient_clip (new)
-        opt_cfg = self.cfg.get('optimizer', {})
-        return opt_cfg.get('grad_clip', opt_cfg.get('gradient_clip', {}))
+        opt_cfg = self.cfg.get("optimizer", {})
+        return opt_cfg.get("grad_clip", opt_cfg.get("gradient_clip", {}))
 
     def _get_n_gpus(self) -> int:
         """Get number of GPUs from config."""
-        hw = self.cfg.get('hardware', {})
+        hw = self.cfg.get("hardware", {})
         # Try direct keys first
-        for key in ['n_gpu', 'n_gpus']:
+        for key in ["n_gpu", "n_gpus"]:
             if (value := hw.get(key)) is not None:
                 return int(value)
         # Try gpu_ids list
-        if (gpu_ids := hw.get('gpu_ids')) and isinstance(gpu_ids, (list, tuple)):
+        if (gpu_ids := hw.get("gpu_ids")) and isinstance(gpu_ids, (list, tuple)):
             return len(gpu_ids)
         return 1
 
     def _get_warmup_config(self) -> Dict[str, int | bool]:
         """Get warmup configuration with clear priority order."""
-        training = self.cfg.get('training', {})
-        scheduler = self.cfg.get('scheduler', {})
-        
+        training = self.cfg.get("training", {})
+        scheduler = self.cfg.get("scheduler", {})
+
         # Priority 1: warmup_epochs (most specific)
-        if (warmup_epochs := training.get('warmup_epochs')) and int(warmup_epochs) > 0:
-            return {"enabled": True, "steps": int(warmup_epochs) * len(self.train_loader)}
-        
+        if (warmup_epochs := training.get("warmup_epochs")) and int(warmup_epochs) > 0:
+            return {
+                "enabled": True,
+                "steps": int(warmup_epochs) * len(self.train_loader),
+            }
+
         # Priority 2: warmup_period or warmup_iters
-        warmup_steps = training.get('warmup_period') or scheduler.get('warmup_iters')
+        warmup_steps = training.get("warmup_period") or scheduler.get("warmup_iters")
         if warmup_steps and int(warmup_steps) > 0:
             return {"enabled": True, "steps": int(warmup_steps)}
-        
+
         # Priority 3: warmup flag only (no steps configured)
-        if training.get('warmup', False):
-            self.logger.warning("Warmup enabled but no steps configured. Disabling warmup.")
-        
+        if training.get("warmup", False):
+            self.logger.warning(
+                "Warmup enabled but no steps configured. Disabling warmup."
+            )
+
         return {"enabled": False, "steps": 0}
 
     def _create_model(self):
         """Create SAM model with LoRA or hybrid adapter."""
         # Get SAM type (vit_b, vit_l, vit_h)
-        sam_type = self.cfg.model.get('sam_type', 'vit_b')
+        sam_type = self.cfg.model.get("sam_type", "vit_b")
         if sam_type not in sam_model_registry:
             # Fallback: check if model name itself is a valid sam type
             if self.cfg.model.name in sam_model_registry:
                 sam_type = self.cfg.model.name
             else:
-                sam_type = 'vit_b'
+                sam_type = "vit_b"
 
         # Get checkpoint path
-        checkpoint = self.cfg.model.get('sam_checkpoint', self.cfg.model.get('ckpt'))
+        checkpoint = self.cfg.model.get("sam_checkpoint", self.cfg.model.get("ckpt"))
 
         # Register SAM model
         sam, _ = sam_model_registry[sam_type](
@@ -116,24 +125,32 @@ class SAMTrainer(BaseTrainer):
         )
 
         # Load LoRA/Adapter module
-        module_path = self.cfg.model.get('module', 'model.sam_lora_image_encoder_mask_decoder')
+        module_path = self.cfg.model.get(
+            "module", "model.sam_lora_image_encoder_mask_decoder"
+        )
         pkg = import_module(module_path)
 
         # Build kwargs for LoRA_Sam (supports both old and new config styles)
         model_kwargs = {}
-        if self.cfg.model.get('adaptation_mode'):
-            model_kwargs['adaptation_mode'] = self.cfg.model.adaptation_mode
+        if self.cfg.model.get("adaptation_mode"):
+            model_kwargs["adaptation_mode"] = self.cfg.model.adaptation_mode
 
         # Alignment layer configuration (for encoder_frozen_alignment_* modes)
-        if self.cfg.model.get('alignment_num_blocks'):
-            model_kwargs['alignment_num_blocks'] = self.cfg.model.alignment_num_blocks
-        if self.cfg.model.get('alignment_hidden_channels'):
-            model_kwargs['alignment_hidden_channels'] = self.cfg.model.alignment_hidden_channels
+        if self.cfg.model.get("alignment_num_blocks"):
+            model_kwargs["alignment_num_blocks"] = self.cfg.model.alignment_num_blocks
+        if self.cfg.model.get("alignment_hidden_channels"):
+            model_kwargs["alignment_hidden_channels"] = (
+                self.cfg.model.alignment_hidden_channels
+            )
 
-        self.model = pkg.LoRA_Sam(sam, self.cfg.model.get('rank', 4), **model_kwargs).to(self.device)
+        self.model = pkg.LoRA_Sam(
+            sam, self.cfg.model.get("rank", 4), **model_kwargs
+        ).to(self.device)
 
         # Load LoRA checkpoint if provided (support both config key names)
-        lora_ckpt = self.cfg.model.get('lora_checkpoint', self.cfg.model.get('lora_ckpt'))
+        lora_ckpt = self.cfg.model.get(
+            "lora_checkpoint", self.cfg.model.get("lora_ckpt")
+        )
         if lora_ckpt is not None:
             self.model.load_lora_parameters(lora_ckpt)
             self.logger.info(f"Loaded LoRA checkpoint: {lora_ckpt}")
@@ -141,15 +158,17 @@ class SAMTrainer(BaseTrainer):
         # Setup DataParallel
         if self._get_n_gpus() > 1:
             self.model = nn.DataParallel(self.model)
-            
+
         self._setup_loss_functions()
 
         # Set multimask output
-        self.multimask_output = self.cfg.get('multimask_output', False)
+        self.multimask_output = self.cfg.get("multimask_output", False)
 
         # Log model info
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
         self.logger.info(f"Total parameters: {total_params:,}")
         self.logger.info(f"Trainable parameters: {trainable_params:,}")
 
@@ -161,18 +180,22 @@ class SAMTrainer(BaseTrainer):
         - Distillation mode: Uses split dataset (adaptation or distillation subset)
           Configure via cfg.distillation.enabled and cfg.distillation.phase
         """
-        distill_cfg = self.cfg.get('distillation', {})
-        distill_enabled = distill_cfg.get('enabled', False)
+        distill_cfg = self.cfg.get("distillation", {})
+        distill_enabled = distill_cfg.get("enabled", False)
 
         if distill_enabled:
             # Distillation mode: use split datasets
-            phase = distill_cfg.get('phase', 'adaptation')  # 'adaptation' or 'distillation'
-            adaptation_ratio = distill_cfg.get('adaptation_ratio', 0.5)
-            split_seed = distill_cfg.get('split_seed', 42)
-            split_file = distill_cfg.get('split_file', None)
+            phase = distill_cfg.get(
+                "phase", "adaptation"
+            )  # 'adaptation' or 'distillation'
+            adaptation_ratio = distill_cfg.get("adaptation_ratio", 0.5)
+            split_seed = distill_cfg.get("split_seed", 42)
+            split_file = distill_cfg.get("split_file", None)
 
             self.logger.info(f"=== Distillation Mode: {phase} ===")
-            self.logger.info(f"Adaptation ratio: {adaptation_ratio}, Seed: {split_seed}")
+            self.logger.info(
+                f"Adaptation ratio: {adaptation_ratio}, Seed: {split_seed}"
+            )
 
             loaders = SegDatasetProcessor.build_distillation_data_loaders(
                 self.cfg,
@@ -182,26 +205,30 @@ class SAMTrainer(BaseTrainer):
             )
 
             # Select appropriate loaders based on phase
-            if phase == 'adaptation':
-                self.train_loader = loaders['adaptation_train']
-                self.val_loader = loaders['adaptation_val']
+            if phase == "adaptation":
+                self.train_loader = loaders["adaptation_train"]
+                self.val_loader = loaders["adaptation_val"]
             else:  # 'distillation'
-                self.train_loader = loaders['distillation_train']
-                self.val_loader = loaders['distillation_val']
+                self.train_loader = loaders["distillation_train"]
+                self.val_loader = loaders["distillation_val"]
 
-            self.test_loader = loaders['test']
+            self.test_loader = loaders["test"]
 
             self.logger.info(f"Using {phase} split:")
         else:
             # Normal mode: use full dataset
-            self.train_loader, self.val_loader, self.test_loader = SegDatasetProcessor.build_data_loaders(self.cfg)
+            self.train_loader, self.val_loader, self.test_loader = (
+                SegDatasetProcessor.build_data_loaders(self.cfg)
+            )
 
         self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
         self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
 
         # Log test set sizes
         if isinstance(self.test_loader, dict):
-            total_test = sum(len(loader.dataset) for loader in self.test_loader.values())
+            total_test = sum(
+                len(loader.dataset) for loader in self.test_loader.values()
+            )
             self.logger.info(f"Test set size (Total): {total_test}")
         for name, loader in self._iter_test_loaders():
             prefix = "  - " if isinstance(self.test_loader, dict) else ""
@@ -211,21 +238,21 @@ class SAMTrainer(BaseTrainer):
         """Create optimizer."""
         base_lr = self._get_base_lr()
 
-        optimizer_name = self.cfg.optimizer.get('name', 'SGD')
+        optimizer_name = self.cfg.optimizer.get("name", "SGD")
 
         if optimizer_name == "AdamW":
             self.optimizer = optim.AdamW(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
                 lr=base_lr,
                 betas=(0.9, 0.999),
-                weight_decay=self.cfg.optimizer.get('weight_decay', 0.1)
+                weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
             )
         else:
             self.optimizer = optim.SGD(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
                 lr=base_lr,
                 momentum=0.9,
-                weight_decay=0.0001
+                weight_decay=0.0001,
             )
 
         self.logger.info(f"Optimizer: {optimizer_name}, Base LR: {base_lr}")
@@ -233,16 +260,16 @@ class SAMTrainer(BaseTrainer):
     def _create_scheduler(self):
         """Create learning rate scheduler with warmup and polynomial decay."""
         warmup_cfg = self._get_warmup_config()
-        warmup_steps = warmup_cfg['steps']
-        warmup_enabled = warmup_cfg['enabled']
+        warmup_steps = warmup_cfg["steps"]
+        warmup_enabled = warmup_cfg["enabled"]
 
         max_epochs = self._get_num_epochs()
         total_iters = max_epochs * len(self.train_loader)
-        power = float(self.cfg.get('scheduler', {}).get('power', 0.9))
+        power = float(self.cfg.get("scheduler", {}).get("power", 0.9))
 
         # Minimum learning rate ratio (prevents LR from reaching 0)
         base_lr = self._get_base_lr()
-        min_lr = float(self.cfg.get('scheduler', {}).get('min_lr', 1e-6))
+        min_lr = float(self.cfg.get("scheduler", {}).get("min_lr", 1e-6))
         min_lr_ratio = min_lr / base_lr
 
         def lr_lambda(current_step: int) -> float:
@@ -252,20 +279,31 @@ class SAMTrainer(BaseTrainer):
                 return (current_step + 1) / warmup_steps
 
             # Polynomial decay phase
-            shift_iter = current_step - warmup_steps if (warmup_enabled and warmup_steps > 0) else current_step
+            shift_iter = (
+                current_step - warmup_steps
+                if (warmup_enabled and warmup_steps > 0)
+                else current_step
+            )
             shift_iter = min(max(0, shift_iter), total_iters)  # Clamp to valid range
             decay = (1.0 - shift_iter / total_iters) ** power
             return max(min_lr_ratio, decay)
 
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
-        self.logger.info(f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, max_iterations={total_iters}, power={power}, min_lr={min_lr}")
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=lr_lambda
+        )
+        self.logger.info(
+            f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, max_iterations={total_iters}, power={power}, min_lr={min_lr}"
+        )
+
     def _get_current_lr(self) -> float:
         """Get current learning rate from optimizer."""
-        return self.optimizer.param_groups[0]['lr']
+        return self.optimizer.param_groups[0]["lr"]
 
     def _get_base_model(self):
         """Get base model (handle DataParallel wrapper)."""
-        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        return (
+            self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        )
 
     def _iter_test_loaders(self):
         """Iterate over test loaders with names."""
@@ -274,7 +312,7 @@ class SAMTrainer(BaseTrainer):
                 yield name, loader
         else:
             yield "test", self.test_loader
-            
+
     def _setup_loss_functions(self):
         """Setup loss functions based on number of classes."""
         # Setup loss functions
@@ -286,27 +324,19 @@ class SAMTrainer(BaseTrainer):
         self.dice_loss = DiceLoss(self.cfg.data.num_classes)
 
     def _calc_loss(self, outputs, label_batch, low_res_label_batch):
-        """Calculate loss based on number of classes."""
+        """Calculate loss using unified channel-based approach."""
         dice_weight = self._get_dice_weight()
 
-        if self.cfg.data.num_classes == 2:
-            # Binary segmentation
-            logits = outputs['masks']
-            target = label_batch.unsqueeze(1).float()
+        # Both binary and multi-class now use low_res_logits and low_res_label_batch (float [B, C, H, W])
+        logits = outputs["low_res_logits"]
+        target = low_res_label_batch
 
-            # Ensure target and logits have the same resolution
-            if logits.shape[-2:] != target.shape[-2:]:
-                target = F.interpolate(target, size=logits.shape[-2:], mode='nearest')
+        # Ensure target and logits have the same resolution
+        if logits.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
 
-            target = (target > 0.5).float()
-
-            loss_ce = self.bce_loss(logits, target)
-            loss_dice = self.dice_loss(logits, target)
-        else:
-            # Multi-class segmentation
-            low_res_logits = outputs['low_res_logits']
-            loss_ce = self.ce_loss(low_res_logits, low_res_label_batch.long())
-            loss_dice = self.dice_loss(low_res_logits, low_res_label_batch, softmax=True)
+        loss_ce = self.bce_loss(logits, target)
+        loss_dice = self.dice_loss(logits, target)
 
         loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice
 
@@ -320,7 +350,9 @@ class SAMTrainer(BaseTrainer):
         total_ce_loss = 0.0
         total_dice_loss = 0.0
 
-        train_pbar = tqdm(self.train_loader, desc=f'Epoch {epoch + 1}/{self._get_num_epochs()}')
+        train_pbar = tqdm(
+            self.train_loader, desc=f"Epoch {epoch + 1}/{self._get_num_epochs()}"
+        )
 
         for image_batch, label_batch, low_res_label_batch in train_pbar:
             image_batch = image_batch.to(self.device)
@@ -331,16 +363,18 @@ class SAMTrainer(BaseTrainer):
             outputs = self.model(image_batch, self.multimask_output, self.img_size)
 
             # Calculate loss
-            loss, loss_ce, loss_dice = self._calc_loss(outputs, label_batch, low_res_label_batch)
+            loss, loss_ce, loss_dice = self._calc_loss(
+                outputs, label_batch, low_res_label_batch
+            )
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            
+
             # Gradient clipping
             grad_clip_config = self._get_grad_clip_config()
-            if grad_clip_config.get('enabled', False):
-                max_norm = grad_clip_config.get('max_norm', 1.0)
+            if grad_clip_config.get("enabled", False):
+                max_norm = grad_clip_config.get("max_norm", 1.0)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
 
             self.optimizer.step()
@@ -355,29 +389,28 @@ class SAMTrainer(BaseTrainer):
             total_dice_loss += loss_dice.item()
 
             # Update progress bar
-            train_pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'lr': f'{lr:.6f}'
-            })
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr:.6f}"})
 
             # Log to wandb (step-level metrics)
             if self.global_step % 10 == 0:
-                wandb.log({
-                    'step_train/loss': loss.item(),
-                    'step_train/loss_ce': loss_ce.item(),
-                    'step_train/loss_dice': loss_dice.item(),
-                    'step_train/learning_rate': lr,
-                    'global_step': self.global_step
-                })
+                wandb.log(
+                    {
+                        "step_train/loss": loss.item(),
+                        "step_train/loss_ce": loss_ce.item(),
+                        "step_train/loss_dice": loss_dice.item(),
+                        "step_train/learning_rate": lr,
+                        "global_step": self.global_step,
+                    }
+                )
 
             self.global_step += 1
 
         # Calculate average losses
         num_batches = len(self.train_loader)
         metrics = {
-            'loss': total_loss / num_batches,
-            'loss_ce': total_ce_loss / num_batches,
-            'loss_dice': total_dice_loss / num_batches,
+            "loss": total_loss / num_batches,
+            "loss_ce": total_ce_loss / num_batches,
+            "loss_dice": total_dice_loss / num_batches,
         }
 
         return metrics
@@ -391,10 +424,10 @@ class SAMTrainer(BaseTrainer):
             self.val_loader,
             self.device,
             self.cfg.data.num_classes,
-            img_size=self.img_size
+            img_size=self.img_size,
         )
 
-        self.evaluator.print_metrics(val_metrics, phase='validation')
+        self.evaluator.print_metrics(val_metrics, phase="validation")
 
         return val_metrics
 
@@ -417,11 +450,14 @@ class SAMTrainer(BaseTrainer):
                 self.device,
                 self.cfg.data.num_classes,
                 img_size=self.img_size,
-                return_predictions=True
+                return_predictions=True,
             )
             metrics, images_list, preds_list, masks_list = result
 
-            self.evaluator.print_metrics(metrics, phase=f'test_{name}' if isinstance(self.test_loader, dict) else 'test')
+            self.evaluator.print_metrics(
+                metrics,
+                phase=f"test_{name}" if isinstance(self.test_loader, dict) else "test",
+            )
 
             # Store metrics with appropriate keys
             if isinstance(self.test_loader, dict):
@@ -444,14 +480,18 @@ class SAMTrainer(BaseTrainer):
 
         # Create epoch-specific visualization directory
         vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
-        num_vis_samples = self.cfg.get('visualization', {}).get('num_samples', None)
+        num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", None)
 
         sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
-        self.logger.info(f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}...")
+        self.logger.info(
+            f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}..."
+        )
 
         for name, loader in self._iter_test_loaders():
             save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
-            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+            phase_name = (
+                f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+            )
 
             if predictions_cache and name in predictions_cache:
                 # Use cached predictions (no additional forward pass)
@@ -463,11 +503,12 @@ class SAMTrainer(BaseTrainer):
                     self.cfg.data.num_classes,
                     save_dir,
                     num_samples=num_vis_samples,
-                    phase_name=phase_name
+                    phase_name=phase_name,
                 )
             else:
                 # Fallback to original method if no cache
                 from utils.visualize import visualize_predictions
+
                 visualize_predictions(
                     self.model,
                     loader,
@@ -475,9 +516,9 @@ class SAMTrainer(BaseTrainer):
                     self.cfg.data.num_classes,
                     save_dir,
                     num_samples=num_vis_samples,
-                    model_type='sam',
+                    model_type="sam",
                     img_size=self.img_size,
-                    phase_name=phase_name
+                    phase_name=phase_name,
                 )
 
         self.logger.info(f"Visualizations saved to {vis_dir}")

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 
 class BaseDistiller(nn.Module, ABC):
@@ -14,9 +14,23 @@ class BaseDistiller(nn.Module, ABC):
         super().__init__()
         self.cfg = cfg
         self.temperature = cfg.method.get("temperature", 4.0)
-        self.alpha = cfg.method.get("alpha", 0.5)
-        self.beta = cfg.method.get("beta", 0.5)
+        self.alpha = cfg.method.get("alpha", 1.0)
+        self.beta = cfg.method.get("beta", 0.0)
         self.gamma = cfg.method.get("gamma", 0.0)
+
+    def prepare(self, student: nn.Module, teacher: nn.Module):
+        """
+        Prepare the distiller by registering hooks, initializing adapters, etc.
+        Called once before training starts.
+        """
+        pass
+
+    def on_step_begin(self):
+        """
+        Called at the beginning of each training step.
+        Used to clear feature buffers or reset internal state.
+        """
+        pass
 
     @abstractmethod
     def forward(

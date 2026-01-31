@@ -3,6 +3,7 @@ from distillers.logit_distiller import LogitDistiller
 from distillers.feature_distiller import FeatureDistiller
 from distillers.adaptive_distiller import AdaptiveDistiller
 from distillers.hybrid_distiller import HybridDistiller
+from distillers.unified_distiller import UnifiedDistiller
 
 # Make sure all distillers are registered when the package is imported
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "FeatureDistiller",
     "AdaptiveDistiller",
     "HybridDistiller",
+    "UnifiedDistiller",
 ]

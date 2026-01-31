@@ -32,7 +32,7 @@ scheduler:
 
 hardware:
   n_gpus: 1
-  seed: 1234
+  seed: 42
   deterministic: 1
   gpu_ids: [0]
 

@@ -1,0 +1,5 @@
+#@package _global_
+wandb:
+  project: medical-foundation-models
+  entity: hheo
+  log_model: true

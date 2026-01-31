@@ -15,6 +15,7 @@ Supported adaptation modes:
     - encoder_frozen_decoder_frozen: Freeze both (inference only)
     - encoder_frozen_alignment_decoder_ft: Freeze encoder, alignment layer, full fine-tune decoder
     - encoder_frozen_alignment_decoder_lora: Freeze encoder, alignment layer, LoRA on decoder
+    - encoder_frozen_alignment_decoder_frozen: Freeze encoder and decoder, train alignment layer only
 """
 
 import math
@@ -105,12 +106,14 @@ class LoRA_Sam(nn.Module):
         "encoder_frozen_decoder_frozen",
         "encoder_frozen_alignment_decoder_ft",
         "encoder_frozen_alignment_decoder_lora",
+        "encoder_frozen_alignment_decoder_frozen",
     }
 
     def __init__(
         self,
         sam_model: Sam,
-        r: int = 4,
+        r_e: int = 4,
+        r_d: int = 4,
         adaptation_mode: str = "dual_lora",
         lora_layer=None,
         alignment_num_blocks: int = 4,
@@ -125,7 +128,8 @@ class LoRA_Sam(nn.Module):
             )
 
         self.adaptation_mode = adaptation_mode
-        self.r = r
+        self.r_e = r_e
+        self.r_d = r_d
 
         # Parse adaptation mode
         encoder_mode, decoder_mode, use_alignment = self._parse_adaptation_mode(
@@ -156,10 +160,10 @@ class LoRA_Sam(nn.Module):
         self.cross_attn_it_Bs = []
 
         # Apply adaptation to encoder
-        self._adapt_encoder(sam_model, encoder_mode, r)
+        self._adapt_encoder(sam_model, encoder_mode)
 
         # Apply adaptation to decoder
-        self._adapt_decoder(sam_model, decoder_mode, r)
+        self._adapt_decoder(sam_model, decoder_mode)
 
         # Setup alignment layer if needed
         self.alignment_layer = None
@@ -203,13 +207,15 @@ class LoRA_Sam(nn.Module):
             in_channels=encoder_output_dim,
             hidden_channels=self.alignment_hidden_channels,
             num_blocks=self.alignment_num_blocks,
+            use_bn=self.use_alignment,
         )
         print(
             f"[LoRA_Sam] Alignment Layer: {self.alignment_layer.get_num_params():,} parameters"
         )
 
-    def _adapt_encoder(self, sam_model: Sam, mode: str, r: int):
+    def _adapt_encoder(self, sam_model: Sam, mode: str):
         """Apply adaptation strategy to the image encoder."""
+        r = self.r_e
         if mode == "frozen":
             # Freeze all encoder parameters
             for param in sam_model.image_encoder.parameters():
@@ -251,8 +257,9 @@ class LoRA_Sam(nn.Module):
                     w_b_linear_v,
                 )
 
-    def _adapt_decoder(self, sam_model: Sam, mode: str, r: int):
+    def _adapt_decoder(self, sam_model: Sam, mode: str):
         """Apply adaptation strategy to the mask decoder."""
+        r = self.r_d
         decoder_transformer = sam_model.mask_decoder.transformer
 
         if mode == "frozen":
@@ -756,6 +763,7 @@ if __name__ == "__main__":
         "encoder_frozen_decoder_lora",
         "encoder_frozen_alignment_decoder_ft",
         "encoder_frozen_alignment_decoder_lora",
+        "encoder_frozen_alignment_decoder_frozen",
     ]
 
     for mode in test_modes:

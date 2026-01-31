@@ -7,10 +7,11 @@ model:
   name: sam_hybrid
   module: model.sam_hybrid_adapter
   sam_type: vit_b
-  adaptation_mode: encoder_frozen_alignment_decoder_ft
+  adaptation_mode: encoder_frozen_alignment_decoder_frozen
   img_size: 224
   rank: 4
   sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  use_bn: false
 
   # Alignment layer configuration
   alignment_num_blocks: 4

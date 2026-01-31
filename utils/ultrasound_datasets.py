@@ -10,6 +10,35 @@ import torchvision.transforms as T
 from sklearn.model_selection import train_test_split
 from transformers import SegformerImageProcessor
 
+
+def _format_mask(mask, num_classes):
+    """
+    Format mask into [C, H, W] float 0/1 tensor.
+
+    Args:
+        mask: PIL Image or [H, W] array
+        num_classes: Number of classes
+    Returns:
+        torch.Tensor: [C, H, W] float. For num_classes=1, shape is [1, H, W].
+    """
+    mask_np = np.array(mask)
+    if num_classes == 1:
+        # Binary case: assume > 0 or > 127 is foreground depending on value range
+        if mask_np.max() > 1:
+            mask_np = (mask_np > 127).astype(np.float32)
+        else:
+            mask_np = (mask_np > 0).astype(np.float32)
+        return torch.from_numpy(mask_np).unsqueeze(0).float()
+    else:
+        # Multi-class case: convert to one-hot [C, H, W]
+        # In this project, multi-class labels are usually 0, 1, 2...
+        mask_long = torch.from_numpy(mask_np.astype(np.int64)).long()
+        # Handle cases where mask_np might have values >= num_classes due to noise if any
+        mask_long = torch.clamp(mask_long, 0, num_classes - 1)
+        mask_one_hot = torch.nn.functional.one_hot(mask_long, num_classes=num_classes)
+        return mask_one_hot.permute(2, 0, 1).float()
+
+
 class BUID(Dataset):
     """
     BUID Dataset (Breast Ultrasound Images Dataset)
@@ -165,25 +194,11 @@ class BUID(Dataset):
             )  # [C, H, W]
 
         # --- Mask tensor and low_res_label creation ---
-        mask_np = np.array(mask)
+        mask_tensor = _format_mask(mask, self.num_classes)
 
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
+        # low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
         return image_tensor, mask_tensor, low_res_tensor
 
@@ -492,26 +507,11 @@ class BUS_UCLM(Dataset):
             )  # [C, H, W]
 
         # --- Mask tensor and low_res_label creation ---
-        mask_np = np.array(mask)
+        mask_tensor = _format_mask(mask, self.num_classes)
 
-        if self.num_classes == 2:
-            # 0/1/2 -> 0/1 float (if malignant/benign are both foreground)
-            # Based on UltrasoundSegmentationDataset reference: everything >0 to 1
-            mask_np = (mask_np > 0).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
-
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 0).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
+        # low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
         return image_tensor, mask_tensor, low_res_tensor
 
@@ -751,23 +751,12 @@ class BUSI(Dataset):
 
         mask_np = np.array(mask)
 
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
+        # --- Mask tensor and low_res_label creation ---
+        mask_tensor = _format_mask(mask, self.num_classes)
 
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
+        # low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
         return image_tensor, mask_tensor, low_res_tensor
 
@@ -959,23 +948,14 @@ class BUSBRA(Dataset):
             )  # [C, H, W]
         mask_np = np.array(mask)
 
-        if self.num_classes == 2:
-            # 0/255 -> 0/1 float
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)  # [H, W], float 0/1
+        # --- Mask tensor and low_res_label creation ---
+        mask_tensor = _format_mask(mask, self.num_classes)
 
-            # low-res mask
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)  # [h, w], float 0/1
-        else:
-            # multi-class
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
+        # low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
+        return image_tensor, mask_tensor, low_res_tensor
 
         return image_tensor, mask_tensor, low_res_tensor
 
@@ -988,7 +968,6 @@ class BUSBRA(Dataset):
             if random.random() > 0.5:
                 image = TF.vflip(image)
                 label = TF.vflip(label)
-
         if random.random() > 0.5:
             angle = random.uniform(-30, 30)
             image = TF.rotate(image, angle)
@@ -1090,12 +1069,8 @@ class UltrasoundSegmentationDataset(Dataset):
         image = TF.to_tensor(image)
         image = self.normalize(image)  # [C, H, W]
 
-        if self.num_classes == 2:
-            label = torch.from_numpy(np.array(label)).float() / 255.0
-            label = (label > 0.5).float()
-        else:
-            label = torch.from_numpy(np.array(label)).long()
-        return image, label
+        label_tensor = _format_mask(label, self.num_classes)
+        return image, label_tensor
 
     def _joint_transform(self, image, label):
         if self.task_type == "tumor":
@@ -1256,22 +1231,11 @@ class B(Dataset):
             )(image_tensor)
 
         # Format Mask
-        mask_np = np.array(mask)
-        if self.num_classes == 2:
-            mask_np = (mask_np > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_np)
+        mask_tensor = _format_mask(mask, self.num_classes)
 
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img)
-            low_res_np = (low_res_np > 127).astype(np.float32)
-            low_res_tensor = torch.from_numpy(low_res_np)
-        else:
-            # multi-class assumption: pixel values are classes
-            mask_tensor = torch.from_numpy(mask_np.astype(np.int64)).long()
-
-            low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-            low_res_np = np.array(low_res_mask_img).astype(np.int64)
-            low_res_tensor = torch.from_numpy(low_res_np).long()
+        # low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
         return image_tensor, mask_tensor, low_res_tensor
 

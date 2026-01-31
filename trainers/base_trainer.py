@@ -25,7 +25,7 @@ from utils.evaluate import Evaluator_seg
 class EarlyStopping:
     """Early stopping to prevent overfitting."""
 
-    def __init__(self, patience: int = 10, min_delta: float = 0.0, mode: str = 'max'):
+    def __init__(self, patience: int = 10, min_delta: float = 0.0, mode: str = "max"):
         """
         Args:
             patience: Number of epochs to wait before stopping
@@ -45,7 +45,7 @@ class EarlyStopping:
             self.best_score = score
             return True
 
-        if self.mode == 'max':
+        if self.mode == "max":
             improved = score > self.best_score + self.min_delta
         else:
             improved = score < self.best_score - self.min_delta
@@ -81,7 +81,7 @@ class BaseTrainer(ABC):
             cfg: Configuration object (OmegaConf DictConfig)
         """
         self.cfg = cfg
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize attributes
         self.model = None
@@ -105,7 +105,7 @@ class BaseTrainer(ABC):
         self.current_epoch = 0
         self.global_step = 0
 
-    def setup(self, mode: str = 'train'):
+    def setup(self, mode: str = "train"):
         """
         Setup training environment.
 
@@ -122,7 +122,7 @@ class BaseTrainer(ABC):
         self._setup_logger()
 
         # Setup wandb
-        if mode == 'train':
+        if mode == "train":
             self._setup_wandb()
 
         # Create data loaders
@@ -132,7 +132,7 @@ class BaseTrainer(ABC):
         self._create_model()
 
         # Setup training components (only for training mode)
-        if mode == 'train':
+        if mode == "train":
             self._create_optimizer()
             self._create_scheduler()
             self._setup_early_stopping()
@@ -143,14 +143,14 @@ class BaseTrainer(ABC):
 
     def _set_seed(self):
         """Set random seeds for reproducibility."""
-        seed = self.cfg.get('hardware', {}).get('seed', 1234)
+        seed = self.cfg.get("hardware", {}).get("seed", 1234)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-        deterministic = self.cfg.get('hardware', {}).get('deterministic', True)
+        deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
         if deterministic:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
@@ -162,19 +162,19 @@ class BaseTrainer(ABC):
         """Setup experiment directories."""
         # Get model name
         model_name = self.cfg.model.get("adaptation_mode", self.cfg.model.name)
-        if self.cfg.data.get('name') == 'dynamic':
+        if self.cfg.data.get("name") == "dynamic":
             dataset_name = "+".join(self.cfg.data.train)
         else:
             dataset_name = self.cfg.data.name
 
         # Create base directory
-        logs_root = Path(self.cfg.get('output', {}).get('dir', 'logs'))
+        logs_root = Path(self.cfg.get("output", {}).get("dir", "logs"))
 
         # Create experiment tags
         exp_tags = self._create_exp_tags()
 
         # Create timestamp-based experiment directory
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
 
         # Final experiment directory
@@ -189,8 +189,8 @@ class BaseTrainer(ABC):
         self.log_dir = self.exp_dir
 
         # Save config
-        config_file = self.exp_dir / 'config.yaml'
-        with open(config_file, 'w') as f:
+        config_file = self.exp_dir / "config.yaml"
+        with open(config_file, "w") as f:
             OmegaConf.save(self.cfg, f)
 
     def _create_exp_tags(self) -> list:
@@ -198,13 +198,13 @@ class BaseTrainer(ABC):
         exp_tags = []
 
         # Add custom tags from config
-        if hasattr(self.cfg.training, 'batch_size'):
+        if hasattr(self.cfg.training, "batch_size"):
             exp_tags.append(f"bs{self.cfg.training.batch_size}")
 
-        if hasattr(self.cfg.training, 'base_lr'):
+        if hasattr(self.cfg.training, "base_lr"):
             if self.cfg.training.base_lr != 0.01:
                 exp_tags.append(f"lr{self.cfg.training.base_lr}")
-        elif hasattr(self.cfg.training, 'lr'):
+        elif hasattr(self.cfg.training, "lr"):
             if self.cfg.training.lr != 0.01:
                 exp_tags.append(f"lr{self.cfg.training.lr}")
 
@@ -218,25 +218,29 @@ class BaseTrainer(ABC):
 
     def _setup_wandb(self):
         """Setup Weights & Biases logging."""
-        wandb_config = self.cfg.get('wandb', {})
+        wandb_config = self.cfg.get("wandb", {})
 
         wandb.init(
-            entity=wandb_config.get('entity', 'hheo'),
-            project=wandb_config.get('project', 'TinyUSFM'),
+            entity=wandb_config.get("entity", "hheo"),
+            project=wandb_config.get("project", "medical_foundation_models"),
             name=f"{self.cfg.model.get('adaptation_mode', self.cfg.model.get('name', 'model'))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config=OmegaConf.to_container(self.cfg, resolve=True),
-            dir=str(self.exp_dir)
+            dir=str(self.exp_dir),
         )
 
     def _setup_early_stopping(self):
         """Setup early stopping."""
-        early_stop_cfg = self.cfg.get('training', {}).get('early_stopping', {})
+        early_stop_cfg = self.cfg.get("training", {}).get("early_stopping", {})
 
-        if early_stop_cfg.get('enabled', False):
-            patience = early_stop_cfg.get('patience', 15)
-            min_delta = early_stop_cfg.get('min_delta', 0.001)
-            self.early_stopping = EarlyStopping(patience=patience, min_delta=min_delta, mode='max')
-            self.logger.info(f"Early stopping enabled: patience={patience}, min_delta={min_delta}")
+        if early_stop_cfg.get("enabled", False):
+            patience = early_stop_cfg.get("patience", 15)
+            min_delta = early_stop_cfg.get("min_delta", 0.001)
+            self.early_stopping = EarlyStopping(
+                patience=patience, min_delta=min_delta, mode="max"
+            )
+            self.logger.info(
+                f"Early stopping enabled: patience={patience}, min_delta={min_delta}"
+            )
 
     @abstractmethod
     def _create_model(self):
@@ -296,13 +300,17 @@ class BaseTrainer(ABC):
 
     def _visualize_predictions(self):
         """Visualize test predictions. Should be implemented by subclasses."""
-        self.logger.warning(f"{self.__class__.__name__} does not implement _visualize_predictions")
+        self.logger.warning(
+            f"{self.__class__.__name__} does not implement _visualize_predictions"
+        )
 
     def train(self):
         """Main training loop."""
         self.logger.info("Starting training")
 
-        num_epochs = self.cfg.training.get('num_epochs', self.cfg.training.get('max_epochs', 100))
+        num_epochs = self.cfg.training.get(
+            "num_epochs", self.cfg.training.get("max_epochs", 100)
+        )
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch
@@ -312,19 +320,23 @@ class BaseTrainer(ABC):
 
             # Validate
             val_metrics = self.validate(epoch)
-            
+
             # Test
             test_metrics = self.test()
 
             # Log metrics
-            self._log_metrics(epoch, train_metrics, val_metrics, test_metrics=test_metrics)
+            self._log_metrics(
+                epoch, train_metrics, val_metrics, test_metrics=test_metrics
+            )
 
             # Save checkpoint
             self._save_checkpoint(epoch, val_metrics)
 
             # Early stopping check
             if self.early_stopping is not None:
-                self.early_stopping(val_metrics.get('Dice', val_metrics.get('dice', 0.0)))
+                self.early_stopping(
+                    val_metrics.get("Dice", val_metrics.get("dice", 0.0))
+                )
 
                 if self.early_stopping.should_stop():
                     self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
@@ -343,41 +355,59 @@ class BaseTrainer(ABC):
 
         self.logger.info("Training completed!")
 
-    def _log_metrics(self, epoch: int, train_metrics: Dict, val_metrics: Dict, test_metrics: Dict = None):
+    def _log_metrics(
+        self,
+        epoch: int,
+        train_metrics: Dict,
+        val_metrics: Dict,
+        test_metrics: Dict = None,
+    ):
         """Log training and validation metrics."""
         # Log to console
-        self.logger.info(f"\nEpoch {epoch + 1}/{self.cfg.training.get('num_epochs', self.cfg.training.get('max_epochs', 100))}")
+        self.logger.info(
+            f"\nEpoch {epoch + 1}/{self.cfg.training.get('num_epochs', self.cfg.training.get('max_epochs', 100))}"
+        )
         self.logger.info(f"Train:")
-        self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in train_metrics.items()]))
+        self.logger.info(
+            f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in train_metrics.items()])
+        )
         self.logger.info(f"Val:")
-        self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()]))
+        self.logger.info(
+            f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()])
+        )
         if test_metrics is not None:
             self.logger.info(f"Test:")
-            self.logger.info(f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()]))
+            self.logger.info(
+                f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()])
+            )
 
         # Log to wandb (epoch-level metrics)
-        wandb_metrics = {'epoch': epoch + 1}
-        wandb_metrics.update({f'epoch_train/{k}': v for k, v in train_metrics.items()})
-        wandb_metrics.update({f'epoch_val/{k}': v for k, v in val_metrics.items()})
+        wandb_metrics = {"epoch": epoch + 1}
+        wandb_metrics.update({f"epoch_train/{k}": v for k, v in train_metrics.items()})
+        wandb_metrics.update({f"epoch_val/{k}": v for k, v in val_metrics.items()})
         if test_metrics is not None:
-            wandb_metrics.update({f'epoch_test/{k}': v for k, v in test_metrics.items()})
+            wandb_metrics.update(
+                {f"epoch_test/{k}": v for k, v in test_metrics.items()}
+            )
         wandb.log(wandb_metrics)
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
-        dice_score = val_metrics.get('Dice', val_metrics.get('dice', 0.0))
+        dice_score = val_metrics.get("Dice", val_metrics.get("dice", 0.0))
 
         # Save best model
         if dice_score > self.best_metric:
             self.best_metric = dice_score
-            self.best_model_path = self.ckpt_dir / f'best_epoch_{epoch + 1}_dice{dice_score:.4f}.pth'
+            self.best_model_path = (
+                self.ckpt_dir / f"best_epoch_{epoch + 1}_dice{dice_score:.4f}.pth"
+            )
             self._save_model(self.best_model_path)
             self.logger.info(f"Saved best model: {self.best_model_path}")
 
         # Periodic checkpoint
-        save_interval = self.cfg.get('training', {}).get('save_interval', 20)
+        save_interval = self.cfg.get("training", {}).get("save_interval", 20)
         if (epoch + 1) % save_interval == 0:
-            ckpt_path = self.ckpt_dir / f'epoch_{epoch + 1}.pth'
+            ckpt_path = self.ckpt_dir / f"epoch_{epoch + 1}.pth"
             self._save_model(ckpt_path)
             self.logger.info(f"Saved checkpoint: {ckpt_path}")
 
@@ -402,7 +432,7 @@ class BaseTrainer(ABC):
         self.logger.info(f"Test results saved to {test_results_path}")
 
         # Log to wandb
-        wandb.log({f'test/{k}': v for k, v in test_metrics.items()})
+        wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
 
     def run_test_only(self, checkpoint_path: str):
         """Run test-only mode with a specific checkpoint."""
@@ -418,11 +448,11 @@ class BaseTrainer(ABC):
 
         # Initialize wandb for test-only run
         wandb.init(
-            entity=self.cfg.get('wandb', {}).get('entity', 'hheo'),
-            project=self.cfg.get('wandb', {}).get('project', 'TinyUSFM'),
+            entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
+            project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
             name=f"{self.cfg.model.name}_test_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config=OmegaConf.to_container(self.cfg, resolve=True),
-            tags=['test-only']
+            tags=["test-only"],
         )
 
         # Run test

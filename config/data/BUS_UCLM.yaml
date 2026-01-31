@@ -9,7 +9,7 @@ path:
     vis:
       samples: 16
       interval: 10
-num_classes: 2
+num_classes: 1
 img_size: 224
 extensions: [".png"]
 partition_dir: "partitions"  # train/test split directory

@@ -3,7 +3,7 @@ type: Combined
 train: [BUSBRA]
 val: [BUSBRA]
 test: [BUID, BUS_UCLM]
-num_classes: 2  # Binary segmentation (background, lesion)
+num_classes: 1  # Binary segmentation (background, lesion)
 img_size: 224  # Resize images to 224x224 for training and evaluation
 # img_size: 512  # Resize images to 512x512 for training and evaluation
 path:

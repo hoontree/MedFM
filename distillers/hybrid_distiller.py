@@ -35,10 +35,7 @@ class HybridDistiller(BaseDistiller):
         self.use_ce = cfg.method.get("use_ce", True)
 
         # Task losses
-        if self.num_classes == 2:
-            self.task_criterion = nn.BCEWithLogitsLoss()
-        else:
-            self.task_criterion = nn.CrossEntropyLoss()
+        self.task_criterion = nn.BCEWithLogitsLoss()
 
         self.dice_loss = DiceLoss(self.num_classes)
         self.kl_div = nn.KLDivLoss(reduction="batchmean")
@@ -67,17 +64,11 @@ class HybridDistiller(BaseDistiller):
         ce_loss = torch.tensor(0.0).to(student_logits.device)
         dice_loss = torch.tensor(0.0).to(student_logits.device)
 
-        if self.num_classes == 2:
-            target_mask = targets.unsqueeze(1).float()
-            if self.use_ce:
-                ce_loss = self.task_criterion(student_logits, target_mask)
-            if self.use_dice:
-                dice_loss = self.dice_loss(student_logits, target_mask)
-        else:
-            if self.use_ce:
-                ce_loss = self.task_criterion(student_logits, targets.long())
-            if self.use_dice:
-                dice_loss = self.dice_loss(student_logits, targets, softmax=True)
+        target_mask = targets.float()
+        if self.use_ce:
+            ce_loss = self.task_criterion(student_logits, target_mask)
+        if self.use_dice:
+            dice_loss = self.dice_loss(student_logits, target_mask)
 
         task_loss = 0.0
         if self.use_ce and self.use_dice:
@@ -102,7 +93,7 @@ class HybridDistiller(BaseDistiller):
             else:
                 teacher_logits_resized = teacher_logits
 
-            if self.num_classes == 2:
+            if self.num_classes == 1:
                 # Binary: expand to 2 channels
                 student_soft = F.log_softmax(
                     torch.cat([torch.zeros_like(student_logits), student_logits], dim=1)

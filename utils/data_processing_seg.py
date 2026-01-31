@@ -9,7 +9,14 @@ from omegaconf import OmegaConf, ListConfig
 import json
 import copy
 
-from utils.ultrasound_datasets import BUID, BUS_UCLM, BUSI, BUSBRA, UltrasoundSegmentationDataset, B
+from utils.ultrasound_datasets import (
+    BUID,
+    BUS_UCLM,
+    BUSI,
+    BUSBRA,
+    UltrasoundSegmentationDataset,
+    B,
+)
 
 
 # Dataset class registry - safer than eval()
@@ -27,20 +34,9 @@ def get_dataset_class(name: str) -> Type[Dataset]:
     """Get dataset class from registry by name."""
     if name not in DATASET_REGISTRY:
         available = ", ".join(DATASET_REGISTRY.keys())
-        raise ValueError(
-            f"Unknown dataset class: {name}. Available: {available}"
-        )
+        raise ValueError(f"Unknown dataset class: {name}. Available: {available}")
     return DATASET_REGISTRY[name]
 
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 class SegDatasetProcessor:
     @staticmethod
@@ -77,7 +73,7 @@ class SegDatasetProcessor:
         return dataset_class(data_cfg, split=split)
 
     @staticmethod
-    def build_dataset(cfg): 
+    def build_dataset(cfg):
         # Case 1: Dynamic/Combined Dataset (Multi-dataset support)
         # Check if train/test are lists rather than just looking at type
         is_list_train = hasattr(cfg.data, "train") and isinstance(
@@ -94,15 +90,19 @@ class SegDatasetProcessor:
             train_list = cfg.data.train if is_list_train else []
             for name in train_list:
                 train_datasets.append(
-                    SegDatasetProcessor.load_dataset_from_config(cfg, name, split="train")
+                    SegDatasetProcessor.load_dataset_from_config(
+                        cfg, name, split="train"
+                    )
                 )
 
             if not train_datasets:
                 raise ValueError("No training datasets specified in config.")
             train_dataset = ConcatDataset(train_datasets)
-            print(f"Using combined training dataset consisting of:{', '.join(train_list)}")
+            print(
+                f"Using combined training dataset consisting of:{', '.join(train_list)}"
+            )
             print(f"Total training samples: {len(train_dataset)}")
-            
+
             # 2. Validation Sets (Internal)
             val_datasets = []
             val_list = getattr(cfg.data, "val", None)
@@ -119,7 +119,9 @@ class SegDatasetProcessor:
                     SegDatasetProcessor.load_dataset_from_config(cfg, name, split="val")
                 )
             val_dataset = ConcatDataset(val_datasets)
-            print(f"Using combined validation dataset consisting of:{', '.join(val_list)}")
+            print(
+                f"Using combined validation dataset consisting of:{', '.join(val_list)}"
+            )
             print(f"Total validation samples: {len(val_dataset)}")
             # 3. Test Sets (External Validation) - Keep Separate
             test_datasets = {}
@@ -127,9 +129,13 @@ class SegDatasetProcessor:
 
             if isinstance(test_list, (list, ListConfig)):
                 for name in test_list:
-                    SegDatasetProcessor._add_test_dataset_with_unfiltered(cfg, name, test_datasets)
+                    SegDatasetProcessor._add_test_dataset_with_unfiltered(
+                        cfg, name, test_datasets
+                    )
             elif isinstance(test_list, str):
-                SegDatasetProcessor._add_test_dataset_with_unfiltered(cfg, test_list, test_datasets)
+                SegDatasetProcessor._add_test_dataset_with_unfiltered(
+                    cfg, test_list, test_datasets
+                )
 
             return train_dataset, val_dataset, test_datasets
 
@@ -505,7 +511,7 @@ class SegDatasetProcessor:
     @staticmethod
     def _get_stratified_split_indices_path(cfg, seed: int) -> Path:
         """Get the path for storing/loading stratified split indices."""
-        train_list = cfg.data.train if hasattr(cfg.data, "train") else []
+        train_list = cfg.data.get("train", [])
         if isinstance(train_list, (list, ListConfig)):
             dataset_id = "_".join(train_list)
         else:
@@ -523,7 +529,6 @@ class SegDatasetProcessor:
         seed: int,
     ):
         """Save stratified split indices to JSON file."""
-        
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -542,7 +547,6 @@ class SegDatasetProcessor:
     @staticmethod
     def _load_stratified_split_indices(path: Path) -> Optional[Dict]:
         """Load stratified split indices from JSON file if exists."""
-        
 
         if not path.exists():
             return None
@@ -792,15 +796,17 @@ class SegDatasetProcessor:
     def _add_test_dataset_with_unfiltered(cfg, name, test_datasets_dict):
         """Load test dataset and add unfiltered version if filter_empty_masks is enabled."""
         print(f"Loading Test dataset: {name}")
-        ds: Dataset = SegDatasetProcessor.load_dataset_from_config(cfg, name, split="test")
+        ds: Dataset = SegDatasetProcessor.load_dataset_from_config(
+            cfg, name, split="test"
+        )
         test_datasets_dict[name] = ds
 
         # If dataset has filter_empty_masks enabled, also add unfiltered version
         if hasattr(ds, "filter_empty_masks") and ds.filter_empty_masks:
-            
+
             # Use copy to avoid reloading and re-filtering
             ds_unfiltered = copy.copy(ds)
-            
+
             # Restore original unfiltered file lists
             ds_unfiltered.image_files = list(ds.image_files_unfiltered)
             ds_unfiltered.mask_files = list(ds.mask_files_unfiltered)

@@ -23,21 +23,12 @@ from utils.data_processing_seg import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
 from utils.logger import setup_logger
 from trainers.model_builder import ModelBuilder
+from utils.utils import set_seed
 
 
 # ImageNet normalization constants for denormalization
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
-
-
-def set_seed(seed=1234):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def denormalize_image(img_tensor: np.ndarray) -> np.ndarray:
@@ -150,7 +141,9 @@ def evaluate_and_visualize(
     from medpy.metric.binary import hd95 as compute_hd95, dc, recall
 
     with torch.no_grad():
-        for batch_idx, (images, masks, _) in enumerate(tqdm(data_loader, desc=f"Evaluating {dataset_name}")):
+        for batch_idx, (images, masks, _) in enumerate(
+            tqdm(data_loader, desc=f"Evaluating {dataset_name}")
+        ):
             images = images.to(device)
             masks = masks.to(device)
 
@@ -163,7 +156,7 @@ def evaluate_and_visualize(
                 logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
             # Get predictions
-            if num_classes == 2:
+            if num_classes == 1:
                 probs = torch.sigmoid(logits)
                 preds = (probs > threshold).float()
             else:
@@ -202,7 +195,7 @@ def evaluate_and_visualize(
                 bf_score_list.append(bf_score)
 
                 # Collect for ECE
-                if num_classes == 2:
+                if num_classes == 1:
                     all_probs.append(probs[i].cpu().numpy().flatten())
                     all_labels.append(masks[i].cpu().numpy().flatten())
 
@@ -223,7 +216,7 @@ def evaluate_and_visualize(
                 sample_idx += 1
 
     # Compute ECE
-    if num_classes == 2 and all_probs:
+    if num_classes == 1 and all_probs:
         all_probs_flat = np.concatenate(all_probs)
         all_labels_flat = np.concatenate(all_labels)
         ece = Evaluator_seg.compute_ece(all_probs_flat, all_labels_flat)
@@ -263,10 +256,18 @@ def print_full_metrics(metrics: dict, dataset_name: str, logger):
     logger.info(f"  Dice:        {metrics['Dice']:.4f} +/- {metrics['Dice_std']:.4f}")
     logger.info(f"  HD95:        {metrics['HD95']:.2f} +/- {metrics['HD95_std']:.2f}")
     logger.info(f"  IoU:         {metrics['IoU']:.4f} +/- {metrics['IoU_std']:.4f}")
-    logger.info(f"  Sensitivity: {metrics['Sensitivity']:.4f} +/- {metrics['Sensitivity_std']:.4f}")
-    logger.info(f"  Specificity: {metrics['Specificity']:.4f} +/- {metrics['Specificity_std']:.4f}")
-    logger.info(f"  PixelAcc:    {metrics['PixelAcc']:.4f} +/- {metrics['PixelAcc_std']:.4f}")
-    logger.info(f"  BFScore:     {metrics['BFScore']:.4f} +/- {metrics['BFScore_std']:.4f}")
+    logger.info(
+        f"  Sensitivity: {metrics['Sensitivity']:.4f} +/- {metrics['Sensitivity_std']:.4f}"
+    )
+    logger.info(
+        f"  Specificity: {metrics['Specificity']:.4f} +/- {metrics['Specificity_std']:.4f}"
+    )
+    logger.info(
+        f"  PixelAcc:    {metrics['PixelAcc']:.4f} +/- {metrics['PixelAcc_std']:.4f}"
+    )
+    logger.info(
+        f"  BFScore:     {metrics['BFScore']:.4f} +/- {metrics['BFScore_std']:.4f}"
+    )
     logger.info(f"  ECE:         {metrics['ECE']:.4f}")
     logger.info("=" * 70)
 
@@ -281,13 +282,27 @@ def save_metrics_to_file(all_metrics: dict, save_path: Path):
             f.write(f"Dataset: {dataset_name}\n")
             f.write("-" * 50 + "\n")
             f.write(f"  Samples:     {metrics['num_samples']}\n")
-            f.write(f"  Dice:        {metrics['Dice']:.4f} +/- {metrics['Dice_std']:.4f}\n")
-            f.write(f"  HD95:        {metrics['HD95']:.2f} +/- {metrics['HD95_std']:.2f}\n")
-            f.write(f"  IoU:         {metrics['IoU']:.4f} +/- {metrics['IoU_std']:.4f}\n")
-            f.write(f"  Sensitivity: {metrics['Sensitivity']:.4f} +/- {metrics['Sensitivity_std']:.4f}\n")
-            f.write(f"  Specificity: {metrics['Specificity']:.4f} +/- {metrics['Specificity_std']:.4f}\n")
-            f.write(f"  PixelAcc:    {metrics['PixelAcc']:.4f} +/- {metrics['PixelAcc_std']:.4f}\n")
-            f.write(f"  BFScore:     {metrics['BFScore']:.4f} +/- {metrics['BFScore_std']:.4f}\n")
+            f.write(
+                f"  Dice:        {metrics['Dice']:.4f} +/- {metrics['Dice_std']:.4f}\n"
+            )
+            f.write(
+                f"  HD95:        {metrics['HD95']:.2f} +/- {metrics['HD95_std']:.2f}\n"
+            )
+            f.write(
+                f"  IoU:         {metrics['IoU']:.4f} +/- {metrics['IoU_std']:.4f}\n"
+            )
+            f.write(
+                f"  Sensitivity: {metrics['Sensitivity']:.4f} +/- {metrics['Sensitivity_std']:.4f}\n"
+            )
+            f.write(
+                f"  Specificity: {metrics['Specificity']:.4f} +/- {metrics['Specificity_std']:.4f}\n"
+            )
+            f.write(
+                f"  PixelAcc:    {metrics['PixelAcc']:.4f} +/- {metrics['PixelAcc_std']:.4f}\n"
+            )
+            f.write(
+                f"  BFScore:     {metrics['BFScore']:.4f} +/- {metrics['BFScore_std']:.4f}\n"
+            )
             f.write(f"  ECE:         {metrics['ECE']:.4f}\n")
             f.write("\n")
 
@@ -297,7 +312,9 @@ def main(cfg: DictConfig):
     # Validate checkpoint path
     checkpoint_path = cfg.get("checkpoint")
     if not checkpoint_path:
-        raise ValueError("checkpoint path is required. Usage: python eval.py checkpoint=/path/to/model.pth")
+        raise ValueError(
+            "checkpoint path is required. Usage: python eval.py checkpoint=/path/to/model.pth"
+        )
 
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():

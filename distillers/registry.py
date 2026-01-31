@@ -30,6 +30,12 @@ class DistillerRegistry:
     @classmethod
     def create(cls, cfg: Any) -> BaseDistiller:
         """Create a distiller instance based on config."""
-        method_name = cfg.method.name
-        distiller_cls = cls.get(method_name)
+        method_name = cfg.method.name.lower()
+
+        # Consolidation: maintain backward compatibility by aliasing old names to unified
+        if method_name in ["logit", "feature", "adaptive_layer", "hybrid"]:
+            distiller_cls = cls.get("unified")
+        else:
+            distiller_cls = cls.get(method_name)
+
         return distiller_cls(cfg)

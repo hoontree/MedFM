@@ -61,7 +61,6 @@ class LoRA_Sam(nn.Module):
     Args:
         sam_model: a vision transformer model, see base_vit.py
         r: rank of LoRA
-        num_classes: how many classes the model output, default to the vit model
         lora_layer: which layer we apply LoRA.
 
     Examples::

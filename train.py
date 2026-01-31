@@ -12,9 +12,6 @@ def main(cfg: DictConfig):
     gpu_ids = cfg.get("gpu_ids", [0])
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
 
-    # Print config for debugging
-    print(OmegaConf.to_yaml(cfg))
-
     # Create trainer based on model type
     trainer = ModelBuilder.create_trainer(cfg)
 

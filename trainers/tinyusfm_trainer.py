@@ -22,35 +22,35 @@ from utils.schedule import build_scheduler, get_lr_decay_param_groups
 
 def _build_criterion(num_classes: int) -> nn.Module:
     """Build loss function based on number of classes."""
-    if num_classes == 2:
-        return nn.BCEWithLogitsLoss()
-    return nn.CrossEntropyLoss()
+    return nn.BCEWithLogitsLoss()
 
 
-def _compute_loss(criterion: nn.Module, outputs: torch.Tensor, masks: torch.Tensor, num_classes: int) -> torch.Tensor:
+def _compute_loss(
+    criterion: nn.Module, outputs: torch.Tensor, masks: torch.Tensor, num_classes: int
+) -> torch.Tensor:
     """Compute loss with proper mask formatting."""
-    if num_classes == 2:
-        return criterion(outputs, masks.unsqueeze(1))
-    return criterion(outputs, masks.long())
+    return criterion(outputs, masks)
 
 
 def _build_optimizer(model: nn.Module, cfg) -> optim.Optimizer:
     """Build optimizer from config."""
-    optimizer_name = cfg.optimizer.get('name', 'Adam')
-    lr = cfg.training.get('lr', 0.0001)
-    weight_decay = cfg.optimizer.get('weight_decay', 0)
+    optimizer_name = cfg.optimizer.get("name", "Adam")
+    lr = cfg.training.get("lr", 0.0001)
+    weight_decay = cfg.optimizer.get("weight_decay", 0)
 
-    if optimizer_name == 'Adam':
+    if optimizer_name == "Adam":
         return optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif optimizer_name == 'SGD':
-        return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
-    elif optimizer_name == 'AdamW':
+    elif optimizer_name == "SGD":
+        return optim.SGD(
+            model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay
+        )
+    elif optimizer_name == "AdamW":
         param_groups = get_lr_decay_param_groups(
             model=model,
             base_lr=lr,
             weight_decay=weight_decay,
             num_layers=12,
-            layer_decay=0.8
+            layer_decay=0.8,
         )
         return optim.AdamW(param_groups, betas=(0.9, 0.999))
     else:
@@ -71,7 +71,9 @@ class TinyUSFMTrainer(BaseTrainer):
 
         # Log model info
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
         self.logger.info(f"Total parameters: {total_params:,}")
         self.logger.info(f"Trainable parameters: {trainable_params:,}")
 
@@ -79,11 +81,15 @@ class TinyUSFMTrainer(BaseTrainer):
 
     def _create_dataloaders(self):
         """Create data loaders."""
-        self.train_loader, self.val_loader, self.test_loader = SegDatasetProcessor.build_data_loaders(self.cfg)
+        self.train_loader, self.val_loader, self.test_loader = (
+            SegDatasetProcessor.build_data_loaders(self.cfg)
+        )
         self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
         self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
         if isinstance(self.test_loader, dict):
-            total_test = sum(len(loader.dataset) for loader in self.test_loader.values())
+            total_test = sum(
+                len(loader.dataset) for loader in self.test_loader.values()
+            )
             self.logger.info(f"Test set size (Total): {total_test}")
             for name, loader in self.test_loader.items():
                 self.logger.info(f"  - {name}: {len(loader.dataset)}")
@@ -93,21 +99,23 @@ class TinyUSFMTrainer(BaseTrainer):
     def _create_optimizer(self):
         """Create optimizer."""
         self.optimizer = _build_optimizer(self.model, self.cfg)
-        optimizer_name = self.cfg.optimizer.get('name', 'Adam')
-        lr = self.cfg.training.get('lr', 0.0001)
+        optimizer_name = self.cfg.optimizer.get("name", "Adam")
+        lr = self.cfg.training.get("lr", 0.0001)
         self.logger.info(f"Optimizer: {optimizer_name}, LR: {lr}")
 
     def _create_scheduler(self):
         """Create learning rate scheduler."""
-        use_reduce_on_plateau = self.cfg.get('scheduler', {}).get('use_reduce_on_plateau', False)
+        use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
+            "use_reduce_on_plateau", False
+        )
 
         if use_reduce_on_plateau:
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
-                mode='max',
-                factor=self.cfg.scheduler.get('factor', 0.5),
-                patience=self.cfg.scheduler.get('patience', 5),
-                min_lr=self.cfg.scheduler.get('min_lr', 1e-7),
+                mode="max",
+                factor=self.cfg.scheduler.get("factor", 0.5),
+                patience=self.cfg.scheduler.get("patience", 5),
+                min_lr=self.cfg.scheduler.get("min_lr", 1e-7),
             )
             self.logger.info(f"Using ReduceLROnPlateau scheduler")
         else:
@@ -117,55 +125,58 @@ class TinyUSFMTrainer(BaseTrainer):
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         # Handle warmup
-        warmup_epochs = self.cfg.training.get('warmup_epochs', 0)
+        warmup_epochs = self.cfg.training.get("warmup_epochs", 0)
         if epoch < warmup_epochs:
             lr = self.cfg.training.lr * (epoch + 1) / warmup_epochs
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
 
         self.model.train()
         running_loss = 0.0
 
         train_pbar = tqdm(
             self.train_loader,
-            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs} [Training]"
+            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs} [Training]",
         )
 
-        for images, masks, low_res_labels in train_pbar:
+        for images, masks, _ in train_pbar:
             images, masks = images.to(self.device), masks.to(self.device).float()
 
             # Forward pass
             outputs = self.model(images)
 
             # Calculate loss
-            loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
+            loss = _compute_loss(
+                self.criterion, outputs, masks, self.cfg.model.num_classes
+            )
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
 
             # Gradient clipping
-            gradient_clip_enabled = self.cfg.optimizer.get('grad_clip', {}).get('enabled', False)
+            gradient_clip_enabled = self.cfg.optimizer.get("grad_clip", {}).get(
+                "enabled", False
+            )
             if gradient_clip_enabled:
-                max_norm = self.cfg.optimizer.grad_clip.get('max_norm', 1.0)
-                norm_type = self.cfg.optimizer.grad_clip.get('norm_type', 2)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_norm, norm_type=norm_type)
+                max_norm = self.cfg.optimizer.grad_clip.get("max_norm", 1.0)
+                norm_type = self.cfg.optimizer.grad_clip.get("norm_type", 2)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=max_norm, norm_type=norm_type
+                )
 
             self.optimizer.step()
 
             running_loss += loss.item() * images.size(0)
 
             # Update progress bar
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         # Calculate epoch loss
         epoch_loss = running_loss / len(self.train_loader.dataset)
-        current_lr = self.optimizer.param_groups[0]['lr']
+        current_lr = self.optimizer.param_groups[0]["lr"]
 
-        metrics = {
-            'loss': epoch_loss,
-            'lr': current_lr
-        }
+        metrics = {"loss": epoch_loss, "lr": current_lr}
 
         return metrics
 
@@ -177,7 +188,7 @@ class TinyUSFMTrainer(BaseTrainer):
 
         val_pbar = tqdm(
             self.val_loader,
-            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs} [Validation]"
+            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs} [Validation]",
         )
 
         with torch.no_grad():
@@ -188,7 +199,9 @@ class TinyUSFMTrainer(BaseTrainer):
                 outputs = self.model(images)
 
                 # Calculate loss
-                loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
+                loss = _compute_loss(
+                    self.criterion, outputs, masks, self.cfg.model.num_classes
+                )
 
                 val_loss += loss.item() * images.size(0)
 
@@ -196,26 +209,29 @@ class TinyUSFMTrainer(BaseTrainer):
 
         # Evaluate metrics
         val_metrics = self.evaluator.evaluate_model(
-            self.model,
-            self.val_loader,
-            self.device,
-            self.cfg.model.num_classes
+            self.model, self.val_loader, self.device, self.cfg.model.num_classes
         )
 
         # Update scheduler
-        use_reduce_on_plateau = self.cfg.get('scheduler', {}).get('use_reduce_on_plateau', False)
+        use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
+            "use_reduce_on_plateau", False
+        )
         if use_reduce_on_plateau and self.scheduler is not None:
-            self.scheduler.step(val_metrics['Dice'])
-        elif not use_reduce_on_plateau and self.scheduler is not None and epoch >= self.cfg.training.get('warmup_epochs', 0):
+            self.scheduler.step(val_metrics["Dice"])
+        elif (
+            not use_reduce_on_plateau
+            and self.scheduler is not None
+            and epoch >= self.cfg.training.get("warmup_epochs", 0)
+        ):
             self.scheduler.step()
 
         # Add loss to metrics
-        val_metrics['loss'] = val_loss
+        val_metrics["loss"] = val_loss
 
-        self.evaluator.print_metrics(val_metrics, phase='validation')
+        self.evaluator.print_metrics(val_metrics, phase="validation")
 
         return val_metrics
-    
+
     def _iter_test_loaders(self):
         """Iterate over test loaders with names."""
         if isinstance(self.test_loader, dict):
@@ -233,18 +249,18 @@ class TinyUSFMTrainer(BaseTrainer):
         for name, loader in self.test_loader.items():
             if isinstance(self.test_loader, dict):
                 self.logger.info(f"Testing on dataset: {name}")
-                
+
                 results = self.evaluator.evaluate_model(
                     self.model,
                     loader,
                     self.device,
                     self.cfg.model.num_classes,
-                    return_predictions=True
+                    return_predictions=True,
                 )
                 metrics, images_list, preds_list, masks_list = results
                 predictions_cache[name] = (images_list, preds_list, masks_list)
-                self.evaluator.print_metrics(metrics, phase=f'test_{name}')
-                
+                self.evaluator.print_metrics(metrics, phase=f"test_{name}")
+
                 if isinstance(self.test_loader, dict):
                     for k, v in metrics.items():
                         test_metrics[f"{name}/{k}"] = v
@@ -255,20 +271,29 @@ class TinyUSFMTrainer(BaseTrainer):
 
         return test_metrics
 
-    def _visualize_predictions(self, predictions_cache: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]]) -> None:
+    def _visualize_predictions(
+        self,
+        predictions_cache: Dict[
+            str, Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]
+        ],
+    ) -> None:
         """Visualize test predictions."""
         from utils.visualize import visualize_from_predictions
 
         vis_dir = self.exp_dir / "visualizations"
-        num_vis_samples = self.cfg.get('visualization', {}).get('num_samples', 10)
-        
+        num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+
         sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples} samples"
 
-        self.logger.info(f"Generating {sample_msg} visualizations for epoch {self.current_epoch+1}...")
+        self.logger.info(
+            f"Generating {sample_msg} visualizations for epoch {self.current_epoch+1}..."
+        )
 
         for name, loader in self._iter_test_loaders():
             save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
-            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+            phase_name = (
+                f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+            )
 
             if predictions_cache and name in predictions_cache:
                 # Use cached predictions (no additional forward pass)
@@ -280,11 +305,12 @@ class TinyUSFMTrainer(BaseTrainer):
                     self.cfg.data.num_classes,
                     save_dir,
                     num_samples=num_vis_samples,
-                    phase_name=phase_name
+                    phase_name=phase_name,
                 )
             else:
                 # Fallback to original method if no cache
                 from utils.visualize import visualize_predictions
+
                 visualize_predictions(
                     self.model,
                     loader,
@@ -292,20 +318,21 @@ class TinyUSFMTrainer(BaseTrainer):
                     self.cfg.data.num_classes,
                     save_dir,
                     num_samples=num_vis_samples,
-                    model_type='sam',
+                    model_type="sam",
                     img_size=self.img_size,
-                    phase_name=phase_name
+                    phase_name=phase_name,
                 )
 
         self.logger.info(f"Visualizations saved to {vis_dir}")
-        
+
+
 class TinyUSFMLightningModule(L.LightningModule):
     """Lightning module for TinyUSFM training."""
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.model = load_model_seg(self.cfg, torch.device('cpu'))
+        self.model = load_model_seg(self.cfg, torch.device("cpu"))
         self.criterion = _build_criterion(self.cfg.model.num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -319,7 +346,9 @@ class TinyUSFMLightningModule(L.LightningModule):
         images, masks, _ = batch
         outputs = self.model(images)
         loss = self._compute_loss(outputs, masks)
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(
+            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
         return loss
 
     def configure_optimizers(self) -> Tuple[List[optim.Optimizer], List]:
@@ -331,15 +360,23 @@ class TinyUSFMLightningModule(L.LightningModule):
         images, masks, _ = batch
         outputs = self.model(images)
         loss = self._compute_loss(outputs, masks)
-        self.log('val_loss', loss, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        self.log(
+            "val_loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True
+        )
         return loss
 
-    def test_step(self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:
+    def test_step(
+        self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0
+    ) -> torch.Tensor:
         images, masks, _ = batch
         outputs = self.model(images)
         loss = self._compute_loss(outputs, masks)
 
-        preds = torch.sigmoid(outputs) if self.cfg.model.num_classes == 2 else torch.softmax(outputs, dim=1)
+        preds = (
+            torch.sigmoid(outputs)
+            if self.cfg.model.num_classes == 1
+            else torch.softmax(outputs, dim=1)
+        )
 
         vis_dir = Path(self.trainer.logger.log_dir) / "visualizations"
         self.visualize_predictions_batch(
@@ -350,24 +387,30 @@ class TinyUSFMLightningModule(L.LightningModule):
             mean=np.array([0.485, 0.456, 0.406]),
             std=np.array([0.229, 0.224, 0.225]),
             batch_idx=batch_idx,
-            num_samples=10
+            num_samples=10,
         )
 
-        self.log('test_loss', loss, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        self.log(
+            "test_loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True
+        )
         return loss
-    
+
     def configure_gradient_clipping(
         self,
         optimizer: optim.Optimizer,
         gradient_clip_val: Optional[float] = None,
-        gradient_clip_algorithm: Optional[str] = None
+        gradient_clip_algorithm: Optional[str] = None,
     ) -> None:
-        if self.cfg.optimizer.get('grad_clip', {}).get('enabled', False):
-            gradient_clip_val = self.cfg.optimizer.grad_clip.get('max_norm', 1.0)
-            gradient_clip_algorithm = 'norm'
-        super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
+        if self.cfg.optimizer.get("grad_clip", {}).get("enabled", False):
+            gradient_clip_val = self.cfg.optimizer.grad_clip.get("max_norm", 1.0)
+            gradient_clip_algorithm = "norm"
+        super().configure_gradient_clipping(
+            optimizer, gradient_clip_val, gradient_clip_algorithm
+        )
 
-    def predict_step(self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:
+    def predict_step(
+        self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0
+    ) -> torch.Tensor:
         images, _, _ = batch
         return self.model(images)
 
@@ -380,7 +423,7 @@ class TinyUSFMLightningModule(L.LightningModule):
         mean: np.ndarray,
         std: np.ndarray,
         batch_idx: int = 0,
-        num_samples: int = 10
+        num_samples: int = 10,
     ) -> None:
         vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -415,32 +458,32 @@ class TinyUSFMLightningModule(L.LightningModule):
             fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
             # Input Image
-            axes[0].imshow(img, cmap='gray' if img.ndim == 2 else None)
-            axes[0].set_title('Input Image', fontsize=14)
-            axes[0].axis('off')
+            axes[0].imshow(img, cmap="gray" if img.ndim == 2 else None)
+            axes[0].set_title("Input Image", fontsize=14)
+            axes[0].axis("off")
 
             # Ground Truth
-            axes[1].imshow(mask, cmap='jet')
-            axes[1].set_title('Ground Truth', fontsize=14)
-            axes[1].axis('off')
+            axes[1].imshow(mask, cmap="jet")
+            axes[1].set_title("Ground Truth", fontsize=14)
+            axes[1].axis("off")
 
             # Prediction
-            axes[2].imshow(pred, cmap='jet')
-            axes[2].set_title('Prediction', fontsize=14)
-            axes[2].axis('off')
+            axes[2].imshow(pred, cmap="jet")
+            axes[2].set_title("Prediction", fontsize=14)
+            axes[2].axis("off")
 
             # Overlay (Input + Prediction)
-            axes[3].imshow(img, cmap='gray' if img.ndim == 2 else None)
-            cmap = plt.get_cmap('jet')
+            axes[3].imshow(img, cmap="gray" if img.ndim == 2 else None)
+            cmap = plt.get_cmap("jet")
             colored_pred = cmap(pred)
             colored_pred[..., 3] = 0.4  # Set alpha
             axes[3].imshow(colored_pred)
-            axes[3].set_title('Overlay', fontsize=14)
-            axes[3].axis('off')
+            axes[3].set_title("Overlay", fontsize=14)
+            axes[3].axis("off")
 
             plt.tight_layout()
             save_path = vis_dir / f"sample_{sample_count:03d}.png"
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
             sample_count += 1

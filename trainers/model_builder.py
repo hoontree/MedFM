@@ -8,6 +8,7 @@ from hmac import new
 from tabnanny import check
 from typing import TYPE_CHECKING
 import torch
+from importlib import import_module
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -28,8 +29,6 @@ class ModelBuilder:
         "usfm": ("trainers.tinyusfm_trainer", "TinyUSFMTrainer"),
         "segformer": ("trainers.segformer_trainer", "SegformerTrainer"),
         "sam3": ("trainers.sam3_adapter", "SAM3TrainerAdapter"),
-        "ca_sam": ("trainers.ca_sam_trainer", "CASAMTrainer"),
-        "casam": ("trainers.ca_sam_trainer", "CASAMTrainer"),
     }
 
     # Registry mapping model names to model creation functions or classes
@@ -56,8 +55,6 @@ class ModelBuilder:
         Raises:
             ValueError: If model name is not supported
         """
-        import importlib
-
         model_name = cfg.model.name.lower()
 
         if model_name not in cls.TRAINER_MAP:
@@ -67,7 +64,7 @@ class ModelBuilder:
             )
 
         module_path, class_name = cls.TRAINER_MAP[model_name]
-        module = importlib.import_module(module_path)
+        module = import_module(module_path)
         trainer_class = getattr(module, class_name)
         return trainer_class(cfg)
 
@@ -82,7 +79,6 @@ class ModelBuilder:
 
         if "sam" in model_name or "vit" in model_name:
             from model.segment_anything import sam_model_registry
-            from importlib import import_module
 
             sam_type = model_cfg.get("sam_type", model_name)
             if sam_type not in sam_model_registry:
@@ -108,10 +104,9 @@ class ModelBuilder:
 
             # Build kwargs for LoRA_Sam - only pass supported parameters
             lora_sam_kwargs = {}
-            if model_cfg.get("adaptation_mode"):
-                lora_sam_kwargs["adaptation_mode"] = model_cfg.adaptation_mode
-            if model_cfg.get("lora_layer"):
-                lora_sam_kwargs["lora_layer"] = model_cfg.lora_layer
+            lora_sam_kwargs["adaptation_mode"] = model_cfg.get("adaptation_mode", "")
+            lora_sam_kwargs["lora_layer"] = model_cfg.get("lora_layer", "")
+            lora_sam_kwargs["use_bn"] = model_cfg.get("use_bn", True)
 
             model = pkg.LoRA_Sam(sam, model_cfg.get("rank", 4), **lora_sam_kwargs)
 
@@ -134,7 +129,9 @@ class ModelBuilder:
                     }
                     load_info = model.load_state_dict(new_state_dict, strict=False)
             except Exception as e:
-                print(f"Warning: Failed to load checkpoint for tinyusfm model. Error: {e}")
+                print(
+                    f"Warning: Failed to load checkpoint for tinyusfm model. Error: {e}"
+                )
 
         elif "usfm" in model_name:
             from model.usfm_seg import SegmentationModel

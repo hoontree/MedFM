@@ -3,45 +3,13 @@
 defaults:
   - _self_
   - data: dynamic
-  - teacher: sam_vit_b
+  - teacher: sam_encoder_frozen_alignment_decoder_lora
   - student: tinyusfm
   - method: hybrid
+  - log: wandb
+  - training: distillation
 
-gpu_ids: [0]
-
-# Training configuration
-training:
-  num_epochs: 150
-  lr: 0.0005           # Learning rate for student
-  warmup_epochs: 5
-  batch_size: 16
-  num_workers: 8
-  limit_train_batches: null
-
-  early_stopping:
-    enabled: true
-    patience: 30
-    min_delta: 0.0001
-
-# Optimizer configuration
-optimizer:
-  name: AdamW          # AdamW or Adam
-  weight_decay: 0.01
-  gradient_clip:
-    enabled: true
-    max_norm: 1.0
-
-# Scheduler configuration
-scheduler:
-  use_reduce_on_plateau: false
-  warmup_iters: 500
-  total_iters: 15000
-  power: 0.9
-
-# Hardware configuration
-hardware:
-  gpu_ids: [0]
-  seed: 42
+gpu_ids: [1]
 
 # Output configuration
 output:
@@ -50,12 +18,6 @@ output:
 # Visualization
 visualization:
   num_samples: 10
-
-# Wandb configuration
-wandb:
-  project: TinyUSFM
-  entity: hheo
-  log_model: true
 
 # Distillation dataset split configuration
 # When enabled, uses only the distillation subset (non-overlapping with adaptation data)
@@ -66,4 +28,4 @@ distillation:
   # Random seed for reproducible splitting (must match train.py for consistency)
   split_seed: 42
   # Optional: explicit path to split file (auto-generated if null)
-  split_file: null
+  split_file: distillation_stratified_split_BUSBRA_BUSI_B_seed42.json

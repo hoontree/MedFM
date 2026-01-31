@@ -58,7 +58,7 @@ class Evaluator:
 
         metrics = {}
 
-        if num_classes == 2:
+        if num_classes == 1:
             try:
                 auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
             except Exception as e:
@@ -168,27 +168,28 @@ class Evaluator_seg:
     def evaluate_batch(
         preds: torch.Tensor,
         labels: torch.Tensor,
-        num_classes: int = 2,
+        num_classes: int = 1,
         threshold: float = 0.5,
     ) -> Dict[str, List[float]]:
         """
-        Evaluate a single batch for Lightning training.
-        Returns lists of metrics for each sample in the batch.
-        
+        Evaluate a single batch using unified channel-based approach.
+
         Args:
-            preds: Model predictions [B, C, H, W] or [B, 1, H, W] for binary
-            labels: Ground truth labels [B, H, W] or [B, 1, H, W]
-            num_classes: Number of classes
-            threshold: Threshold for binary segmentation
-            
-        Returns:
-            Dictionary with metric lists for aggregation
+            preds: Model predictions [B, C, H, W] (logits)
+            labels: Ground truth labels [B, C, H, W] (float 0/1)
+            num_classes: Number of classes (C)
+            threshold: Threshold for binary mask creation
         """
-        if num_classes == 2:
+        if num_classes == 1:
             return Evaluator_seg._evaluate_batch_binary(preds, labels, threshold)
         else:
-            return Evaluator_seg._evaluate_batch_multiclass(preds, labels, num_classes)
-    
+            # Multi-class: convert channel-based labels back to indices for the multi-class logic
+            # Or refactor multi-class logic to handle channel-based labels
+            labels_indices = torch.argmax(labels, dim=1)
+            return Evaluator_seg._evaluate_batch_multiclass(
+                preds, labels_indices, num_classes
+            )
+
     @staticmethod
     def _evaluate_batch_binary(preds, labels, threshold):
         """Evaluate binary segmentation for a single batch."""
@@ -199,23 +200,20 @@ class Evaluator_seg:
         specificity_list = []
         pixel_acc_list = []
         bf_score_list = []
-        
+
         # Convert predictions to probabilities and binary masks
-        if preds.shape[1] == 1:
-            probs = torch.sigmoid(preds)
-            preds_binary = (probs > threshold).float()
-        else:
-            raise ValueError("Only binary segmentation supported.")
-        
+        probs = torch.sigmoid(preds)
+        preds_binary = (probs > threshold).float()
+
         # Collect probs and labels for ECE calculation later
         all_probs = probs.cpu().numpy().flatten()
         all_labels_flat = labels.cpu().numpy().flatten()
-        
+
         # Process each sample in batch
         for pred, gt in zip(preds_binary, labels):
             pred_np = pred.squeeze().cpu().numpy().astype(bool)
             gt_np = gt.squeeze().cpu().numpy().astype(bool)
-            
+
             dice = dc(pred_np, gt_np)
             if pred_np.any() and gt_np.any():
                 hausdorff = hd95(pred_np, gt_np)
@@ -228,7 +226,7 @@ class Evaluator_seg:
             spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
             pixel_acc = (pred_np == gt_np).sum() / gt_np.size
             bf_score = Evaluator_seg.compute_boundary_score(pred_np, gt_np)
-            
+
             dice_list.append(dice)
             hd95_list.append(hausdorff)
             iou_list.append(iou)
@@ -236,19 +234,19 @@ class Evaluator_seg:
             specificity_list.append(spec)
             pixel_acc_list.append(pixel_acc)
             bf_score_list.append(bf_score)
-        
+
         return {
-            'dice': dice_list,
-            'hd95': hd95_list,
-            'iou': iou_list,
-            'sensitivity': sensitivity_list,
-            'specificity': specificity_list,
-            'pixel_acc': pixel_acc_list,
-            'bf_score': bf_score_list,
-            'probs': all_probs,
-            'labels': all_labels_flat,
+            "dice": dice_list,
+            "hd95": hd95_list,
+            "iou": iou_list,
+            "sensitivity": sensitivity_list,
+            "specificity": specificity_list,
+            "pixel_acc": pixel_acc_list,
+            "bf_score": bf_score_list,
+            "probs": all_probs,
+            "labels": all_labels_flat,
         }
-    
+
     @staticmethod
     def _evaluate_batch_multiclass(preds, labels, num_classes):
         """Evaluate multiclass segmentation for a single batch."""
@@ -258,21 +256,21 @@ class Evaluator_seg:
         sensitivity_per_class = [[] for _ in range(num_classes)]
         specificity_per_class = [[] for _ in range(num_classes)]
         hd95_per_class = [[] for _ in range(num_classes)]
-        
+
         # Convert to class predictions
         preds_class = torch.argmax(preds, dim=1)  # [B, H, W]
-        
+
         for pred, gt in zip(preds_class, labels):
             pred_np = pred.cpu().numpy()
             gt_np = gt.cpu().numpy()
-            
+
             pixel_acc = (pred_np == gt_np).mean()
             pixel_acc_list.append(pixel_acc)
-            
+
             for class_id in range(num_classes):
                 pred_class = pred_np == class_id
                 gt_class = gt_np == class_id
-                
+
                 if not (gt_class.any() or pred_class.any()):
                     dice = 1.0
                     iou = 1.0
@@ -295,42 +293,46 @@ class Evaluator_seg:
                     else:
                         specificity = np.nan
                     if gt_class.any() and pred_class.any():
-                        hd = hd95(pred_class.astype(np.bool_), gt_class.astype(np.bool_))
+                        hd = hd95(
+                            pred_class.astype(np.bool_), gt_class.astype(np.bool_)
+                        )
                     else:
                         hd = 224
-                
+
                 dice_per_class[class_id].append(dice)
                 iou_per_class[class_id].append(iou)
                 sensitivity_per_class[class_id].append(sensitivity)
                 specificity_per_class[class_id].append(specificity)
                 hd95_per_class[class_id].append(hd)
-        
+
         return {
-            'dice_per_class': dice_per_class,
-            'iou_per_class': iou_per_class,
-            'pixel_acc': pixel_acc_list,
-            'sensitivity_per_class': sensitivity_per_class,
-            'specificity_per_class': specificity_per_class,
-            'hd95_per_class': hd95_per_class,
+            "dice_per_class": dice_per_class,
+            "iou_per_class": iou_per_class,
+            "pixel_acc": pixel_acc_list,
+            "sensitivity_per_class": sensitivity_per_class,
+            "specificity_per_class": specificity_per_class,
+            "hd95_per_class": hd95_per_class,
         }
-    
+
     @staticmethod
-    def aggregate_metrics(batch_metrics: List[Dict], num_classes: int = 2) -> Dict[str, float]:
+    def aggregate_metrics(
+        batch_metrics: List[Dict], num_classes: int = 1
+    ) -> Dict[str, float]:
         """
         Aggregate batch metrics into epoch metrics for Lightning.
-        
+
         Args:
             batch_metrics: List of metric dictionaries from evaluate_batch
             num_classes: Number of classes
-            
+
         Returns:
             Aggregated metrics dictionary
         """
-        if num_classes == 2:
+        if num_classes == 1:
             return Evaluator_seg._aggregate_binary(batch_metrics)
         else:
             return Evaluator_seg._aggregate_multiclass(batch_metrics, num_classes)
-    
+
     @staticmethod
     def _aggregate_binary(batch_metrics):
         """Aggregate binary metrics from multiple batches."""
@@ -343,41 +345,41 @@ class Evaluator_seg:
         all_bf_score = []
         all_probs = []
         all_labels = []
-        
+
         for batch in batch_metrics:
-            all_dice.extend(batch['dice'])
-            all_hd95.extend(batch['hd95'])
-            all_iou.extend(batch['iou'])
-            all_sensitivity.extend(batch['sensitivity'])
-            all_specificity.extend(batch['specificity'])
-            all_pixel_acc.extend(batch['pixel_acc'])
-            all_bf_score.extend(batch['bf_score'])
-            all_probs.append(batch['probs'])
-            all_labels.append(batch['labels'])
-        
+            all_dice.extend(batch["dice"])
+            all_hd95.extend(batch["hd95"])
+            all_iou.extend(batch["iou"])
+            all_sensitivity.extend(batch["sensitivity"])
+            all_specificity.extend(batch["specificity"])
+            all_pixel_acc.extend(batch["pixel_acc"])
+            all_bf_score.extend(batch["bf_score"])
+            all_probs.append(batch["probs"])
+            all_labels.append(batch["labels"])
+
         # Compute ECE
         all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)
         ece = Evaluator_seg.compute_ece(all_probs, all_labels)
-        
+
         return {
-            'Dice': np.mean(all_dice),
-            'Dice_std': np.std(all_dice),
-            'HD95': np.mean(all_hd95),
-            'HD95_std': np.std(all_hd95),
-            'IoU': np.mean(all_iou),
-            'IoU_std': np.std(all_iou),
-            'Sensitivity': np.mean(all_sensitivity),
-            'Sensitivity_std': np.std(all_sensitivity),
-            'Specificity': np.mean(all_specificity),
-            'Specificity_std': np.std(all_specificity),
-            'PixelAcc': np.mean(all_pixel_acc),
-            'PixelAcc_std': np.std(all_pixel_acc),
-            'BFScore': np.mean(all_bf_score),
-            'BFScore_std': np.std(all_bf_score),
-            'ECE': ece,
+            "Dice": np.mean(all_dice),
+            "Dice_std": np.std(all_dice),
+            "HD95": np.mean(all_hd95),
+            "HD95_std": np.std(all_hd95),
+            "IoU": np.mean(all_iou),
+            "IoU_std": np.std(all_iou),
+            "Sensitivity": np.mean(all_sensitivity),
+            "Sensitivity_std": np.std(all_sensitivity),
+            "Specificity": np.mean(all_specificity),
+            "Specificity_std": np.std(all_specificity),
+            "PixelAcc": np.mean(all_pixel_acc),
+            "PixelAcc_std": np.std(all_pixel_acc),
+            "BFScore": np.mean(all_bf_score),
+            "BFScore_std": np.std(all_bf_score),
+            "ECE": ece,
         }
-    
+
     @staticmethod
     def _aggregate_multiclass(batch_metrics, num_classes):
         """Aggregate multiclass metrics from multiple batches."""
@@ -387,31 +389,55 @@ class Evaluator_seg:
         all_sensitivity_per_class = [[] for _ in range(num_classes)]
         all_specificity_per_class = [[] for _ in range(num_classes)]
         all_hd95_per_class = [[] for _ in range(num_classes)]
-        
+
         for batch in batch_metrics:
-            all_pixel_acc.extend(batch['pixel_acc'])
+            all_pixel_acc.extend(batch["pixel_acc"])
             for class_id in range(num_classes):
-                all_dice_per_class[class_id].extend(batch['dice_per_class'][class_id])
-                all_iou_per_class[class_id].extend(batch['iou_per_class'][class_id])
-                all_sensitivity_per_class[class_id].extend(batch['sensitivity_per_class'][class_id])
-                all_specificity_per_class[class_id].extend(batch['specificity_per_class'][class_id])
-                all_hd95_per_class[class_id].extend(batch['hd95_per_class'][class_id])
-        
+                all_dice_per_class[class_id].extend(batch["dice_per_class"][class_id])
+                all_iou_per_class[class_id].extend(batch["iou_per_class"][class_id])
+                all_sensitivity_per_class[class_id].extend(
+                    batch["sensitivity_per_class"][class_id]
+                )
+                all_specificity_per_class[class_id].extend(
+                    batch["specificity_per_class"][class_id]
+                )
+                all_hd95_per_class[class_id].extend(batch["hd95_per_class"][class_id])
+
         foreground_ids = list(range(1, num_classes))
-        
+
         return {
-            'PixelAcc': np.nanmean(all_pixel_acc),
-            'PixelAcc_std': np.nanstd(all_pixel_acc),
-            'Dice': np.nanmean([np.nanmean(all_dice_per_class[i]) for i in foreground_ids]),
-            'Dice_std': np.nanstd([item for i in foreground_ids for item in all_dice_per_class[i]]),
-            'IoU': np.nanmean([np.nanmean(all_iou_per_class[i]) for i in foreground_ids]),
-            'IoU_std': np.nanstd([item for i in foreground_ids for item in all_iou_per_class[i]]),
-            'Sensitivity': np.nanmean([np.nanmean(all_sensitivity_per_class[i]) for i in foreground_ids]),
-            'Sensitivity_std': np.nanstd([item for i in foreground_ids for item in all_sensitivity_per_class[i]]),
-            'Specificity': np.nanmean([np.nanmean(all_specificity_per_class[i]) for i in foreground_ids]),
-            'Specificity_std': np.nanstd([item for i in foreground_ids for item in all_specificity_per_class[i]]),
-            'HD95': np.nanmean([np.nanmean(all_hd95_per_class[i]) for i in foreground_ids]),
-            'HD95_std': np.nanstd([item for i in foreground_ids for item in all_hd95_per_class[i]]),
+            "PixelAcc": np.nanmean(all_pixel_acc),
+            "PixelAcc_std": np.nanstd(all_pixel_acc),
+            "Dice": np.nanmean(
+                [np.nanmean(all_dice_per_class[i]) for i in foreground_ids]
+            ),
+            "Dice_std": np.nanstd(
+                [item for i in foreground_ids for item in all_dice_per_class[i]]
+            ),
+            "IoU": np.nanmean(
+                [np.nanmean(all_iou_per_class[i]) for i in foreground_ids]
+            ),
+            "IoU_std": np.nanstd(
+                [item for i in foreground_ids for item in all_iou_per_class[i]]
+            ),
+            "Sensitivity": np.nanmean(
+                [np.nanmean(all_sensitivity_per_class[i]) for i in foreground_ids]
+            ),
+            "Sensitivity_std": np.nanstd(
+                [item for i in foreground_ids for item in all_sensitivity_per_class[i]]
+            ),
+            "Specificity": np.nanmean(
+                [np.nanmean(all_specificity_per_class[i]) for i in foreground_ids]
+            ),
+            "Specificity_std": np.nanstd(
+                [item for i in foreground_ids for item in all_specificity_per_class[i]]
+            ),
+            "HD95": np.nanmean(
+                [np.nanmean(all_hd95_per_class[i]) for i in foreground_ids]
+            ),
+            "HD95_std": np.nanstd(
+                [item for i in foreground_ids for item in all_hd95_per_class[i]]
+            ),
         }
 
     @staticmethod
@@ -419,14 +445,17 @@ class Evaluator_seg:
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
         device: torch.device,
-        num_classes: int = 2,
+        num_classes: int = 1,
         threshold: float = 0.5,
         return_predictions: bool = False,
     ) -> Dict[str, float] | tuple:
         model.eval()
-        if num_classes == 2:
-            return Evaluator_seg._evaluate_binary(model, data_loader, device, threshold, return_predictions)
+        if num_classes == 1:
+            return Evaluator_seg._evaluate_binary(
+                model, data_loader, device, threshold, return_predictions
+            )
         else:
+            # Need to see how _evaluate_multiclass is implemented to see if it needs labels as indices
             return Evaluator_seg._evaluate_multiclass(
                 model, data_loader, device, num_classes, return_predictions
             )
@@ -436,7 +465,7 @@ class Evaluator_seg:
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
         device: torch.device,
-        num_classes: int = 2,
+        num_classes: int = 1,
         img_size: int = 256,
         threshold: float = 0.5,
         return_predictions: bool = False,
@@ -457,7 +486,7 @@ class Evaluator_seg:
             If return_predictions is True: (metrics, images_list, preds_list, masks_list)
         """
         model.eval()
-        if num_classes == 2:
+        if num_classes == 1:
             return Evaluator_seg._evaluate_binary_sam(
                 model, data_loader, device, img_size, threshold, return_predictions
             )
@@ -467,7 +496,9 @@ class Evaluator_seg:
             )
 
     @staticmethod
-    def _evaluate_binary(model, data_loader, device, threshold, return_predictions=False):
+    def _evaluate_binary(
+        model, data_loader, device, threshold, return_predictions=False
+    ):
         dice_list = []
         hd95_list = []
         iou_list = []
@@ -477,7 +508,7 @@ class Evaluator_seg:
         bf_score_list = []
         all_probs = []
         all_labels = []
-        
+
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
@@ -498,7 +529,7 @@ class Evaluator_seg:
                 # Collect for ECE
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.cpu().numpy().flatten())
-                
+
                 if return_predictions:
                     images_list.append(images.cpu())
                     preds_list.append(preds.cpu())
@@ -554,7 +585,9 @@ class Evaluator_seg:
         return metrics
 
     @staticmethod
-    def _evaluate_binary_sam(model, data_loader, device, img_size, threshold, return_predictions=False):
+    def _evaluate_binary_sam(
+        model, data_loader, device, img_size, threshold, return_predictions=False
+    ):
         dice_list = []
         hd95_list = []
         iou_list = []
@@ -654,12 +687,13 @@ class Evaluator_seg:
         with torch.no_grad():
             for images, labels, _ in data_loader:
                 images = images.to(device)
-                labels = labels.to(device)  # [B, H, W]
+                labels = labels.to(device)  # [B, C, H, W]
+                gt_indices = torch.argmax(labels, dim=1)  # [B, H, W]
 
                 outputs = model(images)  # [B, num_classes, H, W]
                 preds = torch.argmax(outputs, dim=1)  # [B, H, W]
 
-                for pred, gt in zip(preds, labels):
+                for pred, gt in zip(preds, gt_indices):
                     pred_np = pred.cpu().numpy()
                     gt_np = gt.cpu().numpy()
 
@@ -744,7 +778,9 @@ class Evaluator_seg:
         return metrics
 
     @staticmethod
-    def _evaluate_multiclass_sam(model, data_loader, device, num_classes, img_size, return_predictions=False):
+    def _evaluate_multiclass_sam(
+        model, data_loader, device, num_classes, img_size, return_predictions=False
+    ):
         dice_per_class = [[] for _ in range(num_classes)]
         iou_per_class = [[] for _ in range(num_classes)]
         pixel_acc_list = []
@@ -761,6 +797,7 @@ class Evaluator_seg:
             for images, labels, low_res_labels in data_loader:
                 images = images.to(device)
                 labels = labels.to(device)
+                gt_indices = torch.argmax(labels, dim=1)
 
                 outputs = model(images, True, img_size)
                 output_masks = outputs["masks"]
@@ -769,10 +806,12 @@ class Evaluator_seg:
                 # Store for visualization if requested
                 if return_predictions:
                     images_list.append(images.cpu())
-                    preds_list.append(preds.unsqueeze(1).cpu())  # Add channel dim for consistency
+                    preds_list.append(
+                        preds.unsqueeze(1).cpu()
+                    )  # Add channel dim for consistency
                     masks_list.append(labels.cpu())
 
-                for pred, gt in zip(preds, labels):
+                for pred, gt in zip(preds, gt_indices):
                     pred_np = pred.cpu().numpy()
                     gt_np = gt.cpu().numpy()
 

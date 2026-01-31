@@ -19,10 +19,7 @@ class LogitDistiller(BaseDistiller):
         self.num_classes = cfg.data.num_classes
 
         # Task losses
-        if self.num_classes == 2:
-            self.task_criterion = nn.BCEWithLogitsLoss()
-        else:
-            self.task_criterion = nn.CrossEntropyLoss()
+        self.task_criterion = nn.BCEWithLogitsLoss()
 
         self.dice_loss = DiceLoss(self.num_classes)
         self.kl_div = nn.KLDivLoss(reduction="batchmean")
@@ -38,16 +35,8 @@ class LogitDistiller(BaseDistiller):
         teacher_logits = teacher_outputs["masks"]
 
         # 1. Task loss (hard targets)
-        if self.num_classes == 2:
-            # Binary case: targets is [B, H, W]
-            task_loss = self.task_criterion(
-                student_logits, targets.unsqueeze(1).float()
-            )
-            dice_loss = self.dice_loss(student_logits, targets.unsqueeze(1).float())
-        else:
-            # Multi-class case: targets is [B, H, W]
-            task_loss = self.task_criterion(student_logits, targets.long())
-            dice_loss = self.dice_loss(student_logits, targets, softmax=True)
+        task_loss = self.task_criterion(student_logits, targets.float())
+        dice_loss = self.dice_loss(student_logits, targets.float())
 
         total_task_loss = 0.5 * task_loss + 0.5 * dice_loss
 
