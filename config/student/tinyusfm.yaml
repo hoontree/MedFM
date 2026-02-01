@@ -1,3 +1,5 @@
+# TinyUSFM student config for distillation
+_target_: model.tinyusfm_seg.SegmentationModel
 name: TinyUSFM
-pretrained: true
-checkpoint: checkpoints/TinyUSFM.pth
+num_classes: ${data.num_classes}
+checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights

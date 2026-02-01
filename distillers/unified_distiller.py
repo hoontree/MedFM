@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, List, Optional
 from distillers.base_distiller import BaseDistiller
-from distillers.registry import DistillerRegistry
+
+
 from utils.sam_utils import DiceLoss
 from utils.feature_extractor import FeatureExtractor
 
@@ -23,7 +24,6 @@ class FeatureAdapter(nn.Module):
         return self.conv(x)
 
 
-@DistillerRegistry.register("unified")
 class UnifiedDistiller(BaseDistiller):
     """
     Unified distillation supporting multiple components controlled by coefficients.
@@ -34,7 +34,7 @@ class UnifiedDistiller(BaseDistiller):
     5. Alignment Layer Distillation (MSE on specific SAM output) - gamma_align
     """
 
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg)
         self.num_classes = cfg.data.num_classes
 

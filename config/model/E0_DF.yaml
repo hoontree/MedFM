@@ -1,5 +1,5 @@
 # @package _global_
-# SAM: Encoder frozen + Alignment layer + Decoder LoRA (E0_AL_DL)
+# SAM: Encoder frozen + Decoder fine-tuned (E0_DF)
 
 defaults:
   - _self_
@@ -10,15 +10,12 @@ trainer:
 
 model:
   _target_: model.sam_hybrid_adapter.build_sam_hybrid
-  name: E0_AL_DL
+  name: E0_DF
   sam_type: vit_b
   num_classes: ${data.num_classes}
   img_size: ${data.img_size}
-  adaptation_mode: encoder_frozen_alignment_decoder_lora
+  adaptation_mode: encoder_frozen_decoder_ft
   r_e: 4
   r_d: 4
   sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-  alignment_num_blocks: 4
-  alignment_hidden_channels: 256
-  alignment_use_bn: true
   checkpoint: null  # Set to path to load trained weights

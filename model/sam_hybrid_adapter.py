@@ -118,6 +118,7 @@ class LoRA_Sam(nn.Module):
         lora_layer=None,
         alignment_num_blocks: int = 4,
         alignment_hidden_channels: int = 256,
+        alignment_use_bn: bool = True,
     ):
         super(LoRA_Sam, self).__init__()
 
@@ -142,6 +143,7 @@ class LoRA_Sam(nn.Module):
         # Alignment layer configuration
         self.alignment_num_blocks = alignment_num_blocks
         self.alignment_hidden_channels = alignment_hidden_channels
+        self.alignment_use_bn = alignment_use_bn
 
         # Setup lora layers for encoder
         if lora_layer:
@@ -207,7 +209,7 @@ class LoRA_Sam(nn.Module):
             in_channels=encoder_output_dim,
             hidden_channels=self.alignment_hidden_channels,
             num_blocks=self.alignment_num_blocks,
-            use_bn=self.use_alignment,
+            use_bn=self.alignment_use_bn,
         )
         print(
             f"[LoRA_Sam] Alignment Layer: {self.alignment_layer.get_num_params():,} parameters"
@@ -573,6 +575,23 @@ class LoRA_Sam(nn.Module):
 
         self.sam.load_state_dict(sam_dict)
 
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint. Supports both LoRA and regular SAM checkpoints."""
+        try:
+            # First try loading as LoRA parameters
+            self.load_lora_parameters(checkpoint_path)
+            print(f"[LoRA_Sam] Loaded LoRA/Adapter parameters from {checkpoint_path}")
+        except Exception as e:
+            # Fallback to regular SAM load_state_dict if it's a full model checkpoint
+            try:
+                state_dict = torch.load(checkpoint_path, map_location="cpu")
+                self.load_state_dict(state_dict)
+                print(f"[LoRA_Sam] Loaded full model state_dict from {checkpoint_path}")
+            except Exception as e2:
+                print(f"Warning: Failed to load checkpoint {checkpoint_path}")
+                print(f"LoRA Load Error: {e}")
+                print(f"Full Load Error: {e2}")
+
     def _load_legacy_checkpoint(self, state_dict: dict) -> None:
         """Load checkpoint in legacy hybrid_lora_v1 format.
 
@@ -777,3 +796,46 @@ if __name__ == "__main__":
         # Test forward pass
         # lora_sam.sam.image_encoder(torch.rand(size=(1, 3, 1024, 1024)))
         print(f"Mode {mode} initialized successfully!")
+
+
+def build_sam_hybrid(
+    sam_type="vit_b",
+    img_size=224,
+    num_classes=2,
+    sam_checkpoint=None,
+    pixel_mean=[0, 0, 0],
+    pixel_std=[1, 1, 1],
+    r_e=4,
+    r_d=4,
+    adaptation_mode="dual_lora",
+    lora_layer=None,
+    alignment_num_blocks=4,
+    alignment_hidden_channels=256,
+    alignment_use_bn=True,
+    **kwargs,
+):
+    """Factory function for Hydra instantiation."""
+    from model.segment_anything import sam_model_registry
+
+    # 1. Build base SAM model
+    sam, _ = sam_model_registry[sam_type](
+        image_size=img_size,
+        num_classes=num_classes,
+        checkpoint=sam_checkpoint,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+
+    # 2. Wrap with LoRA_Sam
+    model = LoRA_Sam(
+        sam,
+        r_e=r_e,
+        r_d=r_d,
+        adaptation_mode=adaptation_mode,
+        lora_layer=lora_layer,
+        alignment_num_blocks=alignment_num_blocks,
+        alignment_hidden_channels=alignment_hidden_channels,
+        alignment_use_bn=alignment_use_bn,
+    )
+
+    return model

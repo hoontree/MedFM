@@ -8,5 +8,7 @@ train: [BUSBRA, BUSI, B]
 val: []   # If empty, defaults to same as train (using val split)
 test: [BUID, BUS_UCLM]  # Each dataset in this list will be evaluated separately
 
+# Canonical location for num_classes and img_size
 num_classes: 1
+img_size: 224
 normalization: "imagenet"

@@ -38,17 +38,20 @@ class SegformerTrainer(BaseTrainer):
 
     def _create_model(self):
         """Create Segformer model."""
-        # Configure Segformer model
-        config = SegformerConfig.from_pretrained(
-            pretrained_model_name_or_path="nvidia/segformer-b2-finetuned-ade-512-512",
-            num_labels=self.cfg.data.num_classes,
-        )
+        if self.model is None:
+            # Configure Segformer model
+            config = SegformerConfig.from_pretrained(
+                pretrained_model_name_or_path="nvidia/segformer-b2-finetuned-ade-512-512",
+                num_labels=self.cfg.data.num_classes,
+            )
 
-        self.model = SegformerForSemanticSegmentation.from_pretrained(
-            "nvidia/segformer-b2-finetuned-ade-512-512",
-            config=config,
-            ignore_mismatched_sizes=True,
-        ).cuda()
+            self.model = SegformerForSemanticSegmentation.from_pretrained(
+                "nvidia/segformer-b2-finetuned-ade-512-512",
+                config=config,
+                ignore_mismatched_sizes=True,
+            )
+
+        self.model = self.model.cuda()
 
         # Setup image processor
         self.image_processor = SegformerImageProcessor.from_pretrained(

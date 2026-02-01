@@ -17,8 +17,14 @@ training:
 
 # Optimizer configuration
 optimizer:
-  name: AdamW
+  _target_: torch.optim.AdamW
+  lr: ${training.lr}
   weight_decay: 0.01
+  betas: [0.9, 0.999]
+  # Custom flags for TinyUSFMTrainer
+  use_layer_decay: true
+  num_layers: 12
+  layer_decay: 0.8
   gradient_clip:
     enabled: true
     max_norm: 1.0

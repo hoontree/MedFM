@@ -380,8 +380,13 @@ class FPNHead(nn.Module):
 class SegmentationModel(nn.Module):
     """Complete segmentation model using the provided VisionTransformer"""
 
-    def __init__(self, num_classes=2):
+    def __init__(self, num_classes, checkpoint=None, **kwargs):
         super().__init__()
+
+        if checkpoint:
+            self.checkpoint_path = checkpoint
+        else:
+            self.checkpoint_path = kwargs.get("checkpoint", None)
 
         self.backbone = MAEBackbone(
             img_size=(224, 224),
@@ -434,3 +439,25 @@ class SegmentationModel(nn.Module):
             return seg_logits, neck_features[2]
 
         return seg_logits
+
+    def load_checkpoint(self, path=None):
+        """Load checkpoint with TinyUSFM specific mapping."""
+        load_path = path or self.checkpoint_path
+        if not load_path:
+            print("Warning: No checkpoint path provided for load_checkpoint.")
+            return
+
+        try:
+            checkpoint = torch.load(load_path, map_location="cpu")
+            # TinyUSFM specific mapping: model. -> backbone.
+            new_state_dict = {
+                k.replace("model.", "backbone."): v
+                for k, v in checkpoint.items()
+                if k.startswith("model.")
+            }
+            load_info = self.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded checkpoint from {self.checkpoint_path}")
+            print(f"Missing keys: {len(load_info.missing_keys)}")
+            print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint. Error: {e}")

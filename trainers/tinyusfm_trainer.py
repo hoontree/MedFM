@@ -13,10 +13,13 @@ import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
+from model.tinyusfm_seg import SegmentationModel as TinyUSFM_Seg
+from hydra.utils import instantiate
 
 from .base_trainer import BaseTrainer
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.load_model_seg import load_model_seg
+from omegaconf import OmegaConf
 from utils.schedule import build_scheduler, get_lr_decay_param_groups
 
 
@@ -34,9 +37,36 @@ def _compute_loss(
 
 def _build_optimizer(model: nn.Module, cfg) -> optim.Optimizer:
     """Build optimizer from config."""
-    optimizer_name = cfg.optimizer.get("name", "Adam")
+    opt_cfg = cfg.get("optimizer", {})
+    if "_target_" in opt_cfg:
+        opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)
+
+        # Handle layer decay
+        use_layer_decay = opt_cfg.pop("use_layer_decay", False)
+        if use_layer_decay:
+            base_lr = opt_cfg.get("lr", cfg.training.get("lr", 0.0001))
+            weight_decay = opt_cfg.get("weight_decay", 0.0)
+            num_layers = opt_cfg.pop("num_layers", 12)
+            layer_decay = opt_cfg.pop("layer_decay", 0.8)
+
+            param_groups = get_lr_decay_param_groups(
+                model=model,
+                base_lr=base_lr,
+                weight_decay=weight_decay,
+                num_layers=num_layers,
+                layer_decay=layer_decay,
+            )
+            # Use instantiate to create the optimizer with the param_groups
+            return instantiate(
+                {"_target_": opt_cfg["_target_"], **opt_cfg}, param_groups
+            )
+        else:
+            # Normal instantiation
+            return instantiate(opt_cfg, model.parameters())
+
+    optimizer_name = opt_cfg.get("name", "Adam")
     lr = cfg.training.get("lr", 0.0001)
-    weight_decay = cfg.optimizer.get("weight_decay", 0)
+    weight_decay = opt_cfg.get("weight_decay", 0)
 
     if optimizer_name == "Adam":
         return optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -66,8 +96,12 @@ class TinyUSFMTrainer(BaseTrainer):
         self.criterion: Optional[nn.Module] = None
 
     def _create_model(self):
-        """Create TinyUSFM model."""
-        self.model = load_model_seg(self.cfg, self.device)
+        """Create or use provided TinyUSFM model."""
+        if self.model is None:
+            self.model = instantiate(self.cfg.model)
+
+        self.model.load_checkpoint()
+        self.model = self.model.to(self.device)
 
         # Log model info
         total_params = sum(p.numel() for p in self.model.parameters())

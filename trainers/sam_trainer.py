@@ -102,58 +102,19 @@ class SAMTrainer(BaseTrainer):
         return {"enabled": False, "steps": 0}
 
     def _create_model(self):
-        """Create SAM model with LoRA or hybrid adapter."""
-        # Get SAM type (vit_b, vit_l, vit_h)
-        sam_type = self.cfg.model.get("sam_type", "vit_b")
-        if sam_type not in sam_model_registry:
-            # Fallback: check if model name itself is a valid sam type
-            if self.cfg.model.name in sam_model_registry:
-                sam_type = self.cfg.model.name
-            else:
-                sam_type = "vit_b"
+        """Create SAM model using ModelBuilder."""
+        if self.model is None:
+            from trainers.model_builder import ModelBuilder
 
-        # Get checkpoint path
-        checkpoint = self.cfg.model.get("sam_checkpoint", self.cfg.model.get("ckpt"))
-
-        # Register SAM model
-        sam, _ = sam_model_registry[sam_type](
-            image_size=self.cfg.model.img_size,
-            num_classes=self.cfg.data.num_classes,
-            checkpoint=checkpoint,
-            pixel_mean=[0, 0, 0],
-            pixel_std=[1, 1, 1],
-        )
-
-        # Load LoRA/Adapter module
-        module_path = self.cfg.model.get(
-            "module", "model.sam_lora_image_encoder_mask_decoder"
-        )
-        pkg = import_module(module_path)
-
-        # Build kwargs for LoRA_Sam (supports both old and new config styles)
-        model_kwargs = {}
-        if self.cfg.model.get("adaptation_mode"):
-            model_kwargs["adaptation_mode"] = self.cfg.model.adaptation_mode
-
-        # Alignment layer configuration (for encoder_frozen_alignment_* modes)
-        if self.cfg.model.get("alignment_num_blocks"):
-            model_kwargs["alignment_num_blocks"] = self.cfg.model.alignment_num_blocks
-        if self.cfg.model.get("alignment_hidden_channels"):
-            model_kwargs["alignment_hidden_channels"] = (
-                self.cfg.model.alignment_hidden_channels
+            # Use ModelBuilder to create the model
+            # This handles both LoRA and hybrid adapters based on config
+            self.model = ModelBuilder.create_model(
+                self.cfg.model,
+                num_classes=self.cfg.data.num_classes,
+                img_size=self.cfg.get("img_size", 224),
             )
 
-        self.model = pkg.LoRA_Sam(
-            sam, self.cfg.model.get("rank", 4), **model_kwargs
-        ).to(self.device)
-
-        # Load LoRA checkpoint if provided (support both config key names)
-        lora_ckpt = self.cfg.model.get(
-            "lora_checkpoint", self.cfg.model.get("lora_ckpt")
-        )
-        if lora_ckpt is not None:
-            self.model.load_lora_parameters(lora_ckpt)
-            self.logger.info(f"Loaded LoRA checkpoint: {lora_ckpt}")
+        self.model = self.model.to(self.device)
 
         # Setup DataParallel
         if self._get_n_gpus() > 1:

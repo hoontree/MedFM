@@ -12,7 +12,7 @@ from utils.evaluate import Evaluator_seg
 from utils.logger import setup_logger
 from utils.schedule import build_scheduler
 from trainers.model_builder import ModelBuilder
-from distillers import DistillerRegistry
+from distillers import create_distiller
 from utils.distill_utils import (
     get_teacher_short_name,
     get_student_short_name,
@@ -22,7 +22,7 @@ from utils.distill_utils import (
     visualize_distillation,
 )
 from utils.utils import set_seed
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 
 class DistillTrainer:
@@ -31,7 +31,7 @@ class DistillTrainer:
     Encapsulates setup, training, validation, and testing logic.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: DictConfig, model: Optional[nn.Module] = None):
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         set_seed(cfg.hardware.seed)
@@ -62,12 +62,17 @@ class DistillTrainer:
 
         # Initialize wandb
         exp_name = f"{self.teacher_short}_{self.student_short}_{cfg.method.name}_{self.dataset_name}"
+        wandb_mode = "disabled" if cfg.get("debug", False) else None
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             name=exp_name,
             config=OmegaConf.to_container(cfg, resolve=True),
+            mode=wandb_mode,
         )
+
+        # Early validation
+        self.validate_config()
 
         # Build Data Loaders
         self._setup_data()
@@ -108,18 +113,19 @@ class DistillTrainer:
             )
 
     def _setup_models(self):
-        self.teacher = ModelBuilder.create_model(
-            self.cfg.teacher, self.cfg.data.num_classes, self.device
-        )
-        self.student = ModelBuilder.create_model(
-            self.cfg.student, self.cfg.data.num_classes, self.device
-        )
-
+        # Create teacher model (num_classes/img_size from ${data.*} interpolation)
+        self.teacher = ModelBuilder.create_model(self.cfg.teacher)
+        self.teacher = self.teacher.to(self.device)
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad = False
 
-        self.distiller = DistillerRegistry.create(self.cfg).to(self.device)
+        # Create student model
+        self.student = ModelBuilder.create_model(self.cfg.student)
+        self.student = self.student.to(self.device)
+
+        # Create distiller
+        self.distiller = create_distiller(self.cfg).to(self.device)
         self.distiller.prepare(self.student, self.teacher)
 
     def _setup_optimizer(self):
@@ -261,8 +267,8 @@ class DistillTrainer:
         return False
 
     def train(self):
-        early_stopping_cfg = self.cfg.training.get("early_stopping")
-        es_enabled = early_stopping_cfg and early_stopping_cfg.enabled
+        early_stopping_cfg = self.cfg.training.get("early_stopping", {})
+        es_enabled = early_stopping_cfg.get("enabled", False)
         if es_enabled:
             patience = early_stopping_cfg.patience
             min_delta = early_stopping_cfg.min_delta
@@ -354,3 +360,109 @@ class DistillTrainer:
                 num_samples=self.cfg.visualization.num_samples,
                 epoch=None,
             )
+
+    def validate_config(self):
+        """Perform early validation of configuration."""
+        self.logger.info("Checking configuration health...")
+
+        # Check for essential components
+        required_keys = ["teacher", "student", "method", "data", "training"]
+        for key in required_keys:
+            if key not in self.cfg:
+                raise ValueError(f"Missing required configuration section: {key}")
+
+        # Check for teacher/student names
+        if "name" not in self.cfg.teacher:
+            raise ValueError("Teacher name is not specified.")
+        if "name" not in self.cfg.student:
+            raise ValueError("Student name is not specified.")
+
+        self.logger.info("Configuration validated successfully.")
+
+    def dry_run(self):
+        """Perform a quick end-to-end test of the training pipeline."""
+        self.logger.info("🚀 Starting Dry Run (Pipeline Validation)...")
+
+        limit_batches = 2
+        batch_size = self.cfg.training.get("batch_size", 1)
+
+        try:
+            # 1. Forward/Backward Test
+            self.logger.info(f"Testing training step with {limit_batches} batches...")
+            old_limit = self.cfg.training.get("limit_train_batches")
+            self.cfg.training.limit_train_batches = limit_batches
+            self.train_epoch(0)
+
+            # Restore limit
+            if old_limit is not None:
+                self.cfg.training.limit_train_batches = old_limit
+            else:
+                self.cfg.training.limit_train_batches = None
+
+            torch.cuda.empty_cache()
+
+            # 2. Validation Test
+            self.logger.info("Testing validation step...")
+            from torch.utils.data import Subset
+
+            val_subset_size = min(
+                len(self.val_loader.dataset), limit_batches * batch_size
+            )
+            val_indices = list(range(val_subset_size))
+            limited_val_loader = torch.utils.data.DataLoader(
+                Subset(self.val_loader.dataset, val_indices),
+                batch_size=batch_size,
+                num_workers=0,
+            )
+            self.evaluator.evaluate_model(
+                self.student, limited_val_loader, self.device, self.cfg.data.num_classes
+            )
+
+            torch.cuda.empty_cache()
+
+            # 3. Test/Evaluation Test
+            self.logger.info("Testing evaluation step...")
+            if isinstance(self.test_loader, dict):
+                first_name = list(self.test_loader.keys())[0]
+                first_loader = self.test_loader[first_name]
+                test_subset_size = min(
+                    len(first_loader.dataset), limit_batches * batch_size
+                )
+                test_indices = list(range(test_subset_size))
+                limited_test_loader = torch.utils.data.DataLoader(
+                    Subset(first_loader.dataset, test_indices),
+                    batch_size=batch_size,
+                    num_workers=0,
+                )
+                self.evaluator.evaluate_model(
+                    self.student,
+                    limited_test_loader,
+                    self.device,
+                    self.cfg.data.num_classes,
+                )
+            else:
+                test_subset_size = min(
+                    len(self.test_loader.dataset), limit_batches * batch_size
+                )
+                test_indices = list(range(test_subset_size))
+                limited_test_loader = torch.utils.data.DataLoader(
+                    Subset(self.test_loader.dataset, test_indices),
+                    batch_size=batch_size,
+                    num_workers=0,
+                )
+                self.evaluator.evaluate_model(
+                    self.student,
+                    limited_test_loader,
+                    self.device,
+                    self.cfg.data.num_classes,
+                )
+
+            self.logger.info(
+                "✅ Dry Run completed successfully! Your experiment setup is valid."
+            )
+
+        except Exception as e:
+            self.logger.error(f"❌ Dry Run failed: {str(e)}")
+            raise e
+        finally:
+            torch.cuda.empty_cache()

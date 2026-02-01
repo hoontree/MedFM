@@ -129,7 +129,7 @@ def save_experiment_summary(cfg: DictConfig, log_dir: Path):
             f"  Epochs: {cfg.training.num_epochs}",
             f"  Batch Size: {cfg.training.batch_size}",
             f"  Learning Rate: {cfg.training.lr}",
-            f"  Early Stopping: {cfg.training.early_stopping.enabled} (patience={cfg.training.early_stopping.patience})",
+            f"  Early Stopping: {cfg.training.get('early_stopping', {}).get('enabled', 'N/A')} (patience={cfg.training.get('early_stopping', {}).get('patience', 'N/A')})",
             "",
             "[Hardware]",
             f"  GPU IDs: {cfg.hardware.gpu_ids}",

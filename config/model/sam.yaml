@@ -1,10 +1,27 @@
 # @package _global_
+# SAM Model Configuration (default: dual LoRA)
 
-# SAM Model Configuration
 defaults:
   - _self_
   - /data: Standard
   - encoder: vit_b
+
+trainer:
+  _target_: trainers.sam_trainer.SAMTrainer
+
+model:
+  _target_: model.sam_hybrid_adapter.build_sam_hybrid
+  name: sam
+  sam_type: vit_b
+  num_classes: ${data.num_classes}
+  img_size: ${data.img_size}
+  r_e: 4
+  r_d: 4
+  adaptation_mode: dual_lora
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  pixel_mean: [123.675, 116.28, 103.53]
+  pixel_std: [58.395, 57.12, 57.375]
+  checkpoint: null  # Set to path to load trained weights
 
 # Training configuration
 training:

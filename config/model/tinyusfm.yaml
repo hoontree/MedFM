@@ -1,0 +1,15 @@
+# @package _global_
+# TinyUSFM - Lightweight segmentation model
+
+defaults:
+  - _self_
+  - /training: tinyusfm_training
+
+trainer:
+  _target_: trainers.tinyusfm_trainer.TinyUSFMTrainer
+
+model:
+  _target_: model.tinyusfm_seg.SegmentationModel
+  name: TinyUSFM
+  num_classes: ${data.num_classes}
+  checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights

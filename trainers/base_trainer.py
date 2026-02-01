@@ -73,18 +73,19 @@ class BaseTrainer(ABC):
     the abstract methods for model creation, data loading, and training logic.
     """
 
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig, model: Optional[nn.Module] = None):
         """
         Initialize base trainer.
 
         Args:
             cfg: Configuration object (OmegaConf DictConfig)
+            model: Pre-built model instance (optional)
         """
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize attributes
-        self.model = None
+        self.model = model
         self.optimizer = None
         self.scheduler = None
         self.train_loader = None

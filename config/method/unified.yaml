@@ -1,0 +1,31 @@
+# Unified Distillation Configuration
+# Supports: Task Loss, Logit KD, Feature KD, Attention KD, Alignment KD
+
+_target_: distillers.UnifiedDistiller
+
+name: unified
+temperature: 4.0
+
+# Loss weights (Set to 0.0 to disable a component)
+alpha: 1.0        # Task loss (GT Dice/CE)
+beta: 1.0         # Logit KD (KL Divergence)
+gamma: 0.0        # Feature KD (MSE on intermediate layers)
+gamma_attn: 0.7   # Attention Map KD (MSE)
+gamma_align: 0.3  # Alignment Layer KD (MSE)
+
+# Task loss components
+use_dice: true
+use_ce: true
+
+# --- Feature Distillation Settings (gamma > 0) ---
+layer_mapping: {}
+# Example:
+#   student.backbone.blocks.2: sam.image_encoder.blocks.2
+layer_channels: {}
+# Example:
+#   student.backbone.blocks.2: 192
+#   sam.image_encoder.blocks.2: 256
+
+# --- Alignment Layer Settings (gamma_align > 0) ---
+student_channels: 48
+teacher_alignment_channels: 256

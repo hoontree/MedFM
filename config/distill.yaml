@@ -3,13 +3,17 @@
 defaults:
   - _self_
   - data: dynamic
-  - teacher: sam_encoder_frozen_alignment_decoder_lora
+  - teacher: E0_AL_DL
   - student: tinyusfm
-  - method: hybrid
+  - method: unified
   - log: wandb
   - training: distillation
 
+trainer:
+  _target_: trainers.distill_trainer.DistillTrainer
+
 gpu_ids: [1]
+debug: false
 
 # Output configuration
 output:

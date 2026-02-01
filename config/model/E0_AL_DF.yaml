@@ -1,22 +1,24 @@
-#@package _global_
+# @package _global_
+# SAM: Encoder frozen + Alignment layer + Decoder fine-tuned (E0_AL_DF)
+
 defaults:
   - _self_
   - /training: sam_training
-  
-model:
-  name: sam_hybrid
-  module: model.sam_hybrid_adapter
-  sam_type: vit_b
-  adaptation_mode: encoder_frozen_alignment_decoder_ft
-  img_size: 224
-  rank: 4
-  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-  use_bn: false
 
-  # Alignment layer configuration
+trainer:
+  _target_: trainers.sam_trainer.SAMTrainer
+
+model:
+  _target_: model.sam_hybrid_adapter.build_sam_hybrid
+  name: E0_AL_DF
+  sam_type: vit_b
+  num_classes: ${data.num_classes}
+  img_size: ${data.img_size}
+  adaptation_mode: encoder_frozen_alignment_decoder_ft
+  r_e: 4
+  r_d: 4
+  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
   alignment_num_blocks: 4
   alignment_hidden_channels: 256
-
-  # Set to checkpoint path for distillation, e.g.:
-  # lora_checkpoint: logs/encoder_frozen_alignment_decoder_ft/.../best_epoch_XX_diceX.XXXX.pth
-  lora_checkpoint: null
+  alignment_use_bn: true
+  checkpoint: null  # Set to path to load trained weights

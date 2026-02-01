@@ -21,6 +21,9 @@ defaults:
   - _self_
   - /data: Standard
 
+trainer:
+  _target_: trainers.sam3_adapter.SAM3TrainerAdapter
+
 # Model identification
 model:
   name: sam3
