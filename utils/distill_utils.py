@@ -225,6 +225,12 @@ def visualize_distillation(
                 if num_classes == 1:
                     t_pred = t_pred[0]
                     s_pred = s_pred[0]
+                    gt = gt[0]
+                else:
+                    # For multi-class, squeeze channel dimension
+                    t_pred = t_pred.squeeze()
+                    s_pred = s_pred.squeeze()
+                    gt = gt.squeeze()
 
                 fig, axes = plt.subplots(1, 4, figsize=(20, 5))
                 axes[0].imshow(img, cmap="gray" if img.ndim == 2 else None)

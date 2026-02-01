@@ -1,6 +1,5 @@
 import hydra
 from omegaconf import DictConfig
-from trainers.distill_trainer import DistillTrainer
 import os
 
 

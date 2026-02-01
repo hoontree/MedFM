@@ -1,4 +1,3 @@
-# SAM: Encoder frozen + Alignment layer + Decoder LoRA (E0_AL_DL) teacher config
 _target_: model.sam_hybrid_adapter.build_sam_hybrid
 name: E0_AL_DL
 sam_type: vit_b
@@ -10,4 +9,4 @@ r_d: 4
 sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
 alignment_num_blocks: 4
 alignment_hidden_channels: 256
-checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_alignment_decoder_lora/BUSBRA+BUSI+B/20260129_143251_bs4_lr0.0001/checkpoints/best_epoch_61_dice0.7561.pth
+checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_alignment_decoder_lora/BUSBRA+BUSI+B/20260201_160805_bs4_lr0.0001/checkpoints/best_epoch_19_dice0.7581.pth

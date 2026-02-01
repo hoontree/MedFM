@@ -49,8 +49,9 @@ class SegmentationDataModule(L.LightningDataModule):
             stage: 'fit', 'validate', 'test', or 'predict'
         """
         if stage == "fit" or stage is None:
-            self.train_dataset, self.val_dataset, self.test_datasets = \
+            self.train_dataset, self.val_dataset, self.test_datasets = (
                 SegDatasetProcessor.build_dataset(self.cfg)
+            )
 
         if stage == "validate":
             if self.val_dataset is None:
@@ -191,7 +192,7 @@ class DistillationDataModule(L.LightningDataModule):
             stage: 'fit', 'validate', 'test', or 'predict'
         """
         if stage == "fit" or stage is None:
-            datasets = SegDatasetProcessor.build_distillation_datasets_stratified(
+            datasets = SegDatasetProcessor.build_distillation_datasets(
                 self.cfg,
                 adaptation_ratio=self.adaptation_ratio,
                 seed=self.seed,
@@ -207,7 +208,7 @@ class DistillationDataModule(L.LightningDataModule):
 
         if stage == "test":
             if not self.test_datasets:
-                datasets = SegDatasetProcessor.build_distillation_datasets_stratified(
+                datasets = SegDatasetProcessor.build_distillation_datasets(
                     self.cfg,
                     adaptation_ratio=self.adaptation_ratio,
                     seed=self.seed,
@@ -253,9 +254,7 @@ class DistillationDataModule(L.LightningDataModule):
         - distillation phase: uses distillation_val
         """
         dataset = (
-            self.adaptation_val
-            if self.phase == "adaptation"
-            else self.distillation_val
+            self.adaptation_val if self.phase == "adaptation" else self.distillation_val
         )
 
         return DataLoader(
@@ -303,7 +302,9 @@ class DistillationDataModule(L.LightningDataModule):
             phase: 'adaptation' or 'distillation'
         """
         if phase not in ("adaptation", "distillation"):
-            raise ValueError(f"Invalid phase: {phase}. Use 'adaptation' or 'distillation'.")
+            raise ValueError(
+                f"Invalid phase: {phase}. Use 'adaptation' or 'distillation'."
+            )
         self.phase = phase
 
     @property

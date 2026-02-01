@@ -1,6 +1,6 @@
 import os
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from trainers.model_builder import ModelBuilder
 

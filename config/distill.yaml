@@ -12,7 +12,7 @@ defaults:
 trainer:
   _target_: trainers.distill_trainer.DistillTrainer
 
-gpu_ids: [1]
+gpu_ids: [0]
 debug: false
 
 # Output configuration

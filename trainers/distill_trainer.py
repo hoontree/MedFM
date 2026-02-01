@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -339,8 +338,22 @@ class DistillTrainer:
 
     def _final_evaluation(self):
         if self.best_model_path and self.best_model_path.exists():
-            checkpoint = torch.load(self.best_model_path, weights_only=False)
+            # Clear memory before final evaluation
+            self.logger.info("Clearing memory before final evaluation...")
+            del self.optimizer
+            del self.distiller
+            torch.cuda.empty_cache()
+
+            self.logger.info(
+                f"Loading best model for final evaluation: {self.best_model_path}"
+            )
+            checkpoint = torch.load(
+                self.best_model_path, map_location="cpu", weights_only=False
+            )
             self.student.load_state_dict(checkpoint["model_state_dict"])
+            # Ensure student is on device and in eval mode
+            self.student.to(self.device)
+            self.student.eval()
 
             test_metrics = self.test(phase="Final_Test")
             wandb.log(test_metrics)

@@ -39,7 +39,197 @@ def _format_mask(mask, num_classes):
         return mask_one_hot.permute(2, 0, 1).float()
 
 
-class BUID(Dataset):
+class BaseUltrasoundDataset(Dataset):
+    """
+    Base class for ultrasound segmentation datasets.
+    Provides shared functionality for image/mask loading, transformations, and tensor creation.
+    """
+
+    def __init__(self, cfg, split, transform: Optional[bool] = False):
+        """
+        Initialize base dataset with common configuration.
+
+        Args:
+            cfg: Configuration object with dataset parameters
+            split: Dataset split ('train', 'val', 'test')
+            transform: Whether to apply data augmentation
+        """
+        self.cfg = cfg
+        self.num_classes = cfg.num_classes
+        self.transform = transform
+        self.split = split
+
+        # Image and mask sizes
+        self.image_size = (cfg.img_size, cfg.img_size)
+        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
+
+        # Common configuration
+        self.seed = getattr(cfg, "seed", 42)
+        self.normalization = getattr(cfg, "normalization", "imagenet")
+        self.task_type = getattr(
+            cfg, "task_type", "tumor"
+        )  # For conditional transforms
+
+    def _load_image(self, path: Path) -> Image.Image:
+        """
+        Load an image from path with error handling.
+
+        Args:
+            path: Path to image file
+
+        Returns:
+            PIL Image in RGB mode
+
+        Raises:
+            ValueError: If image cannot be loaded
+        """
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception as e:
+            raise ValueError(f"Error loading image {path}: {e}")
+
+    def _load_mask(self, path: Path, mode: str = "L") -> Image.Image:
+        """
+        Load a mask from path with error handling.
+
+        Args:
+            path: Path to mask file
+            mode: PIL image mode ('L' for grayscale, 'RGB' for color)
+
+        Returns:
+            PIL Image in specified mode
+
+        Raises:
+            ValueError: If mask cannot be loaded
+        """
+        try:
+            return Image.open(path).convert(mode)
+        except Exception as e:
+            raise ValueError(f"Error loading mask {path}: {e}")
+
+    def _resize_images(
+        self, image: Image.Image, mask: Image.Image
+    ) -> Tuple[Image.Image, Image.Image]:
+        """
+        Resize image and mask to target size.
+
+        Args:
+            image: PIL Image
+            mask: PIL Image
+
+        Returns:
+            Tuple of (resized_image, resized_mask)
+        """
+        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
+        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
+        return image, mask
+
+    def _apply_normalization(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Apply normalization to image tensor.
+
+        Args:
+            image_tensor: Image tensor [C, H, W]
+
+        Returns:
+            Normalized image tensor
+        """
+        if self.normalization == "imagenet":
+            return T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(
+                image_tensor
+            )
+        return image_tensor
+
+    def _create_tensors(
+        self, image: Image.Image, mask: Image.Image
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Convert PIL images to tensors with proper formatting.
+
+        Args:
+            image: PIL Image (RGB)
+            mask: PIL Image (grayscale or class labels)
+
+        Returns:
+            Tuple of (image_tensor, mask_tensor, low_res_mask_tensor)
+        """
+        # Image tensorization and normalization
+        image_tensor = TF.to_tensor(image)
+        image_tensor = self._apply_normalization(image_tensor)
+
+        # Mask tensor creation
+        mask_tensor = _format_mask(mask, self.num_classes)
+
+        # Low-res mask
+        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
+        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
+
+        return image_tensor, mask_tensor, low_res_tensor
+
+    def _joint_transform(
+        self, image: Image.Image, label: Image.Image
+    ) -> Tuple[Image.Image, Image.Image]:
+        """
+        Apply joint augmentation transformations to image and label.
+
+        Transformations include:
+        - Horizontal/vertical flips (conditional on task_type for tumor tasks)
+        - Random rotation (-30 to 30 degrees)
+        - Gamma correction
+        - Random scaling and cropping
+        - Contrast adjustment
+
+        Args:
+            image: PIL Image
+            label: PIL Image (mask)
+
+        Returns:
+            Tuple of (transformed_image, transformed_label)
+        """
+        # Horizontal and vertical flips (conditional for tumor task)
+        if self.task_type == "tumor":
+            if random.random() > 0.5:
+                image = TF.hflip(image)
+                label = TF.hflip(label)
+
+            if random.random() > 0.5:
+                image = TF.vflip(image)
+                label = TF.vflip(label)
+
+        # Random rotation
+        if random.random() > 0.5:
+            angle = random.uniform(-30, 30)
+            image = TF.rotate(image, angle)
+            label = TF.rotate(label, angle)
+
+        # Gamma correction
+        if random.random() > 0.5:
+            g = np.random.randint(10, 25) / 10.0
+            image_np = np.array(image)
+            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
+            image_np = image_np.astype(np.uint8)
+            image = Image.fromarray(image_np)
+
+        # Random scaling and cropping
+        if random.random() > 0.5:
+            scale = np.random.uniform(1, 1.3)
+            h, w = self.image_size
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
+            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
+            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
+            image = TF.crop(image, i, j, crop_h, crop_w)
+            label = TF.crop(label, i, j, crop_h, crop_w)
+
+        # Contrast adjustment
+        if random.random() > 0.5:
+            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
+            image = contr_tf(image)
+
+        return image, label
+
+
+class BUID(BaseUltrasoundDataset):
     """
     BUID Dataset (Breast Ultrasound Images Dataset)
     - Total: 232 cases (109 Benign, 123 Malignant)
@@ -58,19 +248,12 @@ class BUID(Dataset):
     """
 
     def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
+        super().__init__(cfg, split, transform)
 
         self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, "seed", 42)
         self.classes = cfg.classes
-        self.normalization = getattr(cfg, "normalization", "imagenet")
         self.usage = getattr(cfg, "usage", "external")
+
         if self.usage == "external":
             # Get all image and mask files from both classes
             self.images, self.masks = self._unzip_pairs(self._collect_paired_files())
@@ -165,82 +348,22 @@ class BUID(Dataset):
         image_path = self.images[idx]
         mask_path = self.masks[idx]
 
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
-
-        # Load mask (binary mask from .tif file)
-        try:
-            mask = Image.open(mask_path).convert("L")
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
+        # Load image and mask using base class methods
+        image = self._load_image(image_path)
+        mask = self._load_mask(mask_path, mode="L")
 
         # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
+        image, mask = self._resize_images(image, mask)
 
+        # Apply transformations if enabled
         if self.transform:
             image, mask = self._joint_transform(image, mask)
 
-        # --- Image tensorization and normalization ---
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_tensor = _format_mask(mask, self.num_classes)
-
-        # low-res mask
-        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        # Create tensors using base class method
+        return self._create_tensors(image, mask)
 
 
-class BUS_UCLM(Dataset):
+class BUS_UCLM(BaseUltrasoundDataset):
     """
     BUS-UCLM Dataset
     - Total: 683 images from 38 patients
@@ -254,24 +377,14 @@ class BUS_UCLM(Dataset):
     """
 
     def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
+        super().__init__(cfg, split, transform)
 
         self.root = Path(cfg.path.root)
         self.partition_dir = getattr(cfg, "partition_dir", "partitions")
-        self.seed = getattr(cfg, "seed", 42)
         self.extensions = getattr(
             cfg, "extensions", (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
         )
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.filter_empty_masks = getattr(
-            cfg, "filter_empty_masks", False
-        )  # New attribute
+        self.filter_empty_masks = getattr(cfg, "filter_empty_masks", False)
 
         if self.cfg.usage == "train":
             # Support both 'val' and 'valid'
@@ -475,85 +588,27 @@ class BUS_UCLM(Dataset):
         image_path = self.image_files[idx]
         mask_path = self.mask_files[idx]
 
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
+        # Load image using base class method
+        image = self._load_image(image_path)
 
         # Load RGB mask and convert to class labels
-        try:
-            mask_rgb = Image.open(mask_path).convert("RGB")
-            mask_rgb_array = np.array(mask_rgb)
-            mask_array = self._convert_rgb_mask_to_classes(mask_rgb_array)
-            mask = Image.fromarray(mask_array)
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
+        mask_rgb = self._load_mask(mask_path, mode="RGB")
+        mask_rgb_array = np.array(mask_rgb)
+        mask_array = self._convert_rgb_mask_to_classes(mask_rgb_array)
+        mask = Image.fromarray(mask_array)
 
         # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
+        image, mask = self._resize_images(image, mask)
 
+        # Apply transformations if enabled
         if self.transform:
             image, mask = self._joint_transform(image, mask)
 
-        # --- Image tensorization and normalization ---
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_tensor = _format_mask(mask, self.num_classes)
-
-        # low-res mask
-        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        # Create tensors using base class method
+        return self._create_tensors(image, mask)
 
 
-class BUSI(Dataset):
+class BUSI(BaseUltrasoundDataset):
     """
     BUSI Dataset (Breast Ultrasound Images)
     - Total: 780 images (437 Benign, 210 Malignant, 133 Normal)
@@ -565,27 +620,16 @@ class BUSI(Dataset):
     """
 
     def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
+        super().__init__(cfg, split, transform)
 
-        # low-res label 크기
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-
-        # BUSI-specific configuration
         self.root = Path(cfg.path.root)
         self.classes = cfg.classes
         self.image_suffix = getattr(cfg, "image_suffix", "")
         self.mask_suffix = getattr(cfg, "mask_suffix", "_mask")
         self.extensions = getattr(cfg, "extensions", [".png"])
-        self.seed = getattr(cfg, "seed", 42)
         self.combine_multiple_masks = getattr(cfg, "combine_multiple_masks", True)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
 
-        self.image_size = (cfg.img_size, cfg.img_size)
-
-        # BUSI 데이터셋은 클래스별 하위 디렉토리 구조를 가짐
+        # BUSI dataset has class-based subdirectory structure
         all_image_files, all_mask_files = self._get_busi_files()
 
         # Split data by class (random split)
@@ -630,8 +674,6 @@ class BUSI(Dataset):
                 # Returning val set as test set, or could raise error
                 split_images.extend(val_imgs)
                 split_masks.extend(val_masks)
-
-        return sorted(split_images), sorted(split_masks)
 
         return sorted(split_images), sorted(split_masks)
 
@@ -705,100 +747,39 @@ class BUSI(Dataset):
         image_path = self.image_files[index]
         mask_paths = self.mask_files[index]  # List of mask paths
 
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
+        # Load image using base class method
+        image = self._load_image(image_path)
 
         # Load and combine multiple masks
-        try:
-            combined_mask = None
-
-            for mask_path in mask_paths:
-                mask = Image.open(mask_path).convert("L")
-                mask_array = np.array(mask, dtype=np.uint8)
-
-                if combined_mask is None:
-                    combined_mask = mask_array
-                else:
-                    # Combine masks using OR operation
-                    combined_mask = combined_mask | mask_array
+        combined_mask = None
+        for mask_path in mask_paths:
+            mask = self._load_mask(mask_path, mode="L")
+            mask_array = np.array(mask, dtype=np.uint8)
 
             if combined_mask is None:
-                raise ValueError(f"No masks found for image {image_path}")
+                combined_mask = mask_array
+            else:
+                # Combine masks using OR operation
+                combined_mask = combined_mask | mask_array
 
-            # Convert to PIL Image
-            mask = Image.fromarray(combined_mask)
+        if combined_mask is None:
+            raise ValueError(f"No masks found for image {image_path}")
 
-        except Exception as e:
-            raise ValueError(f"Error loading masks for {image_path}: {e}")
+        # Convert to PIL Image
+        mask = Image.fromarray(combined_mask)
 
         # Resize to target size
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
+        image, mask = self._resize_images(image, mask)
 
+        # Apply transformations if enabled
         if self.transform:
             image, mask = self._joint_transform(image, mask)
 
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-
-        mask_np = np.array(mask)
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_tensor = _format_mask(mask, self.num_classes)
-
-        # low-res mask
-        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        # Create tensors using base class method
+        return self._create_tensors(image, mask)
 
 
-class BUSBRA(Dataset):
+class BUSBRA(BaseUltrasoundDataset):
     """
     BUSBRA Dataset (Breast Ultrasound Brazil)
     - Total: 1875 images (left/right breast images)
@@ -811,17 +792,8 @@ class BUSBRA(Dataset):
     """
 
     def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.split = split
-        self.seed = getattr(cfg, "seed", 42)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.transform = transform
+        super().__init__(cfg, split, transform)
 
-        # low-res label size
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-
-        # BUSBRA-specific configuration
         self.root = Path(cfg.path.root)
         self.image_prefix = getattr(cfg, "image_prefix", "bus_")
         self.mask_prefix = getattr(cfg, "mask_prefix", "mask_")
@@ -832,8 +804,6 @@ class BUSBRA(Dataset):
 
         self.image_dir = self.root / image_dir_name
         self.mask_dir = self.root / mask_dir_name
-
-        self.image_size = (cfg.img_size, cfg.img_size)
 
         # 1. Scan directory for all images
         # 1. Scan directory for all images and pair with masks
@@ -930,71 +900,19 @@ class BUSBRA(Dataset):
         img_path = self.image_list[index]
         mask_path = self.mask_list[index]
 
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")  # Grayscale mask
+        # Load image and mask using base class methods
+        image = self._load_image(img_path)
+        mask = self._load_mask(mask_path, mode="L")
 
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
+        # Resize to target size
+        image, mask = self._resize_images(image, mask)
 
+        # Apply transformations if enabled
         if self.transform:
             image, mask = self._joint_transform(image, mask)
 
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(
-                image_tensor
-            )  # [C, H, W]
-        mask_np = np.array(mask)
-
-        # --- Mask tensor and low_res_label creation ---
-        mask_tensor = _format_mask(mask, self.num_classes)
-
-        # low-res mask
-        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if self.task_type == "tumor":
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-                label = TF.hflip(label)
-
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-                label = TF.vflip(label)
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        # Create tensors using base class method
+        return self._create_tensors(image, mask)
 
 
 class BUSBRA_SegFormer(BUSBRA):
@@ -1019,7 +937,9 @@ class BUSBRA_SegFormer(BUSBRA):
         return inputs["pixel_values"], inputs["labels"]
 
 
-class UltrasoundSegmentationDataset(Dataset):
+class UltrasoundSegmentationDataset(BaseUltrasoundDataset):
+    """Simple ultrasound segmentation dataset without low-res tensor output."""
+
     def __init__(
         self,
         image_dir: str,
@@ -1029,12 +949,20 @@ class UltrasoundSegmentationDataset(Dataset):
         image_size: Tuple[int, int] = (512, 512),
         task_type: str = "tumor",
     ):
+        # Create a minimal config object for base class
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            num_classes=num_classes,
+            img_size=image_size[0],
+            seed=42,
+            normalization="imagenet",
+            task_type=task_type,
+        )
+        super().__init__(cfg, split="train", transform=transform)
+
         self.image_dir = Path(image_dir)
         self.label_dir = Path(label_dir)
-        self.transform = transform
-        self.image_size = image_size
-        self.num_classes = num_classes
-        self.task_type = task_type
 
         self.image_files = sorted(
             [
@@ -1042,10 +970,6 @@ class UltrasoundSegmentationDataset(Dataset):
                 for f in self.image_dir.iterdir()
                 if f.suffix.lower() in (".png", ".jpg", ".jpeg")
             ]
-        )
-
-        self.normalize = T.Normalize(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         )
 
         assert len(self.image_files) > 0, "No image files found"
@@ -1057,61 +981,28 @@ class UltrasoundSegmentationDataset(Dataset):
         img_path = self.image_dir / self.image_files[idx]
         label_path = self.label_dir / self.image_files[idx]
 
-        image = Image.open(img_path).convert("RGB")
-        label = Image.open(label_path).convert("L")
+        # Load image and mask using base class methods
+        image = self._load_image(img_path)
+        label = self._load_mask(label_path, mode="L")
 
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        label = TF.resize(label, self.image_size, interpolation=Image.NEAREST)
+        # Resize to target size
+        image, label = self._resize_images(image, label)
 
+        # Apply transformations if enabled
         if self.transform:
             image, label = self._joint_transform(image, label)
 
-        image = TF.to_tensor(image)
-        image = self.normalize(image)  # [C, H, W]
+        # Tensorize and normalize image
+        image_tensor = TF.to_tensor(image)
+        image_tensor = self._apply_normalization(image_tensor)
 
+        # Format mask (without low-res tensor)
         label_tensor = _format_mask(label, self.num_classes)
-        return image, label_tensor
 
-    def _joint_transform(self, image, label):
-        if self.task_type == "tumor":
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-                label = TF.hflip(label)
-
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-                label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        return image_tensor, label_tensor
 
 
-class B(Dataset):
+class B(BaseUltrasoundDataset):
     """
     Dataset B
     - Total: 163 images
@@ -1123,17 +1014,9 @@ class B(Dataset):
     """
 
     def __init__(self, cfg, split, transform: Optional[bool] = False):
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
-        self.transform = transform
-        self.split = split
-
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
-        self.image_size = (cfg.img_size, cfg.img_size)
+        super().__init__(cfg, split, transform)
 
         self.root = Path(cfg.path.root)
-        self.seed = getattr(cfg, "seed", 42)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
         self.extensions = getattr(cfg, "extensions", [".png"])
 
         # Directory structure from yaml or default
@@ -1203,75 +1086,16 @@ class B(Dataset):
         image_path = self.images[idx]
         mask_path = self.masks[idx]
 
-        # Load image
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Error loading image {image_path}: {e}")
+        # Load image and mask using base class methods
+        image = self._load_image(image_path)
+        mask = self._load_mask(mask_path, mode="L")
 
-        # Load mask
-        try:
-            mask = Image.open(mask_path).convert("L")
-        except Exception as e:
-            raise ValueError(f"Error loading mask {mask_path}: {e}")
+        # Resize to target size
+        image, mask = self._resize_images(image, mask)
 
-        # Resize
-        image = TF.resize(image, self.image_size, interpolation=Image.BILINEAR)
-        mask = TF.resize(mask, self.image_size, interpolation=Image.NEAREST)
-
-        # Transforms
+        # Apply transformations if enabled
         if self.transform:
             image, mask = self._joint_transform(image, mask)
 
-        # Tensorize and Normalize Image
-        image_tensor = TF.to_tensor(image)
-        if self.normalization == "imagenet":
-            image_tensor = T.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            )(image_tensor)
-
-        # Format Mask
-        mask_tensor = _format_mask(mask, self.num_classes)
-
-        # low-res mask
-        low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
-        low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
-
-        return image_tensor, mask_tensor, low_res_tensor
-
-    def _joint_transform(self, image, label):
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            label = TF.hflip(label)
-
-        if random.random() > 0.5:
-            image = TF.vflip(image)
-            label = TF.vflip(label)
-
-        if random.random() > 0.5:
-            angle = random.uniform(-30, 30)
-            image = TF.rotate(image, angle)
-            label = TF.rotate(label, angle)
-
-        if random.random() > 0.5:
-            g = np.random.randint(10, 25) / 10.0
-            image_np = np.array(image)
-            image_np = (np.power(image_np / 255, 1.0 / g)) * 255
-            image_np = image_np.astype(np.uint8)
-            image = Image.fromarray(image_np)
-
-        if random.random() > 0.5:
-            scale = np.random.uniform(1, 1.3)
-            h, w = self.image_size
-            new_h, new_w = int(h * scale), int(w * scale)
-            image = TF.resize(image, (new_h, new_w), interpolation=Image.BILINEAR)
-            label = TF.resize(label, (new_h, new_w), interpolation=Image.NEAREST)
-            i, j, crop_h, crop_w = T.RandomCrop.get_params(image, self.image_size)
-            image = TF.crop(image, i, j, crop_h, crop_w)
-            label = TF.crop(label, i, j, crop_h, crop_w)
-
-        if random.random() > 0.5:
-            contr_tf = T.ColorJitter(contrast=(0.8, 2.0))
-            image = contr_tf(image)
-
-        return image, label
+        # Create tensors using base class method
+        return self._create_tensors(image, mask)

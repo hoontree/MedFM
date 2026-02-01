@@ -559,6 +559,8 @@ class Evaluator_seg:
                     specificity_list.append(spec)
                     pixel_acc_list.append(pixel_acc)
                     bf_score_list.append(bf_score)
+                # Cleanup batch-level tensors
+                del images, labels, outputs, probs, preds
         all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)
         ece = Evaluator_seg.compute_ece(all_probs, all_labels)
@@ -648,6 +650,9 @@ class Evaluator_seg:
                     specificity_list.append(spec)
                     pixel_acc_list.append(pixel_acc)
                     bf_score_list.append(bf_score)
+
+                # Cleanup batch-level tensors
+                del images, labels, outputs, logits, probs, preds
 
         all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)

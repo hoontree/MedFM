@@ -53,7 +53,7 @@ wandb:
 distillation:
   enabled: true
   # Phase: 'adaptation' (teacher fine-tuning) or 'distillation' (student training)
-  phase: adaptation
+  phase: distillation
   # Ratio of data for adaptation (teacher fine-tuning)
   adaptation_ratio: 0.3
   # Random seed for reproducible splitting
