@@ -118,7 +118,6 @@ class LoRA_Sam(nn.Module):
         lora_layer=None,
         alignment_num_blocks: int = 4,
         alignment_hidden_channels: int = 256,
-        alignment_use_bn: bool = True,
     ):
         super(LoRA_Sam, self).__init__()
 
@@ -143,7 +142,6 @@ class LoRA_Sam(nn.Module):
         # Alignment layer configuration
         self.alignment_num_blocks = alignment_num_blocks
         self.alignment_hidden_channels = alignment_hidden_channels
-        self.alignment_use_bn = alignment_use_bn
 
         # Setup lora layers for encoder
         if lora_layer:
@@ -209,7 +207,6 @@ class LoRA_Sam(nn.Module):
             in_channels=encoder_output_dim,
             hidden_channels=self.alignment_hidden_channels,
             num_blocks=self.alignment_num_blocks,
-            use_bn=self.alignment_use_bn,
         )
         print(
             f"[LoRA_Sam] Alignment Layer: {self.alignment_layer.get_num_params():,} parameters"
@@ -811,7 +808,6 @@ def build_sam_hybrid(
     lora_layer=None,
     alignment_num_blocks=4,
     alignment_hidden_channels=256,
-    alignment_use_bn=True,
     **kwargs,
 ):
     """Factory function for Hydra instantiation."""
@@ -835,7 +831,6 @@ def build_sam_hybrid(
         lora_layer=lora_layer,
         alignment_num_blocks=alignment_num_blocks,
         alignment_hidden_channels=alignment_hidden_channels,
-        alignment_use_bn=alignment_use_bn,
     )
 
     return model

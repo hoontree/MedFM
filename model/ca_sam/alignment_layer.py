@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CAResBlock_wo_bn(nn.Module):
+class CAResBlock(nn.Module):
     """
     Channel Attention Residual Block without Batch Normalization
     """
@@ -74,78 +74,78 @@ class CAResBlock_wo_bn(nn.Module):
         return out
 
 
-class CAResBlock(nn.Module):
-    """
-    Channel Attention Residual Block
+# class CAResBlock(nn.Module):
+#     """
+#     Channel Attention Residual Block
 
-    구성:
-    - 두 개의 3x3 convolution layers
-    - Channel attention mechanism (global average pooling + 1D conv)
-    - Residual connection
-    - LayerNorm for stability
-    """
+#     구성:
+#     - 두 개의 3x3 convolution layers
+#     - Channel attention mechanism (global average pooling + 1D conv)
+#     - Residual connection
+#     - LayerNorm for stability
+#     """
 
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
+#     def __init__(self, in_channels: int, out_channels: int):
+#         super().__init__()
 
-        # Main convolution path
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, padding=1, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+#         # Main convolution path
+#         self.conv1 = nn.Conv2d(
+#             in_channels, out_channels, kernel_size=3, padding=1, bias=False
+#         )
+#         self.bn1 = nn.BatchNorm2d(out_channels)
+#         self.relu = nn.ReLU(inplace=True)
 
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, padding=1, bias=False
-        )
-        self.bn2 = nn.BatchNorm2d(out_channels)
+#         self.conv2 = nn.Conv2d(
+#             out_channels, out_channels, kernel_size=3, padding=1, bias=False
+#         )
+#         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # Channel attention
-        self.gap = nn.AdaptiveAvgPool2d(1)  # Global Average Pooling
-        self.channel_attention = nn.Sequential(
-            nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False), nn.Sigmoid()
-        )
+#         # Channel attention
+#         self.gap = nn.AdaptiveAvgPool2d(1)  # Global Average Pooling
+#         self.channel_attention = nn.Sequential(
+#             nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False), nn.Sigmoid()
+#         )
 
-        # Residual connection (if dimensions match)
-        self.residual = (
-            nn.Identity()
-            if in_channels == out_channels
-            else nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        )
+#         # Residual connection (if dimensions match)
+#         self.residual = (
+#             nn.Identity()
+#             if in_channels == out_channels
+#             else nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+#         )
 
-        # Layer Normalization for stable training
-        self.layer_norm = nn.GroupNorm(
-            1, out_channels
-        )  # GroupNorm with 1 group = LayerNorm2d
+#         # Layer Normalization for stable training
+#         self.layer_norm = nn.GroupNorm(
+#             1, out_channels
+#         )  # GroupNorm with 1 group = LayerNorm2d
 
-    def forward(self, x):
-        identity = self.residual(x)
+#     def forward(self, x):
+#         identity = self.residual(x)
 
-        # Main path
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+#         # Main path
+#         out = self.conv1(x)
+#         out = self.bn1(out)
+#         out = self.relu(out)
 
-        out = self.conv2(out)
-        out = self.bn2(out)
+#         out = self.conv2(out)
+#         out = self.bn2(out)
 
-        # Channel attention
-        B, C, H, W = out.shape
-        att = self.gap(out)  # [B, C, 1, 1]
-        att = att.squeeze(-1).permute(0, 2, 1)  # [B, 1, C]
-        att = self.channel_attention(att)  # [B, 1, C]
-        att = att.permute(0, 2, 1).unsqueeze(-1)  # [B, C, 1, 1]
+#         # Channel attention
+#         B, C, H, W = out.shape
+#         att = self.gap(out)  # [B, C, 1, 1]
+#         att = att.squeeze(-1).permute(0, 2, 1)  # [B, 1, C]
+#         att = self.channel_attention(att)  # [B, 1, C]
+#         att = att.permute(0, 2, 1).unsqueeze(-1)  # [B, C, 1, 1]
 
-        out = out * att
+#         out = out * att
 
-        # Residual connection
-        out = out + identity
-        out = self.relu(out)
+#         # Residual connection
+#         out = out + identity
+#         out = self.relu(out)
 
-        # Layer normalization
-        out = self.layer_norm(out)
+#         # Layer normalization
+#         out = self.layer_norm(out)
 
-        return out
+#         return out
 
 
 class AlignmentLayer(nn.Module):
@@ -163,7 +163,6 @@ class AlignmentLayer(nn.Module):
         in_channels: int = 256,
         hidden_channels: int = 256,
         num_blocks: int = 4,
-        use_bn: bool = True,
     ):
         super().__init__()
 
@@ -178,12 +177,8 @@ class AlignmentLayer(nn.Module):
 
         # Stack of CAResBlocks
         blocks = []
-        if use_bn:
-            for i in range(num_blocks):
-                blocks.append(CAResBlock(hidden_channels, hidden_channels))
-        else:
-            for i in range(num_blocks):
-                blocks.append(CAResBlock_wo_bn(hidden_channels, hidden_channels))
+        for i in range(num_blocks):
+            blocks.append(CAResBlock(hidden_channels, hidden_channels))
         self.blocks = nn.Sequential(*blocks)
 
         # Output projection (if needed)

@@ -299,11 +299,56 @@ class BaseTrainer(ABC):
         """
         raise NotImplementedError
 
-    def _visualize_predictions(self):
-        """Visualize test predictions. Should be implemented by subclasses."""
+    def _visualize_predictions(self, loader=None, vis_dir=None, epoch=None):
+        """Visualize predictions. Should be implemented by subclasses."""
         self.logger.warning(
             f"{self.__class__.__name__} does not implement _visualize_predictions"
         )
+
+    def _visualize_validation(self, epoch: int):
+        """Visualize validation predictions."""
+        vis_dir = self.exp_dir / "visualizations" / f"epoch_{epoch + 1}_val"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(
+            f"Generating validation visualizations for epoch {epoch + 1}..."
+        )
+        self._visualize_predictions(
+            loader=self.val_loader, vis_dir=vis_dir, epoch=epoch
+        )
+
+    def _update_teacher_config(self):
+        """Update the corresponding teacher config with the best model path."""
+        if self.best_model_path is None:
+            return
+
+        model_name = self.cfg.model.get("name")
+        if not model_name:
+            return
+
+        teacher_config_dir = Path("config/teacher")
+        if not teacher_config_dir.exists():
+            return
+
+        for config_file in teacher_config_dir.glob("*.yaml"):
+            try:
+                content = OmegaConf.load(config_file)
+                if content.get("name") == model_name:
+                    self.logger.info(f"Updating teacher config: {config_file}")
+
+                    # Update checkpoint path. Use absolute path for reliability.
+                    best_path_abs = str(self.best_model_path.absolute())
+
+                    # We need to preserve the yaml structure if possible, but OmegaConf.save is fine here
+                    content.checkpoint = best_path_abs
+                    with open(config_file, "w") as f:
+                        OmegaConf.save(content, f)
+
+                    self.logger.info(
+                        f"Successfully updated teacher config '{model_name}' with path: {best_path_abs}"
+                    )
+                    return
+            except Exception as e:
+                self.logger.error(f"Failed to update teacher config {config_file}: {e}")
 
     def train(self):
         """Main training loop."""
@@ -322,13 +367,12 @@ class BaseTrainer(ABC):
             # Validate
             val_metrics = self.validate(epoch)
 
-            # Test
-            test_metrics = self.test()
+            # Visualize validation every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                self._visualize_validation(epoch)
 
-            # Log metrics
-            self._log_metrics(
-                epoch, train_metrics, val_metrics, test_metrics=test_metrics
-            )
+            # Log metrics (removed test_metrics from per-epoch loop)
+            self._log_metrics(epoch, train_metrics, val_metrics)
 
             # Save checkpoint
             self._save_checkpoint(epoch, val_metrics)
@@ -350,6 +394,9 @@ class BaseTrainer(ABC):
             self._load_checkpoint(self.best_model_path)
             test_metrics = self.test()
             self._save_test_results(test_metrics)
+
+            # Update teacher config
+            self._update_teacher_config()
 
         # Cleanup
         wandb.finish()

@@ -431,16 +431,44 @@ class SAMTrainer(BaseTrainer):
             predictions_cache[name] = (images_list, preds_list, masks_list)
 
         # Visualize predictions using cached results
-        self._visualize_predictions(predictions_cache)
+        vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+        self._visualize_predictions(
+            predictions_cache=predictions_cache, vis_dir=vis_dir
+        )
 
         return test_metrics
 
-    def _visualize_predictions(self, predictions_cache: Dict = None):
+    def _visualize_predictions(
+        self, loader=None, vis_dir=None, epoch=None, predictions_cache: Dict = None
+    ):
         """Visualize test predictions using pre-computed results."""
         from utils.visualize import visualize_from_predictions
 
-        # Create epoch-specific visualization directory
-        vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+        # If loader is provided, it's a validation visualization call from BaseTrainer
+        if loader is not None:
+            # For validation visualization, we might not have a cache, so we run the normal flow
+            from utils.visualize import visualize_predictions
+
+            num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+            visualize_predictions(
+                self.model,
+                loader,
+                self.device,
+                self.cfg.data.num_classes,
+                vis_dir,
+                num_samples=num_vis_samples,
+                model_type="sam",
+                img_size=self.img_size,
+                phase_name="val",
+            )
+            return
+
+        # Original logic for test visualization (from self.test())
+        if vis_dir is None:
+            vis_dir = (
+                self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+            )
+
         num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", None)
 
         sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"

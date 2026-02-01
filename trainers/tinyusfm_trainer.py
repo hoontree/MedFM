@@ -301,20 +301,45 @@ class TinyUSFMTrainer(BaseTrainer):
                 else:
                     test_metrics = metrics
         # Visualize predictions
-        self._visualize_predictions(predictions_cache)
+        vis_dir = self.exp_dir / "visualizations" / "test"
+        self._visualize_predictions(
+            predictions_cache=predictions_cache, vis_dir=vis_dir
+        )
 
         return test_metrics
 
     def _visualize_predictions(
         self,
+        loader=None,
+        vis_dir=None,
+        epoch=None,
         predictions_cache: Dict[
             str, Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]
-        ],
+        ] = None,
     ) -> None:
-        """Visualize test predictions."""
+        """Visualize predictions."""
         from utils.visualize import visualize_from_predictions
 
-        vis_dir = self.exp_dir / "visualizations"
+        if loader is not None:
+            # Validation visualization from BaseTrainer
+            from utils.visualize import visualize_predictions
+
+            num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+            visualize_predictions(
+                self.model,
+                loader,
+                self.device,
+                self.cfg.data.num_classes,
+                vis_dir,
+                num_samples=num_vis_samples,
+                model_type="default",
+                phase_name="val",
+            )
+            return
+
+        if vis_dir is None:
+            vis_dir = self.exp_dir / "visualizations"
+
         num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
 
         sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples} samples"

@@ -10,5 +10,4 @@ r_d: 4
 sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
 alignment_num_blocks: 4
 alignment_hidden_channels: 256
-alignment_use_bn: true
 checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_alignment_decoder_ft/BUSBRA+BUSI+B/20260129_143224_bs4_lr0.0001/checkpoints/best_epoch_11_dice0.7458.pth

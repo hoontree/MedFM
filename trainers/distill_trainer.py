@@ -289,26 +289,27 @@ class DistillTrainer:
                 if isinstance(v, (float, int)):
                     log_data[f"val/{k.lower()}"] = v
 
-            # Test & Visualize every epoch
-            test_metrics = self.test(phase="Test")
-            log_data.update(test_metrics)
-
-            vis_loader = (
-                list(self.test_loader.values())[0]
-                if isinstance(self.test_loader, dict)
-                else self.test_loader
-            )
-            visualize_distillation(
-                self.teacher,
-                self.student,
-                vis_loader,
-                self.device,
-                self.cfg.data.num_classes,
-                self.cfg.teacher.img_size,
-                self.vis_dir,
-                num_samples=self.cfg.visualization.num_samples,
-                epoch=epoch,
-            )
+            # Periodic Visualization every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                vis_loader = (
+                    list(self.test_loader.values())[0]
+                    if isinstance(self.test_loader, dict)
+                    else self.test_loader
+                )
+                self.logger.info(
+                    f"Generating validation visualizations for epoch {epoch + 1}..."
+                )
+                visualize_distillation(
+                    self.teacher,
+                    self.student,
+                    vis_loader,
+                    self.device,
+                    self.cfg.data.num_classes,
+                    self.cfg.teacher.img_size,
+                    self.vis_dir,
+                    num_samples=self.cfg.visualization.num_samples,
+                    epoch=epoch,
+                )
 
             wandb.log(log_data)
 
@@ -360,6 +361,36 @@ class DistillTrainer:
                 num_samples=self.cfg.visualization.num_samples,
                 epoch=None,
             )
+
+    def _update_teacher_config(self):
+        """Update the corresponding teacher config with the best student model path."""
+        # For DistillTrainer, we check the student's name to update its future teacher role.
+        if self.best_model_path is None:
+            return
+
+        model_name = self.cfg.student.get("name")
+        if not model_name:
+            return
+
+        teacher_config_dir = Path("config/teacher")
+        if not teacher_config_dir.exists():
+            return
+
+        for config_file in teacher_config_dir.glob("*.yaml"):
+            try:
+                content = OmegaConf.load(config_file)
+                if content.get("name") == model_name:
+                    self.logger.info(f"Updating teacher config: {config_file}")
+                    best_path_abs = str(self.best_model_path.absolute())
+                    content.checkpoint = best_path_abs
+                    with open(config_file, "w") as f:
+                        OmegaConf.save(content, f)
+                    self.logger.info(
+                        f"Successfully updated teacher config '{model_name}' with student path: {best_path_abs}"
+                    )
+                    return
+            except Exception as e:
+                self.logger.error(f"Failed to update teacher config {config_file}: {e}")
 
     def validate_config(self):
         """Perform early validation of configuration."""
