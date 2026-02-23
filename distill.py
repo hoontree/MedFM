@@ -5,7 +5,7 @@ import os
 
 @hydra.main(version_base=None, config_path="config", config_name="distill")
 def main(cfg: DictConfig):
-    gpu_ids = cfg.get("gpu_ids", [0])
+    gpu_ids = cfg.get("hardware", {}).get("gpu_ids", cfg.get("gpu_ids", [0]))
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
 
     from trainers.model_builder import ModelBuilder

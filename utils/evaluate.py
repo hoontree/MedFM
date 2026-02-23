@@ -681,13 +681,19 @@ class Evaluator_seg:
         return metrics
 
     @staticmethod
-    def _evaluate_multiclass(model, data_loader, device, num_classes):
+    def _evaluate_multiclass(
+        model, data_loader, device, num_classes, return_predictions=False
+    ):
         dice_per_class = [[] for _ in range(num_classes)]
         iou_per_class = [[] for _ in range(num_classes)]
         pixel_acc_list = []
         sensitivity_per_class = [[] for _ in range(num_classes)]
         specificity_per_class = [[] for _ in range(num_classes)]
         hd95_per_class = [[] for _ in range(num_classes)]
+
+        images_list = [] if return_predictions else None
+        preds_list = [] if return_predictions else None
+        masks_list = [] if return_predictions else None
 
         with torch.no_grad():
             for images, labels, _ in data_loader:
@@ -697,6 +703,13 @@ class Evaluator_seg:
 
                 outputs = model(images)  # [B, num_classes, H, W]
                 preds = torch.argmax(outputs, dim=1)  # [B, H, W]
+
+                if return_predictions:
+                    images_list.append(images.cpu())
+                    preds_list.append(
+                        preds.unsqueeze(1).cpu()
+                    )  # Add channel dim for consistency
+                    masks_list.append(labels.cpu())
 
                 for pred, gt in zip(preds, gt_indices):
                     pred_np = pred.cpu().numpy()
@@ -780,6 +793,8 @@ class Evaluator_seg:
                 [item for i in foreground_ids for item in hd95_per_class[i]]
             )
 
+        if return_predictions:
+            return metrics, images_list, preds_list, masks_list
         return metrics
 
     @staticmethod

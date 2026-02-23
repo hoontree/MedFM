@@ -1,10 +1,11 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import wandb
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Optional, Tuple
 
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
@@ -21,7 +22,7 @@ from utils.distill_utils import (
     visualize_distillation,
 )
 from utils.utils import set_seed
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf, DictConfig, ListConfig
 
 
 class DistillTrainer:
@@ -38,8 +39,8 @@ class DistillTrainer:
         # Setup directories
         self.log_dir = create_log_dir(cfg)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.models_dir = self.log_dir / "models"
-        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.ckpt_dir = self.log_dir / "checkpoints"
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.vis_dir = self.log_dir / "visualizations"
         self.vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -47,7 +48,9 @@ class DistillTrainer:
         save_experiment_summary(cfg, self.log_dir)
 
         # Setup logger
-        self.logger = setup_logger(str(self.log_dir / "distill.log"))
+        self.logger = setup_logger(
+            str(self.log_dir / "distill.log"), logger_name="medfm.distill"
+        )
         self.teacher_short = get_teacher_short_name(cfg)
         self.student_short = get_student_short_name(cfg)
         self.dataset_name = get_dataset_short_name(cfg)
@@ -60,18 +63,23 @@ class DistillTrainer:
         self.logger.info(f"Log directory: {self.log_dir}")
 
         # Initialize wandb
-        exp_name = f"{self.teacher_short}_{self.student_short}_{cfg.method.name}_{self.dataset_name}"
-        wandb_mode = "disabled" if cfg.get("debug", False) else None
-        wandb.init(
+        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+        exp_name = (
+            None
+            if is_sweep
+            else f"{self.teacher_short}_{self.student_short}_{cfg.method.name}_{self.dataset_name}"
+        )
+        wandb_mode = cfg.get("wandb", {}).get("mode", None)
+        if cfg.get("debug", False) or cfg.get("wandb", {}).get("disabled", False):
+            wandb_mode = "disabled"
+
+        self.wandb_run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             name=exp_name,
             config=OmegaConf.to_container(cfg, resolve=True),
             mode=wandb_mode,
         )
-
-        # Early validation
-        self.validate_config()
 
         # Build Data Loaders
         self._setup_data()
@@ -86,6 +94,14 @@ class DistillTrainer:
         self.best_dice = 0.0
         self.best_model_path = None
         self.global_step = 0
+        self.final_metrics: Dict[str, float] = {}
+        self.pipeline_metric: Optional[float] = None
+        self.pipeline_metric_dataset: Optional[str] = None
+        self.pipeline_metric_key: str = (
+            cfg.get("pipeline", {})
+            .get("distill", {})
+            .get("metric_key", "pipeline/distill_final_dice")
+        )
 
     def _setup_data(self):
         distill_cfg = self.cfg.get("distillation", {})
@@ -111,7 +127,30 @@ class DistillTrainer:
                 SegDatasetProcessor.build_data_loaders(self.cfg)
             )
 
+    def _validate_config(self):
+        """Proactively validate configuration before model building."""
+        t_cfg = self.cfg.get("teacher", {})
+        adaptation_mode = t_cfg.get("adaptation_mode", "")
+
+        # Validation for alignment parameters
+        has_align = "alignment" in adaptation_mode
+        if not has_align:
+            if t_cfg.get("alignment_num_blocks") or t_cfg.get(
+                "alignment_hidden_channels"
+            ):
+                self.logger.warning(
+                    f"Structural alignment parameters found but adaptation_mode '{adaptation_mode}' does not use it. These will be ignored."
+                )
+
+        # Validation for LoRA parameters
+        if "lora" not in adaptation_mode and "dual_lora" not in adaptation_mode:
+            if t_cfg.get("r_e") or t_cfg.get("r_d"):
+                self.logger.warning(
+                    f"LoRA rank parameters found but adaptation_mode '{adaptation_mode}' is not LoRA-based."
+                )
+
     def _setup_models(self):
+        self._validate_config()
         # Create teacher model (num_classes/img_size from ${data.*} interpolation)
         self.teacher = ModelBuilder.create_model(self.cfg.teacher)
         self.teacher = self.teacher.to(self.device)
@@ -119,7 +158,42 @@ class DistillTrainer:
         for param in self.teacher.parameters():
             param.requires_grad = False
 
-        # Create student model
+        # Allow adding new keys to student config
+        from omegaconf import OmegaConf
+
+        OmegaConf.set_struct(self.cfg.student, False)
+        OmegaConf.set_struct(self.cfg.method, False)
+
+        if self.teacher.use_alignment:
+            t_align_channels = getattr(self.teacher, "alignment_hidden_channels", 256)
+            self.logger.info(
+                f"Teacher uses alignment layer with {t_align_channels} channels. Enabling student alignment."
+            )
+            self.cfg.student.use_alignment = True
+            self.cfg.student.alignment_out_channels = t_align_channels
+            self.cfg.student.student_channels = t_align_channels
+            self.cfg.method.teacher_alignment_channels = t_align_channels
+
+            # Proactive GradNorm adjustment: If aligning, ensure align loss is initialized reasonably
+            if (
+                self.cfg.method.get("use_gradnorm")
+                and self.cfg.method.get("gamma_align", 0) == 0
+            ):
+                self.logger.info(
+                    "Enabling gamma_align=1.0 for GradNorm balancing as alignment is active."
+                )
+                self.cfg.method.gamma_align = 1.0
+        else:
+            self.logger.info(
+                "Teacher does not use alignment layer. Disabling student alignment layer."
+            )
+            self.cfg.student.use_alignment = False
+            # If no alignment, student_channels should be the output of the neck (48 for TinyUSFM)
+            # Default to 48 if not specified.
+            if "student_channels" not in self.cfg.student:
+                self.cfg.student.student_channels = 48
+
+        # Create student model with potentially updated config
         self.student = ModelBuilder.create_model(self.cfg.student)
         self.student = self.student.to(self.device)
 
@@ -128,23 +202,18 @@ class DistillTrainer:
         self.distiller.prepare(self.student, self.teacher)
 
     def _setup_optimizer(self):
-        cfg = self.cfg
-        if cfg.optimizer.name == "AdamW":
-            param_groups = [
-                {"params": self.student.parameters(), "lr": cfg.training.lr}
-            ]
-            if list(self.distiller.parameters()):
-                param_groups.append(
-                    {"params": self.distiller.parameters(), "lr": cfg.training.lr}
-                )
-            self.optimizer = optim.AdamW(
-                param_groups, weight_decay=cfg.optimizer.weight_decay
+        param_groups = [
+            {"params": self.student.parameters(), "lr": self.cfg.training.lr}
+        ]
+        if list(self.distiller.parameters()):
+            param_groups.append(
+                {"params": self.distiller.parameters(), "lr": self.cfg.training.lr}
             )
-        else:
-            params = list(self.student.parameters()) + list(self.distiller.parameters())
-            self.optimizer = optim.Adam(params, lr=cfg.training.lr)
+        self.optimizer = optim.AdamW(
+            param_groups, weight_decay=self.cfg.optimizer.weight_decay
+        )
 
-        self.scheduler = build_scheduler(self.optimizer, cfg)
+        self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
     def train_epoch(self, epoch):
         self.student.train()
@@ -190,19 +259,35 @@ class DistillTrainer:
 
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Gradient Clipping
+            grad_clip_cfg = self.cfg.optimizer.get("gradient_clip", {})
+            if grad_clip_cfg.get("enabled", False):
+                nn.utils.clip_grad_norm_(
+                    self.optimizer.param_groups[0]["params"],
+                    max_norm=grad_clip_cfg.get("max_norm", 1.0),
+                )
+                if len(self.optimizer.param_groups) > 1:
+                    nn.utils.clip_grad_norm_(
+                        self.optimizer.param_groups[1]["params"],
+                        max_norm=grad_clip_cfg.get("max_norm", 1.0),
+                    )
+
             self.optimizer.step()
 
             for k, v in loss_dict.items():
-                running_losses[k] = running_losses.get(k, 0.0) + v.item()
+                val = v.item() if hasattr(v, "item") else v
+                running_losses[k] = running_losses.get(k, 0.0) + val
 
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             if self.global_step % 10 == 0:
                 step_log = {"global_step": self.global_step}
                 for k, v in loss_dict.items():
-                    step_log[f"train_step/{k}"] = v.item()
+                    val = v.item() if hasattr(v, "item") else v
+                    step_log[f"train_step/{k}"] = val
                 step_log["train_step/lr"] = self.optimizer.param_groups[0]["lr"]
-                wandb.log(step_log)
+                self.wandb_run.log(step_log)
             self.global_step += 1
 
         return {k: v / (i + 1) for k, v in running_losses.items()}
@@ -250,7 +335,7 @@ class DistillTrainer:
 
             self.best_dice = val_dice
             self.best_model_path = (
-                self.models_dir / f"best_epoch_{epoch+1}_dice{self.best_dice:.4f}.pth"
+                self.ckpt_dir / f"best_epoch_{epoch+1}_dice{self.best_dice:.4f}.pth"
             )
             torch.save(
                 {
@@ -310,7 +395,7 @@ class DistillTrainer:
                     epoch=epoch,
                 )
 
-            wandb.log(log_data)
+            self.wandb_run.log(log_data)
 
             # Checkpointing
             improved = self._save_checkpoint(epoch, val_metrics["Dice"])
@@ -335,6 +420,14 @@ class DistillTrainer:
         # Final Evaluation
         self._final_evaluation()
         wandb.finish()
+        return {
+            "best_model_path": str(self.best_model_path) if self.best_model_path else None,
+            "log_dir": str(self.log_dir),
+            "final_metrics": dict(self.final_metrics),
+            "pipeline_metric_key": self.pipeline_metric_key,
+            "pipeline_metric": self.pipeline_metric,
+            "pipeline_metric_dataset": self.pipeline_metric_dataset,
+        }
 
     def _final_evaluation(self):
         if self.best_model_path and self.best_model_path.exists():
@@ -356,7 +449,28 @@ class DistillTrainer:
             self.student.eval()
 
             test_metrics = self.test(phase="Final_Test")
-            wandb.log(test_metrics)
+            self.final_metrics = test_metrics
+            self.wandb_run.summary.update(test_metrics)
+            metric_dataset, metric_value = self._resolve_pipeline_metric(test_metrics)
+            if metric_value is not None:
+                self.pipeline_metric = float(metric_value)
+                self.pipeline_metric_dataset = metric_dataset
+                self.wandb_run.log({self.pipeline_metric_key: self.pipeline_metric})
+                self.wandb_run.summary[self.pipeline_metric_key] = self.pipeline_metric
+                self.wandb_run.summary[
+                    f"{self.pipeline_metric_key}_dataset"
+                ] = self.pipeline_metric_dataset
+                self.logger.info(
+                    "Pipeline metric recorded: %s=%.6f (dataset=%s)",
+                    self.pipeline_metric_key,
+                    self.pipeline_metric,
+                    self.pipeline_metric_dataset,
+                )
+            else:
+                self.logger.warning(
+                    "Pipeline metric key '%s' could not be resolved from final test metrics.",
+                    self.pipeline_metric_key,
+                )
 
             vis_loader = (
                 list(self.test_loader.values())[0]
@@ -374,54 +488,51 @@ class DistillTrainer:
                 num_samples=self.cfg.visualization.num_samples,
                 epoch=None,
             )
+        else:
+            self.logger.warning(
+                "Best model checkpoint not found. Final metrics and pipeline metric are unavailable."
+            )
 
-    def _update_teacher_config(self):
-        """Update the corresponding teacher config with the best student model path."""
-        # For DistillTrainer, we check the student's name to update its future teacher role.
-        if self.best_model_path is None:
-            return
+    def _resolve_pipeline_metric(
+        self, test_metrics: Dict[str, float]
+    ) -> Tuple[Optional[str], Optional[float]]:
+        """Resolve pipeline metric from final test metrics.
 
-        model_name = self.cfg.student.get("name")
-        if not model_name:
-            return
+        Priority:
+        1) final_test/{metric_dataset}/dice
+        2) final_test/{first data.test dataset}/dice when fallback policy is enabled
+        """
+        pipeline_cfg = self.cfg.get("pipeline", {}).get("distill", {})
+        metric_dataset = pipeline_cfg.get("metric_dataset", "BUID")
+        primary_key = f"final_test/{metric_dataset}/dice"
 
-        teacher_config_dir = Path("config/teacher")
-        if not teacher_config_dir.exists():
-            return
+        if primary_key in test_metrics:
+            return str(metric_dataset), float(test_metrics[primary_key])
 
-        for config_file in teacher_config_dir.glob("*.yaml"):
-            try:
-                content = OmegaConf.load(config_file)
-                if content.get("name") == model_name:
-                    self.logger.info(f"Updating teacher config: {config_file}")
-                    best_path_abs = str(self.best_model_path.absolute())
-                    content.checkpoint = best_path_abs
-                    with open(config_file, "w") as f:
-                        OmegaConf.save(content, f)
-                    self.logger.info(
-                        f"Successfully updated teacher config '{model_name}' with student path: {best_path_abs}"
-                    )
-                    return
-            except Exception as e:
-                self.logger.error(f"Failed to update teacher config {config_file}: {e}")
+        fallback_policy = pipeline_cfg.get("metric_fallback", "first_test_dataset")
+        if fallback_policy != "first_test_dataset":
+            return None, None
 
-    def validate_config(self):
-        """Perform early validation of configuration."""
-        self.logger.info("Checking configuration health...")
+        test_datasets = self.cfg.get("data", {}).get("test", [])
+        fallback_dataset = None
+        if isinstance(test_datasets, str):
+            fallback_dataset = test_datasets
+        elif isinstance(test_datasets, (list, ListConfig)) and len(test_datasets) > 0:
+            fallback_dataset = str(test_datasets[0])
 
-        # Check for essential components
-        required_keys = ["teacher", "student", "method", "data", "training"]
-        for key in required_keys:
-            if key not in self.cfg:
-                raise ValueError(f"Missing required configuration section: {key}")
+        if fallback_dataset is None:
+            return None, None
 
-        # Check for teacher/student names
-        if "name" not in self.cfg.teacher:
-            raise ValueError("Teacher name is not specified.")
-        if "name" not in self.cfg.student:
-            raise ValueError("Student name is not specified.")
+        fallback_key = f"final_test/{fallback_dataset}/dice"
+        if fallback_key not in test_metrics:
+            return None, None
 
-        self.logger.info("Configuration validated successfully.")
+        self.logger.warning(
+            "Preferred dataset '%s' metric missing. Falling back to dataset '%s'.",
+            metric_dataset,
+            fallback_dataset,
+        )
+        return fallback_dataset, float(test_metrics[fallback_key])
 
     def dry_run(self):
         """Perform a quick end-to-end test of the training pipeline."""

@@ -105,6 +105,27 @@ python run_distill_experiments.py
 python run_distill_experiments.py --debug  # Quick debug run
 ```
 
+### Teacher→Distill Pipeline (Single Command)
+
+```bash
+# Train teacher, then automatically run distillation with the same data/hardware/split context
+./.venv/bin/python train.py pipeline.enabled=true model=E0_AL_DL
+
+# Example with explicit split ratio
+./.venv/bin/python train.py \
+  pipeline.enabled=true \
+  distillation.enabled=true \
+  distillation.phase=adaptation \
+  distillation.adaptation_ratio=0.3 \
+  model=E0_AL_DL
+```
+
+Pipeline behavior:
+- Distillation uses the teacher best checkpoint from the same run.
+- Sweep metric is `pipeline/distill_final_dice`.
+- Preferred metric source is `final_test/BUID/dice`.
+- If `BUID` is missing in `data.test`, it falls back to the first test dataset Dice.
+
 ### Evaluation
 
 ```bash
@@ -268,6 +289,7 @@ logs/distillation/{dataset}/{timestamp}/
 - Entity: `hheo`
 - Automatically logs: losses, metrics, learning rate, visualizations
 - Config stored in `.env` file
+- Pipeline sweeps should run with teacher W&B disabled (`wandb.disabled=true`) so one sweep trial maps to one distillation run metric.
 
 ### GPU Management
 

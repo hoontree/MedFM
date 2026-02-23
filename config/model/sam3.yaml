@@ -112,5 +112,5 @@ wandb:
 # Data configuration defaults (can be overridden)
 data:
   name: custom
-  num_classes: 2
+  num_classes: 1
   img_size: 1008

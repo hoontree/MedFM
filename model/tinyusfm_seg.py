@@ -380,7 +380,14 @@ class FPNHead(nn.Module):
 class SegmentationModel(nn.Module):
     """Complete segmentation model using the provided VisionTransformer"""
 
-    def __init__(self, num_classes, checkpoint=None, **kwargs):
+    def __init__(
+        self,
+        num_classes,
+        checkpoint=None,
+        use_alignment=False,
+        alignment_out_channels=256,
+        **kwargs,
+    ):
         super().__init__()
 
         if checkpoint:
@@ -418,6 +425,22 @@ class SegmentationModel(nn.Module):
             align_corners=False,
         )
 
+        # Student alignment layer (Proj/Adapter)
+        self.use_alignment = use_alignment
+        self.alignment_out_channels = alignment_out_channels
+
+        if self.use_alignment:
+            in_channels = int(192 * 0.25)  # matches neck output channels
+            self.alignment_layer = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, self.alignment_out_channels, kernel_size=1, bias=False
+                ),
+                nn.BatchNorm2d(self.alignment_out_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.alignment_layer = None
+
     def forward(self, x, return_features=False):
         # Extract features from backbone
         features = self.backbone(x)
@@ -436,7 +459,10 @@ class SegmentationModel(nn.Module):
         if return_features:
             # Return seg_logits and the 3rd scale feature (14x14 for 224 input)
             # neck_features[2] corresponds to rescale=1.0, matching ViT output size
-            return seg_logits, neck_features[2]
+            feat = neck_features[2]
+            if self.use_alignment:
+                feat = self.alignment_layer(feat)
+            return seg_logits, feat
 
         return seg_logits
 

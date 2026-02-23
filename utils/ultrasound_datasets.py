@@ -60,8 +60,9 @@ class BaseUltrasoundDataset(Dataset):
         self.split = split
 
         # Image and mask sizes
-        self.image_size = (cfg.img_size, cfg.img_size)
-        self.low_res_size = cfg.img_size // 4, cfg.img_size // 4
+        img_size = int(cfg.img_size)
+        self.image_size = (img_size, img_size)
+        self.low_res_size = img_size // 4, img_size // 4
 
         # Common configuration
         self.seed = getattr(cfg, "seed", 42)
@@ -1099,3 +1100,31 @@ class B(BaseUltrasoundDataset):
 
         # Create tensors using base class method
         return self._create_tensors(image, mask)
+
+
+class DDTI(BaseUltrasoundDataset):
+    """DDTI Dataset (DDTI: Deep Learning for Tumor Identification)"""
+
+    def __init__(self, cfg, split, transform: Optional[bool] = False):
+        super().__init__(cfg, split, transform)
+
+        self.root = Path(cfg.path.root)
+        self.extensions = getattr(cfg, "extensions", [".png"])
+
+        # Directory structure from yaml or default
+        self.image_dir_name = getattr(cfg, "image_dir", "original")
+        self.mask_dir_name = getattr(cfg, "mask_dir", "GT")
+
+        self.image_dir = self.root / self.image_dir_name
+        self.mask_dir = self.root / self.mask_dir_name
+
+        if not self.image_dir.exists():
+            raise ValueError(f"Image directory does not exist: {self.image_dir}")
+        if not self.mask_dir.exists():
+            raise ValueError(f"Mask directory does not exist: {self.mask_dir}")
+
+        # Collect paired files
+        images, masks = self._collect_paired_files()
+
+        # Split dataset
+        self.images, self.masks = self._split_dataset(images, masks)

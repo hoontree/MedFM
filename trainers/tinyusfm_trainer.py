@@ -43,6 +43,9 @@ def _build_optimizer(model: nn.Module, cfg) -> optim.Optimizer:
 
         # Handle layer decay
         use_layer_decay = opt_cfg.pop("use_layer_decay", False)
+        # Handle grad_clip (it's custom for our trainer)
+        opt_cfg.pop("grad_clip", None)
+
         if use_layer_decay:
             base_lr = opt_cfg.get("lr", cfg.training.get("lr", 0.0001))
             weight_decay = opt_cfg.get("weight_decay", 0.0)
@@ -102,6 +105,13 @@ class TinyUSFMTrainer(BaseTrainer):
 
         self.model.load_checkpoint()
         self.model = self.model.to(self.device)
+
+        # Handle head-only training
+        train_head_only = self.cfg.training.get("train_head_only", False)
+        if train_head_only:
+            self.logger.info("Head-only training enabled. Freezing backbone...")
+            for param in self.model.backbone.parameters():
+                param.requires_grad = False
 
         # Log model info
         total_params = sum(p.numel() for p in self.model.parameters())

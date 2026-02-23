@@ -6,6 +6,7 @@ import wandb
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
+from typing import Optional, Any
 from omegaconf import DictConfig, ListConfig
 
 
@@ -30,14 +31,23 @@ def get_teacher_short_name(cfg: DictConfig) -> str:
     teacher_name = cfg.teacher.name
 
     # For SAM hybrid models with adaptation mode
-    if teacher_name == "sam_hybrid":
+    if teacher_name == "sam_hybrid" or "E0_" in teacher_name or "EL_" in teacher_name:
         sam_type = cfg.teacher.get("sam_type", "vit_b")
         backbone = sam_type.replace("vit_", "")
         adaptation = cfg.teacher.get("adaptation_mode", "")
+
+        name = f"sam_{backbone}"
         if adaptation:
             adapt_short = get_adaptation_short(adaptation)
-            return f"sam_{backbone}_{adapt_short}"
-        return f"sam_{backbone}"
+            name = f"{name}_{adapt_short}"
+
+        # Add hyperparameters
+        if "alignment_num_blocks" in cfg.teacher:
+            name = f"{name}_al{cfg.teacher.alignment_num_blocks}"
+        if "r_d" in cfg.teacher:
+            name = f"{name}_rd{cfg.teacher.r_d}"
+
+        return name
 
     # For simple SAM teachers (vit_b, vit_l, vit_h)
     if teacher_name.startswith("vit_"):
@@ -64,11 +74,76 @@ def get_dataset_short_name(cfg: DictConfig) -> str:
     return dataset_name
 
 
-def create_log_dir(cfg: DictConfig) -> Path:
-    """Create hierarchical log directory structure for distillation.
+def resolve_distillation_split_path(
+    cfg: DictConfig,
+    adaptation_ratio: float = 0.5,
+    seed: int = 42,
+    split_file: Optional[str] = None,
+) -> Path:
+    """Resolve split file path for adaptation/distillation split.
 
-    Structure: logs/distill/{teacher}_{student}_{method}/{dataset}/{timestamp}/
-    Example: logs/distill/sam_b_E0-DFT_tinyusfm_logit/BUSBRA/20240116_143052/
+    Priority:
+    1) Explicit split_file
+    2) Deterministic auto path based on dataset names, ratio, and seed
+       -> splits/distill_{train_names}_r{adaptation_ratio}_s{seed}.json
+    """
+    if split_file:
+        return Path(split_file)
+
+    train_names = cfg.data.train
+    if isinstance(train_names, (list, ListConfig)):
+        data_name = "_".join(train_names)
+    else:
+        data_name = cfg.data.name
+
+    return Path(f"splits/distill_{data_name}_r{adaptation_ratio}_s{seed}.json")
+
+
+def get_experiment_tags(cfg: DictConfig) -> list:
+    """Generate standardized tags for experiments based on hyperparameters."""
+    tags = []
+
+    # Training tags
+    if (bs := cfg.get("training", {}).get("batch_size")) is not None:
+        tags.append(f"bs{bs}")
+
+    lr = cfg.get("training", {}).get("lr") or cfg.get("training", {}).get("base_lr")
+    if lr is not None:
+        tags.append(f"lr{lr}")
+
+    # Model structural tags
+    model_cfg = cfg.get(
+        "model", cfg.get("student", {})
+    )  # Use student if model not found (distillation case)
+    if not model_cfg and "teacher" in cfg:
+        model_cfg = cfg.teacher  # Fallback for teacher-only paths if needed
+
+    if "alignment_num_blocks" in model_cfg:
+        tags.append(f"al{model_cfg.alignment_num_blocks}")
+    if "r_d" in model_cfg:
+        tags.append(f"rd{model_cfg.r_d}")
+
+    # Distillation coefficients
+    method_cfg = cfg.get("method", {})
+    coeff_map = {
+        "alpha": "a",
+        "beta": "b",
+        "gamma": "g",
+        "gamma_attn": "ga",
+        "gamma_align": "galign",
+        "temperature": "T",
+    }
+    for key, tag in coeff_map.items():
+        if (val := method_cfg.get(key)) is not None:
+            tags.append(f"{tag}{val}")
+
+    return tags
+
+
+def create_log_dir(cfg: DictConfig) -> Path:
+    """Create hierarchical log directory structure with hyperparameter tags.
+
+    Structure: logs/distill/{teacher}_{student}_{method}/{dataset}/{timestamp}_{tags}/
     """
     teacher_short = get_teacher_short_name(cfg)
     student_short = get_student_short_name(cfg)
@@ -76,8 +151,17 @@ def create_log_dir(cfg: DictConfig) -> Path:
     dataset_name = get_dataset_short_name(cfg)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    exp_config = f"{teacher_short}_{student_short}_{method_name}"
-    return Path(cfg.output.dir) / "distill" / exp_config / dataset_name / timestamp
+    tags = get_experiment_tags(cfg)
+    tag_suffix = "_" + "_".join(tags) if tags else ""
+
+    exp_group = f"{teacher_short}_{student_short}_{method_name}"
+    return (
+        Path(cfg.output.dir)
+        / "distill"
+        / exp_group
+        / dataset_name
+        / f"{timestamp}{tag_suffix}"
+    )
 
 
 def save_experiment_summary(cfg: DictConfig, log_dir: Path):
@@ -251,3 +335,82 @@ def visualize_distillation(
                 )
                 plt.close()
                 sample_count += 1
+
+
+def find_best_checkpoint(
+    model_cfg: DictConfig, logs_root: str = "logs"
+) -> Optional[Path]:
+    """Find the best checkpoint for a given model configuration automatically.
+
+    Searches for: logs/{phase}/{model_name}/{dataset}/{timestamp}_{tags}/checkpoints/best_*.pth
+    """
+    adaptation_mode = model_cfg.get("adaptation_mode", model_cfg.get("name", "model"))
+
+    logs_root_path = Path(logs_root)
+    if not logs_root_path.exists():
+        return None
+
+    # We search in these subdirectories
+    search_dirs = [
+        logs_root_path / "adaptation" / adaptation_mode,
+        logs_root_path / "train" / adaptation_mode,
+        logs_root_path / adaptation_mode,  # Legacy support
+    ]
+
+    candidates = []
+
+    # Required tags for structural matching
+    required_tags = []
+    if "alignment_num_blocks" in model_cfg:
+        required_tags.append(f"al{model_cfg.alignment_num_blocks}")
+    if "r_d" in model_cfg:
+        required_tags.append(f"rd{model_cfg.r_d}")
+
+    for logs_dir in search_dirs:
+        if not logs_dir.exists():
+            continue
+
+        # Recursively find checkpoints
+        for dataset_path in logs_dir.iterdir():
+            if not dataset_path.is_dir():
+                continue
+
+            for exp_path in dataset_path.iterdir():
+                if not exp_path.is_dir():
+                    continue
+
+                # Check if tags match
+                exp_name = exp_path.name
+                if all(tag in exp_name for tag in required_tags):
+                    # Verify experiment configuration (distillation.enabled and phase)
+                    config_path = exp_path / "config.yaml"
+                    if config_path.exists():
+                        try:
+                            exp_cfg = OmegaConf.load(config_path)
+                            # If we found it in 'adaptation' folder, it's likely correct.
+                            # But if we found it elsewhere, we might want to check if it's strictly a teacher-ready model.
+                            # For now, let's be loose if it matches structural tags.
+                        except Exception:
+                            continue
+
+                    ckpt_dir = exp_path / "checkpoints"
+                    if ckpt_dir.exists():
+                        best_ckpts = list(ckpt_dir.glob("best_*.pth"))
+                        if best_ckpts:
+
+                            def get_dice(p):
+                                try:
+                                    # Handle dice scores in filename
+                                    return float(p.stem.split("dice")[-1])
+                                except:
+                                    return 0.0
+
+                            best_ckpts.sort(key=get_dice, reverse=True)
+                            candidates.append((exp_path.stat().st_mtime, best_ckpts[0]))
+
+    if not candidates:
+        return None
+
+    # Pick the one from the most recent experiment that matches requirements
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]

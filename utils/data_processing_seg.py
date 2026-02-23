@@ -17,6 +17,7 @@ from utils.ultrasound_datasets import (
     UltrasoundSegmentationDataset,
     B,
 )
+from utils.distill_utils import resolve_distillation_split_path
 
 # Dataset class registry
 DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
@@ -26,6 +27,12 @@ DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
     "BUSBRA": BUSBRA,
     "UltrasoundSegmentationDataset": UltrasoundSegmentationDataset,
     "B": B,
+}
+
+DEFAULT_SAM_IMG_SIZE_BY_TYPE = {
+    "vit_b": 224,
+    "vit_l": 256,
+    "vit_h": 256,
 }
 
 
@@ -38,6 +45,36 @@ def get_dataset_class(name: str) -> Type[Dataset]:
 
 
 class SegDatasetProcessor:
+    @staticmethod
+    def _sync_img_size_with_sam_type(cfg):
+        """Sync data/model img_size from sam_type when enabled.
+
+        Applies to:
+        - train path: cfg.model.sam_type
+        - distill path: cfg.teacher.sam_type
+        """
+        data_cfg = cfg.get("data", {})
+        if not data_cfg.get("auto_img_size_by_sam_type", True):
+            return
+
+        sam_cfg = None
+        if "model" in cfg and cfg.model.get("sam_type") is not None:
+            sam_cfg = cfg.model
+        elif "teacher" in cfg and cfg.teacher.get("sam_type") is not None:
+            sam_cfg = cfg.teacher
+        if sam_cfg is None:
+            return
+
+        sam_type = str(sam_cfg.get("sam_type")).lower()
+        size_map = data_cfg.get("sam_img_size_map", DEFAULT_SAM_IMG_SIZE_BY_TYPE)
+        target_size = size_map.get(sam_type)
+        if target_size is None:
+            return
+
+        target_size = int(target_size)
+        cfg.data.img_size = target_size
+        sam_cfg.img_size = target_size
+
     @staticmethod
     def load_dataset_from_config(cfg, name, split):
         """Helper to load dataset config and instantiate."""
@@ -61,6 +98,8 @@ class SegDatasetProcessor:
     @staticmethod
     def build_dataset(cfg):
         """Build train, val, and test datasets according to config."""
+        SegDatasetProcessor._sync_img_size_with_sam_type(cfg)
+
         # 1. Train/Val sets (Combine into ConcatDataset if multiple)
         train_list = (
             cfg.data.train
@@ -153,16 +192,12 @@ class SegDatasetProcessor:
         """Build non-overlapping datasets for distillation workflow."""
         train_ds, val_ds, test_ds_dict = SegDatasetProcessor.build_dataset(cfg)
 
-        # Determine split path
-        if split_file:
-            split_path = Path(split_file)
-        else:
-            name = (
-                "_".join(cfg.data.train)
-                if isinstance(cfg.data.train, (list, ListConfig))
-                else cfg.data.name
-            )
-            split_path = Path(f"splits/distill_{name}_s{seed}.json")
+        split_path = resolve_distillation_split_path(
+            cfg,
+            adaptation_ratio=adaptation_ratio,
+            seed=seed,
+            split_file=split_file,
+        )
 
         indices = SegDatasetProcessor._get_split_indices(
             train_ds, val_ds, adaptation_ratio, seed, split_path, save_split
@@ -227,6 +262,7 @@ class SegDatasetProcessor:
                     if (
                         data.get("n_train") == len(train_ds)
                         and data.get("seed") == seed
+                        and data.get("ratio") == ratio
                     ):
                         print(f"Loaded valid split indices from {path}")
                         return data

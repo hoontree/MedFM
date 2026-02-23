@@ -1,18 +1,18 @@
 #@package _global_
 
-# Training configuration
+# Distillation Training configuration
 training:
   num_epochs: 1000
-  lr: 0.0005           # Learning rate for student
+  lr: 0.0001           # Learning rate for student
   warmup_epochs: 5
-  batch_size: 16
+  batch_size: 8
   num_workers: 8
   limit_train_batches: null
 
   early_stopping:
     enabled: true
     patience: 30
-    min_delta: 0.0000001
+    min_delta: 1e-6
 
 # Optimizer configuration
 optimizer:
@@ -24,39 +24,16 @@ optimizer:
 
 # Scheduler configuration
 scheduler:
-  use_reduce_on_plateau: false
-  warmup_iters: 500
-  total_iters: 10000
-  power: 0.9
-
-# Hardware configuration
-hardware:
-  gpu_ids: [0]
-  seed: 42
-
-# Output configuration
-output:
-  dir: logs
-
-# Visualization
-visualization:
-  num_samples: 10
-
-# Wandb configuration
-wandb:
-  project: medical_foundation_models
-  entity: hheo
-  log_model: true
+  _target_: utils.schedule.CosineAnnealingWarmupLR
+  warmup_epochs: ${training.warmup_epochs}
+  max_epochs: ${training.num_epochs}
+  base_lr: ${training.lr}
+  min_lr: 1e-6
 
 # Distillation dataset split configuration
-# When enabled, splits training data into adaptation/distillation subsets
 distillation:
   enabled: true
-  # Phase: 'adaptation' (teacher fine-tuning) or 'distillation' (student training)
   phase: distillation
-  # Ratio of data for adaptation (teacher fine-tuning)
   adaptation_ratio: 0.3
-  # Random seed for reproducible splitting
   split_seed: 42
-  # Optional: explicit path to split file (auto-generated if null)
   split_file: splits/distillation_stratified_split_BUSBRA_BUSI_B_seed42.json

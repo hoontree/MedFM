@@ -11,4 +11,9 @@ test: [BUID, BUS_UCLM]  # Each dataset in this list will be evaluated separately
 # Canonical location for num_classes and img_size
 num_classes: 1
 img_size: 224
+auto_img_size_by_sam_type: true
+sam_img_size_map:
+  vit_b: 224
+  vit_l: 1024
+  vit_h: 1024
 normalization: "imagenet"

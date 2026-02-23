@@ -1,0 +1,30 @@
+# WandB Sweep Configuration - GPU 2
+# Model: E0_DL
+project: medfm_teacher_sweep
+
+program: train.py
+method: grid
+metric:
+  name: pipeline/distill_final_dice
+  goal: maximize
+
+parameters:
+  model:
+    values: [E0_DL]
+  model.r_d:
+    values: [1, 2, 4]
+  distillation.adaptation_ratio:
+    values: [0.3, 1.0]
+
+# Hydra command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - pipeline.enabled=true
+  - distillation.enabled=true
+  - distillation.phase=adaptation
+  - wandb.disabled=true
+  - hardware.gpu_ids=[2]
+  - wandb.project=medfm_teacher_sweep

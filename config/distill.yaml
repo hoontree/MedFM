@@ -1,35 +1,28 @@
-# Knowledge Distillation Configuration (Refactored)
-
+# Knowledge Distillation Configuration
 defaults:
-  - _self_
   - data: dynamic
   - teacher: E0_AL_DL
   - student: tinyusfm
   - method: unified
-  - log: wandb
   - training: distillation
+  - log: wandb
+  - _self_
 
 trainer:
   _target_: trainers.distill_trainer.DistillTrainer
 
-gpu_ids: [0]
-debug: false
+# Hardware Configuration (Global Overrides)
+hardware:
+  gpu_ids: [3]
+  seed: 42
 
-# Output configuration
+# Global Flags
+debug: false
+use_gradnorm: false
+
+# Output & Visualization
 output:
   dir: logs
 
-# Visualization
 visualization:
   num_samples: 10
-
-# Distillation dataset split configuration
-# When enabled, uses only the distillation subset (non-overlapping with adaptation data)
-distillation:
-  enabled: true
-  # Ratio of data used for teacher adaptation (distillation uses the remaining)
-  adaptation_ratio: 0.3
-  # Random seed for reproducible splitting (must match train.py for consistency)
-  split_seed: 42
-  # Optional: explicit path to split file (auto-generated if null)
-  split_file: distillation_stratified_split_BUSBRA_BUSI_B_seed42.json

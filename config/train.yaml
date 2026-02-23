@@ -2,6 +2,19 @@
 defaults:
   - _self_
   - data: dynamic
-  - model: E0_AL_D0
+  - model: E0_DF
 
-gpu_ids: [0]
+gpu_ids: [1]
+
+pipeline:
+  enabled: false
+  distill:
+    enabled: true
+    config_name: distill
+    metric_key: pipeline/distill_final_dice
+    metric_dataset: BUID
+    metric_fallback: first_test_dataset
+    require_teacher_preset: true
+    fail_fast: true
+  sweep:
+    disable_teacher_wandb: true

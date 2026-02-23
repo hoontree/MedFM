@@ -1,0 +1,28 @@
+# DEPRECATED: Legacy distillation-only sweep. Prefer train.py pipeline sweeps.
+# WandB Sweep Configuration - GPU 3
+# Model: E0_AL_DL
+project: medfm_teacher_sweep
+
+program: distill.py
+method: grid
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  model:
+    values: [E0_D0, E0_DF]
+  distillation.adaptation_ratio:
+    values: [0.3, 1.0]
+
+  method.beta:
+    values: [0, 1.0]
+
+# Hydra command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - hardware.gpu_ids=[3]
+  - wandb.project=medfm_distill_sweep

@@ -1,0 +1,33 @@
+# WandB Sweep Configuration for Teacher Training (Adaptation)
+# Run this with: wandb sweep config/train_sweep.yaml
+
+program: train.py
+method: grid # grid, random, bayes
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  # Model Structural Hyperparameters
+  model.alignment_num_blocks:
+    values: [2, 4, 8]
+  model.r_d:
+    values: [4]
+  model.r_e:
+    values: [4] # Fixed or sweepable if needed
+    
+  # Training Hyperparameters
+  training.lr:
+    values: [0.0001, 0.00005, 0.0002, 0.00001]
+  training.batch_size:
+    values: [4, 8, 16]
+
+# Hydra command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - model=E0_AL_D0 # Default model for sweep
+  - training.num_epochs=100 # Adjust as needed
+  - wandb.project=medical_foundation_models_teacher_sweep

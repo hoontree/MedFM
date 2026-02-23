@@ -1,12 +1,7 @@
-_target_: model.sam_hybrid_adapter.build_sam_hybrid
+defaults:
+  - /model/sam_hybrid_base@
+
 name: E0_AL_D0
-sam_type: vit_b
-num_classes: ${data.num_classes}
-img_size: ${data.img_size}
 adaptation_mode: encoder_frozen_alignment_decoder_frozen
-r_e: 4
-r_d: 4
-sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-alignment_num_blocks: 4
+alignment_num_blocks: 2
 alignment_hidden_channels: 256
-checkpoint: /home/hheo/codes/papers/medfm/logs/encoder_frozen_alignment_decoder_frozen/BUSBRA+BUSI+B/20260201_160656_bs4_lr0.0001/checkpoints/best_epoch_33_dice0.7580.pth

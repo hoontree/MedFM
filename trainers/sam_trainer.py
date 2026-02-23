@@ -34,6 +34,7 @@ class SAMTrainer(BaseTrainer):
         self.dice_loss = None
         self.multimask_output = False
         self.img_size = cfg.model.img_size
+        self.step_log_interval = 10
 
     def _get_config_value(self, section: str, keys: list, default, cast_type=float):
         """Get config value with multiple key fallbacks."""
@@ -72,7 +73,8 @@ class SAMTrainer(BaseTrainer):
             if (value := hw.get(key)) is not None:
                 return int(value)
         # Try gpu_ids list
-        if (gpu_ids := hw.get("gpu_ids")) and isinstance(gpu_ids, (list, tuple)):
+        gpu_ids = hw.get("gpu_ids", self.cfg.get("gpu_ids"))
+        if gpu_ids and isinstance(gpu_ids, (list, tuple)):
             return len(gpu_ids)
         return 1
 
@@ -103,6 +105,9 @@ class SAMTrainer(BaseTrainer):
 
     def _create_model(self):
         """Create SAM model using ModelBuilder."""
+        # Keep trainer runtime img_size aligned with any pre-dataloader sync.
+        self.img_size = int(self.cfg.model.img_size)
+
         if self.model is None:
             from trainers.model_builder import ModelBuilder
 
@@ -124,14 +129,8 @@ class SAMTrainer(BaseTrainer):
 
         # Set multimask output
         self.multimask_output = self.cfg.get("multimask_output", False)
-
-        # Log model info
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
-        self.logger.info(f"Total parameters: {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable_params:,}")
+        self.step_log_interval = self._get_step_log_interval()
+        self._log_model_configuration()
 
     def _create_dataloaders(self):
         """Create data loaders.
@@ -260,11 +259,117 @@ class SAMTrainer(BaseTrainer):
         """Get current learning rate from optimizer."""
         return self.optimizer.param_groups[0]["lr"]
 
+    def _get_step_log_interval(self) -> int:
+        """Get step-level wandb log interval from config."""
+        training_cfg = self.cfg.get("training", {})
+        wandb_cfg = self.cfg.get("wandb", {})
+        raw_interval = training_cfg.get("step_log_interval")
+        if raw_interval is None:
+            raw_interval = wandb_cfg.get("step_log_interval")
+        if raw_interval is None:
+            return 10
+
+        try:
+            interval = int(raw_interval)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "Invalid step_log_interval=%s. Falling back to 10.", raw_interval
+            )
+            return 10
+
+        if interval <= 0:
+            self.logger.warning(
+                "step_log_interval must be > 0, got %s. Falling back to 10.", interval
+            )
+            return 10
+        return interval
+
     def _get_base_model(self):
         """Get base model (handle DataParallel wrapper)."""
         return (
             self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         )
+
+    def _log_model_configuration(self):
+        """Log resolved SAM adaptation and pretrained configuration."""
+        base_model = self._get_base_model()
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+
+        sam_type = getattr(base_model, "sam_type", self.cfg.model.get("sam_type", "N/A"))
+        adaptation_mode = getattr(
+            base_model,
+            "adaptation_mode",
+            self.cfg.model.get("adaptation_mode", "N/A"),
+        )
+        encoder_mode = getattr(base_model, "encoder_mode", "N/A")
+        decoder_mode = getattr(base_model, "decoder_mode", "N/A")
+        use_alignment = getattr(base_model, "use_alignment", False)
+        pretrained_cfg = self.cfg.model.get("pretrained_weight", {})
+        if pretrained_cfg is None:
+            pretrained_cfg = {}
+        default_pretrained_name = (
+            pretrained_cfg.get("name", "default")
+            if hasattr(pretrained_cfg, "get")
+            else "default"
+        )
+        pretrained_weight_name = getattr(
+            base_model,
+            "pretrained_weight_name",
+            default_pretrained_name,
+        )
+        pretrained_weight_source = getattr(
+            base_model,
+            "pretrained_weight_source",
+            "sam_checkpoint",
+        )
+        resolved_sam_checkpoint = getattr(base_model, "resolved_sam_checkpoint", None)
+
+        self.logger.info("SAM Configuration:")
+        self.logger.info(
+            "  sam_type=%s, adaptation_mode=%s, encoder_mode=%s, decoder_mode=%s, alignment=%s",
+            sam_type,
+            adaptation_mode,
+            encoder_mode,
+            decoder_mode,
+            use_alignment,
+        )
+        self.logger.info(
+            "  pretrained_weight.name=%s, source=%s, resolved_checkpoint=%s",
+            pretrained_weight_name,
+            pretrained_weight_source,
+            resolved_sam_checkpoint if resolved_sam_checkpoint else "none",
+        )
+        self.logger.info("  step_log_interval=%d", self.step_log_interval)
+        self.logger.info(f"Total parameters: {total_params:,}")
+        self.logger.info(f"Trainable parameters: {trainable_params:,}")
+
+        if wandb.run is not None:
+            wandb.config.update(
+                {
+                    "model.sam_type": sam_type,
+                    "model.adaptation_mode": adaptation_mode,
+                    "model.encoder_mode": encoder_mode,
+                    "model.decoder_mode": decoder_mode,
+                    "model.use_alignment": use_alignment,
+                    "model.pretrained_weight_name": pretrained_weight_name,
+                    "model.pretrained_weight_source": pretrained_weight_source,
+                    "model.resolved_sam_checkpoint": resolved_sam_checkpoint,
+                    "wandb.step_log_interval": self.step_log_interval,
+                },
+                allow_val_change=True,
+            )
+            wandb.summary["model/total_params"] = total_params
+            wandb.summary["model/trainable_params"] = trainable_params
+            wandb.summary["model/pretrained_weight_name"] = pretrained_weight_name
+            wandb.summary["model/pretrained_weight_source"] = (
+                pretrained_weight_source
+            )
+            wandb.summary["model/resolved_sam_checkpoint"] = (
+                resolved_sam_checkpoint if resolved_sam_checkpoint else "none"
+            )
 
     def _iter_test_loaders(self):
         """Iterate over test loaders with names."""
@@ -287,6 +392,7 @@ class SAMTrainer(BaseTrainer):
     def _calc_loss(self, outputs, label_batch, low_res_label_batch):
         """Calculate loss using unified channel-based approach."""
         dice_weight = self._get_dice_weight()
+        moe_loss_weight = float(self.cfg.get("training", {}).get("moe_loss_weight", 0.0))
 
         # Both binary and multi-class now use low_res_logits and low_res_label_batch (float [B, C, H, W])
         logits = outputs["low_res_logits"]
@@ -298,10 +404,13 @@ class SAMTrainer(BaseTrainer):
 
         loss_ce = self.bce_loss(logits, target)
         loss_dice = self.dice_loss(logits, target)
+        loss_moe = outputs.get("moe_loss", torch.tensor(0.0, device=logits.device))
+        if not torch.is_tensor(loss_moe):
+            loss_moe = torch.tensor(float(loss_moe), device=logits.device)
 
-        loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice
+        loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice + moe_loss_weight * loss_moe
 
-        return loss, loss_ce, loss_dice
+        return loss, loss_ce, loss_dice, loss_moe
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
@@ -310,6 +419,7 @@ class SAMTrainer(BaseTrainer):
         total_loss = 0.0
         total_ce_loss = 0.0
         total_dice_loss = 0.0
+        total_moe_loss = 0.0
 
         train_pbar = tqdm(
             self.train_loader, desc=f"Epoch {epoch + 1}/{self._get_num_epochs()}"
@@ -324,7 +434,7 @@ class SAMTrainer(BaseTrainer):
             outputs = self.model(image_batch, self.multimask_output, self.img_size)
 
             # Calculate loss
-            loss, loss_ce, loss_dice = self._calc_loss(
+            loss, loss_ce, loss_dice, loss_moe = self._calc_loss(
                 outputs, label_batch, low_res_label_batch
             )
 
@@ -348,17 +458,19 @@ class SAMTrainer(BaseTrainer):
             total_loss += loss.item()
             total_ce_loss += loss_ce.item()
             total_dice_loss += loss_dice.item()
+            total_moe_loss += loss_moe.item()
 
             # Update progress bar
             train_pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr:.6f}"})
 
             # Log to wandb (step-level metrics)
-            if self.global_step % 10 == 0:
+            if self.global_step % self.step_log_interval == 0 and wandb.run is not None:
                 wandb.log(
                     {
                         "step_train/loss": loss.item(),
                         "step_train/loss_ce": loss_ce.item(),
                         "step_train/loss_dice": loss_dice.item(),
+                        "step_train/loss_moe": loss_moe.item(),
                         "step_train/learning_rate": lr,
                         "global_step": self.global_step,
                     }
@@ -372,6 +484,7 @@ class SAMTrainer(BaseTrainer):
             "loss": total_loss / num_batches,
             "loss_ce": total_ce_loss / num_batches,
             "loss_dice": total_dice_loss / num_batches,
+            "loss_moe": total_moe_loss / num_batches,
         }
 
         return metrics

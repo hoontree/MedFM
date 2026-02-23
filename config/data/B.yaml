@@ -1,7 +1,11 @@
 name: "B"
 type: "SegBase"
 num_classes: 1  # Binary segmentation (background, lesion)
-img_size: 224
+auto_img_size_by_sam_type: true
+sam_img_size_map:
+  vit_b: 224
+  vit_l: 1024
+  vit_h: 1024
 path:
   root: "/home/hheo/data/Ultrasound/seg/breast/Dataset_B"
   split:

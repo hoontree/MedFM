@@ -10,7 +10,11 @@ path:
       samples: 16
       interval: 10
 num_classes: 1
-img_size: 224
+auto_img_size_by_sam_type: true
+sam_img_size_map:
+  vit_b: 224
+  vit_l: 1024
+  vit_h: 1024
 extensions: [".png"]
 partition_dir: "partitions"  # train/test split directory
 seed: 42

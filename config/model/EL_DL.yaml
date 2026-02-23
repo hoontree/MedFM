@@ -1,7 +1,6 @@
 # @package _global_
-# SAM with dual LoRA (encoder + decoder)
-
 defaults:
+  - sam_hybrid_base@model
   - _self_
   - /training: sam_training
 
@@ -9,13 +8,5 @@ trainer:
   _target_: trainers.sam_trainer.SAMTrainer
 
 model:
-  _target_: model.sam_hybrid_adapter.build_sam_hybrid
-  name: sam_dual_lora
-  sam_type: vit_b
-  num_classes: ${data.num_classes}
-  img_size: ${data.img_size}
-  adaptation_mode: dual_lora
-  r_e: 4
-  r_d: 4
-  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
-  checkpoint: null  # Set to path to load trained LoRA weights
+  name: EL_DL
+  adaptation_mode: encoder_conv_lora_decoder_lora

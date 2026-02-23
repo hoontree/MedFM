@@ -34,6 +34,7 @@ training:
   warmup: false
   warmup_period: 250
   dice_param: 0.8
+  moe_loss_weight: 0.0
   save_interval: 20               # Save checkpoint every N epochs
   early_stopping:
     enabled: true

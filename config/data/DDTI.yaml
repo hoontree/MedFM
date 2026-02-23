@@ -1,0 +1,23 @@
+name: "DDTI"
+type: "SegBase"
+num_classes: 1 # Binary segmentation (background, lesion)
+img_size: 224 # Resize images to 224x224 for training and evaluation
+# img_size: 512  # Resize images to 512x512 for training and evaluation
+path:
+  root: "/home/hheo/data/Ultrasound/seg/thyroid/DDTI/2_preprocessed_data/stage1"
+  split:
+    train: "train"
+    val: "val"
+    test: "test"
+    vis:
+      samples: 16
+      interval: 10
+extensions: [".PNG"]
+image_dir: "Images"
+mask_dir: "Masks"
+image_prefix: ""
+mask_prefix: ""
+# Dataset info
+# Total:
+# Binary masks (background: 0, lesion: 1)
+# Grayscale images with varying sizes

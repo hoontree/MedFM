@@ -1,0 +1,59 @@
+# Comprehensive Distillation Sweep Configuration
+# Combines teacher selection, architectural tuning, and hyperparameter optimization.
+# Run with: wandb sweep config/comprehensive_sweep.yaml
+
+program: distill.py
+method: bayes # Bayesian optimization for efficient search
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  # 1. Teacher Configuration Preset
+  teacher:
+    values: [E0_AL_DL, E0_AL_D0, E0_DL, E0_DF, E0_D0]
+
+  # 2. Structural Hyperparameters (Overrides presets)
+  teacher.alignment_num_blocks:
+    values: [2, 4, 8]
+  teacher.r_d:
+    values: [1, 2, 4]
+  
+  # 3. Distillation Balance (GradNorm handles these if enabled)
+  method.gamma_attn:
+    distribution: uniform
+    min: 0.1
+    max: 1.0
+  method.gamma_align:
+    distribution: uniform
+    min: 0.1
+    max: 1.0
+
+  # 4. Advanced KD Coefficients
+  method.lambda_boundary:
+    distribution: uniform
+    min: 0.05
+    max: 0.5
+  method.lambda_shape:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+
+  # 5. Training Hyperparameters
+  training.lr:
+    distribution: log_uniform_values
+    min: 5e-5
+    max: 5e-4
+  training.batch_size:
+    values: [8, 16]
+
+# Optimized command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - teacher.checkpoint=auto
+  - training.num_epochs=30 # Balanced for sweep speed
+  - use_gradnorm=true # Recommended default for multi-loss KD
+  - wandb.project=medfm_comprehensive_distill

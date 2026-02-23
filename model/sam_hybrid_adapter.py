@@ -6,6 +6,8 @@ freeze/LoRA/full-finetune for both encoder and decoder components.
 Supported adaptation modes:
     - dual_lora: LoRA on both encoder and decoder
     - dual_ft: Full fine-tune on both encoder and decoder
+    - encoder_conv_lora_decoder_{ft,lora,frozen}: Conv-LoRA on encoder, chosen mode on decoder
+    - encoder_conv_lora_alignment_decoder_{ft,lora,frozen}: Conv-LoRA on encoder, alignment layer, chosen mode on decoder
     - encoder_lora_decoder_ft: LoRA on encoder, full fine-tune decoder
     - encoder_lora_decoder_frozen: LoRA on encoder, freeze decoder
     - encoder_ft_decoder_lora: Full fine-tune encoder, LoRA on decoder
@@ -18,13 +20,26 @@ Supported adaptation modes:
     - encoder_frozen_alignment_decoder_frozen: Freeze encoder and decoder, train alignment layer only
 """
 
+import logging
 import math
+import re
+from pathlib import Path
+from typing import List, Optional
 import torch
 import torch.nn as nn
-from torch.nn.parameter import Parameter
 from model.segment_anything import sam_model_registry
 from model.segment_anything.modeling import Sam
 from model.ca_sam.alignment_layer import AlignmentLayer
+from model.adaptation_layers import ConvLoRALinear
+
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+SAM_PRESET_CHECKPOINTS = {
+    "vit_b": "checkpoints/sam_vit_b_01ec64.pth",
+    "vit_l": "checkpoints/sam_vit_l_0b3195.pth",
+    "vit_h": "checkpoints/sam_vit_h_4b8939.pth",
+}
 
 
 class _LoRA_qkv(nn.Module):
@@ -75,6 +90,101 @@ class _LoRA_qkv_proj(nn.Module):
         return self.proj(x) + self.w_b(self.w_a(x))
 
 
+class _ConvLoRA_qkv(nn.Module):
+    """Adapter for Conv-LoRA qkv projection in image encoder.
+
+    ConvLoRALinear returns `(result, moe_loss)`, but the SAM encoder attention
+    expects a plain tensor. This wrapper keeps interface compatibility.
+    """
+
+    def __init__(self, conv_lora_qkv: ConvLoRALinear):
+        super().__init__()
+        self.conv_lora_qkv = conv_lora_qkv
+        self.last_moe_loss = None
+
+    def forward(self, x):
+        qkv, moe_loss = self.conv_lora_qkv(x)
+        self.last_moe_loss = moe_loss
+        return qkv
+
+
+def create_adaptation(
+    peft: str, layer: nn.Module, lora_r: int, lora_alpha: int, **kwargs
+):
+    """Create Conv-LoRA adaptation for a linear layer."""
+    if peft != "conv_lora":
+        raise NotImplementedError(
+            f"Unsupported adaptation strategy '{peft}'. Only 'conv_lora' is supported here."
+        )
+    if not isinstance(layer, nn.Linear):
+        raise TypeError(f"Conv-LoRA can only wrap nn.Linear. Got: {type(layer)}")
+
+    conv_lora = ConvLoRALinear(
+        in_features=layer.in_features,
+        out_features=layer.out_features,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        merge_weights=False,
+        conv_lora_expert_num=kwargs["conv_lora_expert_num"],
+        bias=layer.bias is not None,
+    )
+    conv_lora.weight.data.copy_(layer.weight.data)
+    if layer.bias is not None and conv_lora.bias is not None:
+        conv_lora.bias.data.copy_(layer.bias.data)
+    return _ConvLoRA_qkv(conv_lora)
+
+
+def inject_adaptation_to_linear_layer(
+    model: nn.Module,
+    peft: str,
+    lora_r: int,
+    lora_alpha: int,
+    filter: Optional[List[str]] = None,
+    module_filter: Optional[List[str]] = None,
+    **kwargs,
+) -> List[_ConvLoRA_qkv]:
+    """Inject Conv-LoRA adapters into selected linear layers."""
+    injected_layers: List[_ConvLoRA_qkv] = []
+
+    for m_name, module in dict(model.named_modules()).items():
+        if module_filter and not any(
+            re.match(filter_module, m_name) for filter_module in module_filter
+        ):
+            continue
+
+        for c_name, layer in dict(module.named_children()).items():
+            if filter and not any(
+                re.match(filter_layer, c_name) for filter_layer in filter
+            ):
+                continue
+            if not isinstance(layer, nn.Linear):
+                continue
+
+            adaptation_layer = create_adaptation(
+                peft, layer, lora_r, lora_alpha, **kwargs
+            )
+            setattr(module, c_name, adaptation_layer)
+            injected_layers.append(adaptation_layer)
+
+    return injected_layers
+
+
+def _resolve_checkpoint_for_sam_type(sam_type: str) -> str:
+    """Resolve fixed SAM checkpoint from sam_type."""
+    if sam_type not in SAM_PRESET_CHECKPOINTS:
+        raise ValueError(
+            f"Unsupported sam_type='{sam_type}'. "
+            f"Available: {sorted(SAM_PRESET_CHECKPOINTS.keys())}"
+        )
+
+    ckpt = (PROJECT_ROOT / SAM_PRESET_CHECKPOINTS[sam_type]).resolve()
+    if not ckpt.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint for sam_type='{sam_type}' not found: {ckpt}"
+        )
+    return str(ckpt)
+
+
 class LoRA_Sam(nn.Module):
     """SAM model with flexible adaptation modes for encoder and decoder.
 
@@ -87,27 +197,16 @@ class LoRA_Sam(nn.Module):
         adaptation_mode: String specifying the adaptation strategy
         lora_layer: Optional list of layer indices to apply LoRA (encoder only)
 
-    Adaptation mode format: '{encoder_mode}_{decoder_mode}'
-        - encoder_mode: 'encoder_lora', 'encoder_ft', 'encoder_frozen'
-        - decoder_mode: 'decoder_lora', 'decoder_ft', 'decoder_frozen'
-        - Special: 'dual_lora', 'dual_ft' for both components same mode
+    Adaptation mode format:
+        - 'encoder_{encoder_mode}_decoder_{decoder_mode}'
+        - 'encoder_{encoder_mode}_alignment_decoder_{decoder_mode}'
+        - Special: 'dual_lora', 'dual_ft'
+        - encoder_mode: 'lora', 'conv_lora', 'ft', 'frozen'
+        - decoder_mode: 'lora', 'ft', 'frozen'
     """
 
-    # Valid adaptation modes
-    VALID_MODES = {
-        "dual_lora",
-        "dual_ft",
-        "encoder_lora_decoder_ft",
-        "encoder_lora_decoder_frozen",
-        "encoder_ft_decoder_lora",
-        "encoder_ft_decoder_frozen",
-        "encoder_frozen_decoder_ft",
-        "encoder_frozen_decoder_lora",
-        "encoder_frozen_decoder_frozen",
-        "encoder_frozen_alignment_decoder_ft",
-        "encoder_frozen_alignment_decoder_lora",
-        "encoder_frozen_alignment_decoder_frozen",
-    }
+    VALID_ENCODER_MODES = {"lora", "conv_lora", "ft", "frozen"}
+    VALID_DECODER_MODES = {"lora", "ft", "frozen"}
 
     def __init__(
         self,
@@ -118,18 +217,14 @@ class LoRA_Sam(nn.Module):
         lora_layer=None,
         alignment_num_blocks: int = 4,
         alignment_hidden_channels: int = 256,
+        conv_lora_expert_num: int = 4,
     ):
         super(LoRA_Sam, self).__init__()
-
-        if adaptation_mode not in self.VALID_MODES:
-            raise ValueError(
-                f"Invalid adaptation_mode: {adaptation_mode}. "
-                f"Valid modes are: {self.VALID_MODES}"
-            )
 
         self.adaptation_mode = adaptation_mode
         self.r_e = r_e
         self.r_d = r_d
+        self.conv_lora_expert_num = conv_lora_expert_num
 
         # Parse adaptation mode
         encoder_mode, decoder_mode, use_alignment = self._parse_adaptation_mode(
@@ -158,6 +253,8 @@ class LoRA_Sam(nn.Module):
         self.cross_attn_ti_Bs = []
         self.cross_attn_it_As = []
         self.cross_attn_it_Bs = []
+        self.encoder_conv_qkv_adapters = []
+        self.encoder_conv_qkv_modules = []
 
         # Apply adaptation to encoder
         self._adapt_encoder(sam_model, encoder_mode)
@@ -184,20 +281,54 @@ class LoRA_Sam(nn.Module):
             return "lora", "lora", False
         elif mode == "dual_ft":
             return "ft", "ft", False
-        else:
-            # Format: encoder_{mode}_decoder_{mode} or encoder_{mode}_alignment_decoder_{mode}
-            parts = mode.split("_")
-            # Check for alignment mode
-            if "alignment" in parts:
-                # encoder_frozen_alignment_decoder_ft -> ['encoder', 'frozen', 'alignment', 'decoder', 'ft']
-                encoder_mode = parts[1]  # frozen
-                decoder_mode = parts[4]  # ft or lora
-                return encoder_mode, decoder_mode, True
+        elif mode.startswith("encoder_"):
+            # Robust parsing that supports encoder_mode tokens containing underscores
+            # (e.g., conv_lora).
+            remainder = mode[len("encoder_") :]
+            use_alignment = "_alignment_decoder_" in remainder
+
+            if use_alignment:
+                if "_alignment_decoder_" not in remainder:
+                    raise ValueError(
+                        f"Invalid adaptation_mode format: {mode}. "
+                        "Expected: encoder_{mode}_alignment_decoder_{mode}"
+                    )
+                encoder_mode, decoder_mode = remainder.split("_alignment_decoder_", 1)
             else:
-                # encoder_lora_decoder_ft -> ['encoder', 'lora', 'decoder', 'ft']
-                encoder_mode = parts[1]  # lora, ft, or frozen
-                decoder_mode = parts[3]  # lora, ft, or frozen
-                return encoder_mode, decoder_mode, False
+                if "_decoder_" not in remainder:
+                    raise ValueError(
+                        f"Invalid adaptation_mode format: {mode}. "
+                        "Expected: encoder_{mode}_decoder_{mode}"
+                    )
+                encoder_mode, decoder_mode = remainder.split("_decoder_", 1)
+
+            if encoder_mode not in self.VALID_ENCODER_MODES:
+                raise ValueError(
+                    f"Invalid encoder mode '{encoder_mode}' in adaptation_mode='{mode}'. "
+                    f"Valid encoder modes: {self.VALID_ENCODER_MODES}"
+                )
+            if decoder_mode not in self.VALID_DECODER_MODES:
+                raise ValueError(
+                    f"Invalid decoder mode '{decoder_mode}' in adaptation_mode='{mode}'. "
+                    f"Valid decoder modes: {self.VALID_DECODER_MODES}"
+                )
+
+            # Conv-LoRA's implementation here is designed for encoder token maps (HxW).
+            # Decoder query lengths are non-square; applying Conv-LoRA there would require
+            # additional reshaping logic and is intentionally disabled for safety.
+            if decoder_mode == "conv_lora":
+                raise ValueError(
+                    "Decoder Conv-LoRA is not supported in this SAM hybrid adapter. "
+                    "Use encoder Conv-LoRA with decoder in {lora, ft, frozen}."
+                )
+
+            return encoder_mode, decoder_mode, use_alignment
+        else:
+            raise ValueError(
+                f"Invalid adaptation_mode: {mode}. "
+                "Examples: dual_lora, dual_ft, encoder_conv_lora_decoder_ft, "
+                "encoder_frozen_alignment_decoder_lora"
+            )
 
     def _setup_alignment_layer(self):
         """Setup alignment layer between encoder and decoder."""
@@ -208,8 +339,9 @@ class LoRA_Sam(nn.Module):
             hidden_channels=self.alignment_hidden_channels,
             num_blocks=self.alignment_num_blocks,
         )
-        print(
-            f"[LoRA_Sam] Alignment Layer: {self.alignment_layer.get_num_params():,} parameters"
+        LOGGER.info(
+            "[LoRA_Sam] Alignment Layer: %s parameters",
+            f"{self.alignment_layer.get_num_params():,}",
         )
 
     def _adapt_encoder(self, sam_model: Sam, mode: str):
@@ -254,6 +386,35 @@ class LoRA_Sam(nn.Module):
                     w_b_linear_q,
                     w_a_linear_v,
                     w_b_linear_v,
+                )
+        elif mode == "conv_lora":
+            for param in sam_model.image_encoder.parameters():
+                param.requires_grad = False
+
+            if self.conv_lora_expert_num is None or self.conv_lora_expert_num < 1:
+                raise ValueError(
+                    f"conv_lora_expert_num must be >= 1 for encoder conv_lora mode. "
+                    f"Got: {self.conv_lora_expert_num}"
+                )
+
+            module_filter = [
+                r"^blocks\.(%s)\.attn$" % "|".join(map(str, self.lora_layer))
+            ]
+            self.encoder_conv_qkv_adapters = inject_adaptation_to_linear_layer(
+                model=sam_model.image_encoder,
+                peft="conv_lora",
+                lora_r=r,
+                lora_alpha=r,
+                filter=[r"^qkv$"],
+                module_filter=module_filter,
+                conv_lora_expert_num=self.conv_lora_expert_num,
+            )
+            self.encoder_conv_qkv_modules = [
+                adapter.conv_lora_qkv for adapter in self.encoder_conv_qkv_adapters
+            ]
+            if len(self.encoder_conv_qkv_modules) == 0:
+                raise RuntimeError(
+                    "Conv-LoRA injection failed: no encoder qkv layers were adapted."
                 )
 
     def _adapt_decoder(self, sam_model: Sam, mode: str):
@@ -347,18 +508,27 @@ class LoRA_Sam(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        print(f"[LoRA_Sam] Adaptation mode: {self.adaptation_mode}")
-        print(
-            f"[LoRA_Sam] Encoder mode: {self.encoder_mode}, Decoder mode: {self.decoder_mode}"
+        LOGGER.info("[LoRA_Sam] Adaptation mode: %s", self.adaptation_mode)
+        LOGGER.info(
+            "[LoRA_Sam] Encoder mode: %s, Decoder mode: %s",
+            self.encoder_mode,
+            self.decoder_mode,
         )
-        if self.use_alignment:
-            print(
-                f"[LoRA_Sam] Alignment Layer: enabled (blocks={self.alignment_num_blocks})"
+        if self.encoder_mode == "conv_lora":
+            LOGGER.info(
+                "[LoRA_Sam] Conv-LoRA (encoder): experts=%s",
+                self.conv_lora_expert_num,
             )
-        print(f"[LoRA_Sam] Total parameters: {total_params:,}")
-        print(
-            f"[LoRA_Sam] Trainable parameters: {trainable_params:,} "
-            f"({100 * trainable_params / total_params:.2f}%)"
+        if self.use_alignment:
+            LOGGER.info(
+                "[LoRA_Sam] Alignment Layer: enabled (blocks=%s)",
+                self.alignment_num_blocks,
+            )
+        LOGGER.info("[LoRA_Sam] Total parameters: %s", f"{total_params:,}")
+        LOGGER.info(
+            "[LoRA_Sam] Trainable parameters: %s (%.2f%%)",
+            f"{trainable_params:,}",
+            100 * trainable_params / total_params,
         )
 
     def reset_parameters(self) -> None:
@@ -406,6 +576,17 @@ class LoRA_Sam(nn.Module):
             merged_dict.update(
                 {f"w_b_{i:03d}": self.w_Bs[i].weight for i in range(num_layer)}
             )
+        elif self.encoder_mode == "conv_lora":
+            for i, mod in enumerate(self.encoder_conv_qkv_modules):
+                merged_dict[f"conv_w_a_{i:03d}"] = mod.lora_A
+                merged_dict[f"conv_w_b_{i:03d}"] = mod.lora_B
+                merged_dict[f"conv_gate_w_{i:03d}"] = mod.lora_moe_gating.w_gate
+                merged_dict[f"conv_noise_w_{i:03d}"] = mod.lora_moe_gating.w_noise
+                for j, expert in enumerate(mod.lora_moe_experts):
+                    expert_conv = expert[0]
+                    merged_dict[f"conv_exp_w_{i:03d}_{j:02d}"] = expert_conv.weight
+                    merged_dict[f"conv_exp_b_{i:03d}_{j:02d}"] = expert_conv.bias
+            merged_dict["conv_lora_expert_num"] = self.conv_lora_expert_num
 
         # Save decoder LoRA if applicable
         if self.decoder_mode == "lora":
@@ -509,6 +690,30 @@ class LoRA_Sam(nn.Module):
                 saved_key = f"w_b_{i:03d}"
                 if saved_key in state_dict:
                     w_B_linear.weight.data.copy_(state_dict[saved_key])
+        elif self.encoder_mode == "conv_lora":
+            for i, mod in enumerate(self.encoder_conv_qkv_modules):
+                key_a = f"conv_w_a_{i:03d}"
+                key_b = f"conv_w_b_{i:03d}"
+                if key_a in state_dict:
+                    mod.lora_A.data.copy_(state_dict[key_a])
+                if key_b in state_dict:
+                    mod.lora_B.data.copy_(state_dict[key_b])
+
+                key_gate = f"conv_gate_w_{i:03d}"
+                key_noise = f"conv_noise_w_{i:03d}"
+                if key_gate in state_dict:
+                    mod.lora_moe_gating.w_gate.data.copy_(state_dict[key_gate])
+                if key_noise in state_dict:
+                    mod.lora_moe_gating.w_noise.data.copy_(state_dict[key_noise])
+
+                for j, expert in enumerate(mod.lora_moe_experts):
+                    expert_conv = expert[0]
+                    key_exp_w = f"conv_exp_w_{i:03d}_{j:02d}"
+                    key_exp_b = f"conv_exp_b_{i:03d}_{j:02d}"
+                    if key_exp_w in state_dict:
+                        expert_conv.weight.data.copy_(state_dict[key_exp_w])
+                    if key_exp_b in state_dict:
+                        expert_conv.bias.data.copy_(state_dict[key_exp_b])
 
         # Load decoder LoRA if applicable
         if self.decoder_mode == "lora":
@@ -552,7 +757,7 @@ class LoRA_Sam(nn.Module):
         if self.use_alignment and self.alignment_layer is not None:
             if "alignment_layer" in state_dict:
                 self.alignment_layer.load_state_dict(state_dict["alignment_layer"])
-                print(f"[LoRA_Sam] Loaded alignment layer from checkpoint")
+                LOGGER.info("[LoRA_Sam] Loaded alignment layer from checkpoint")
 
         # Load prompt encoder and mask decoder state
         sam_dict = self.sam.state_dict()
@@ -577,17 +782,24 @@ class LoRA_Sam(nn.Module):
         try:
             # First try loading as LoRA parameters
             self.load_lora_parameters(checkpoint_path)
-            print(f"[LoRA_Sam] Loaded LoRA/Adapter parameters from {checkpoint_path}")
+            LOGGER.info(
+                "[LoRA_Sam] Loaded LoRA/Adapter parameters from %s", checkpoint_path
+            )
         except Exception as e:
             # Fallback to regular SAM load_state_dict if it's a full model checkpoint
             try:
                 state_dict = torch.load(checkpoint_path, map_location="cpu")
                 self.load_state_dict(state_dict)
-                print(f"[LoRA_Sam] Loaded full model state_dict from {checkpoint_path}")
+                LOGGER.info(
+                    "[LoRA_Sam] Loaded full model state_dict from %s", checkpoint_path
+                )
             except Exception as e2:
-                print(f"Warning: Failed to load checkpoint {checkpoint_path}")
-                print(f"LoRA Load Error: {e}")
-                print(f"Full Load Error: {e2}")
+                LOGGER.warning("Failed to load checkpoint %s", checkpoint_path)
+                LOGGER.warning("LoRA load error: %s", e)
+                LOGGER.warning("Full model load error: %s", e2)
+                raise RuntimeError(
+                    f"Failed to load checkpoint: {checkpoint_path}"
+                ) from e2
 
     def _load_legacy_checkpoint(self, state_dict: dict) -> None:
         """Load checkpoint in legacy hybrid_lora_v1 format.
@@ -676,7 +888,37 @@ class LoRA_Sam(nn.Module):
                 batched_input, multimask_output, image_size
             )
         else:
-            return self.sam(batched_input, multimask_output, image_size)
+            outputs = self.sam(batched_input, multimask_output, image_size)
+            return self._attach_moe_loss(outputs)
+
+    def _get_conv_lora_moe_loss(self):
+        """Aggregate Conv-LoRA MoE losses from injected encoder qkv adapters."""
+        if self.encoder_mode != "conv_lora":
+            return None
+        if len(self.encoder_conv_qkv_adapters) == 0:
+            return None
+
+        losses = []
+        for adapter in self.encoder_conv_qkv_adapters:
+            if adapter.last_moe_loss is not None:
+                losses.append(adapter.last_moe_loss)
+        if len(losses) == 0:
+            return None
+        return torch.stack(losses).sum()
+
+    def _attach_moe_loss(self, outputs):
+        """Attach aggregated moe_loss to outputs for training-time loss composition."""
+        moe_loss = self._get_conv_lora_moe_loss()
+        if moe_loss is None:
+            return outputs
+
+        if isinstance(outputs, dict):
+            outputs["moe_loss"] = moe_loss
+        elif isinstance(outputs, list):
+            for item in outputs:
+                if isinstance(item, dict):
+                    item["moe_loss"] = moe_loss
+        return outputs
 
     def _forward_with_alignment(self, batched_input, multimask_output, image_size):
         """Forward pass with alignment layer between encoder and decoder."""
@@ -718,7 +960,7 @@ class LoRA_Sam(nn.Module):
             "low_res_logits": low_res_masks,
             "image_embeddings": image_embeddings,
         }
-        return outputs
+        return self._attach_moe_loss(outputs)
 
     @torch.no_grad()
     def _forward_test_with_alignment(self, batched_input, multimask_output):
@@ -762,44 +1004,13 @@ class LoRA_Sam(nn.Module):
                     "low_res_logits": low_res_masks,
                 }
             )
-        return outputs
-
-
-if __name__ == "__main__":
-    # Test different adaptation modes
-    from model.segment_anything import sam_model_registry
-
-    print("Testing SAM Hybrid Adapter...")
-
-    test_modes = [
-        "dual_lora",
-        "dual_ft",
-        "encoder_lora_decoder_ft",
-        "encoder_frozen_decoder_ft",
-        "encoder_frozen_decoder_lora",
-        "encoder_frozen_alignment_decoder_ft",
-        "encoder_frozen_alignment_decoder_lora",
-        "encoder_frozen_alignment_decoder_frozen",
-    ]
-
-    for mode in test_modes:
-        print(f"\n{'='*50}")
-        print(f"Testing mode: {mode}")
-        print("=" * 50)
-
-        sam = sam_model_registry["vit_b"](checkpoint="checkpoints/sam_vit_b_01ec64.pth")
-        lora_sam = LoRA_Sam(sam, r=4, adaptation_mode=mode)
-
-        # Test forward pass
-        # lora_sam.sam.image_encoder(torch.rand(size=(1, 3, 1024, 1024)))
-        print(f"Mode {mode} initialized successfully!")
+        return self._attach_moe_loss(outputs)
 
 
 def build_sam_hybrid(
     sam_type="vit_b",
     img_size=224,
     num_classes=2,
-    sam_checkpoint=None,
     pixel_mean=[0, 0, 0],
     pixel_std=[1, 1, 1],
     r_e=4,
@@ -808,16 +1019,23 @@ def build_sam_hybrid(
     lora_layer=None,
     alignment_num_blocks=4,
     alignment_hidden_channels=256,
+    conv_lora_expert_num=4,
     **kwargs,
 ):
     """Factory function for Hydra instantiation."""
-    from model.segment_anything import sam_model_registry
+
+    resolved_checkpoint = _resolve_checkpoint_for_sam_type(sam_type)
+    LOGGER.info(
+        "[build_sam_hybrid] sam_type=%s, checkpoint=%s",
+        sam_type,
+        resolved_checkpoint,
+    )
 
     # 1. Build base SAM model
     sam, _ = sam_model_registry[sam_type](
         image_size=img_size,
         num_classes=num_classes,
-        checkpoint=sam_checkpoint,
+        checkpoint=resolved_checkpoint,
         pixel_mean=pixel_mean,
         pixel_std=pixel_std,
     )
@@ -831,6 +1049,11 @@ def build_sam_hybrid(
         lora_layer=lora_layer,
         alignment_num_blocks=alignment_num_blocks,
         alignment_hidden_channels=alignment_hidden_channels,
+        conv_lora_expert_num=conv_lora_expert_num,
     )
+    model.sam_type = sam_type
+    model.resolved_sam_checkpoint = resolved_checkpoint
+    model.pretrained_weight_name = "fixed_by_sam_type"
+    model.pretrained_weight_source = "sam_type"
 
     return model

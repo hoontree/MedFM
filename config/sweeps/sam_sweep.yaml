@@ -1,0 +1,24 @@
+# WandB Sweep Configuration - GPU 3
+# Model: E0_D*
+project: sam_sweep
+
+program: train.py
+method: grid
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  model:
+    values: [E0_DL, E0_D0, E0_DF]
+  model.sam_type:
+    values: [vit_h, vit_l]
+
+# Hydra command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - hardware.gpu_ids=[1]
+  - wandb.project=sam_sweep

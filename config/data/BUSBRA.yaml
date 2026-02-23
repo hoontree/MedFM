@@ -2,7 +2,11 @@ name: "BUSBRA"
 type: "SegBase"
 num_classes: 1  # Binary segmentation (background, lesion)
 img_size: 224  # Resize images to 224x224 for training and evaluation
-# img_size: 512  # Resize images to 512x512 for training and evaluation
+auto_img_size_by_sam_type: true
+sam_img_size_map:
+  vit_b: 224
+  vit_l: 1024
+  vit_h: 1024
 path:
   root: "/home/hheo/data/Ultrasound/seg/breast/BUSBRA"
   split:

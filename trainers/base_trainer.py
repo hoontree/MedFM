@@ -4,6 +4,7 @@ Base Trainer for Multi-Model Training Framework
 This module provides a base class for training different models with common functionalities.
 """
 
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
@@ -162,14 +163,19 @@ class BaseTrainer(ABC):
     def _setup_directories(self, mode: str):
         """Setup experiment directories."""
         # Get model name
-        model_name = self.cfg.model.get("adaptation_mode", self.cfg.model.name)
-        if self.cfg.data.get("name") == "dynamic":
-            dataset_name = "+".join(self.cfg.data.train)
-        else:
-            dataset_name = self.cfg.data.name
+        model_name = self.cfg.model.get("sam_type", "") + "_" + self.cfg.model.get("adaptation_mode", self.cfg.model.name)
 
         # Create base directory
         logs_root = Path(self.cfg.get("output", {}).get("dir", "logs"))
+
+        # Determine if this is an adaptation phase (pre-distillation training)
+        distill_cfg = self.cfg.get("distillation", {})
+        phase = "train"
+        if (
+            distill_cfg.get("enabled", False)
+            and distill_cfg.get("phase") == "adaptation"
+        ):
+            phase = "adaptation"
 
         # Create experiment tags
         exp_tags = self._create_exp_tags()
@@ -179,7 +185,7 @@ class BaseTrainer(ABC):
         exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
 
         # Final experiment directory
-        self.exp_dir = logs_root / model_name / dataset_name / exp_dir_name
+        self.exp_dir = logs_root / phase / model_name / exp_dir_name
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         # Checkpoint directory
@@ -196,37 +202,38 @@ class BaseTrainer(ABC):
 
     def _create_exp_tags(self) -> list:
         """Create experiment tags based on hyperparameters."""
-        exp_tags = []
+        from utils.distill_utils import get_experiment_tags
 
-        # Add custom tags from config
-        if hasattr(self.cfg.training, "batch_size"):
-            exp_tags.append(f"bs{self.cfg.training.batch_size}")
-
-        if hasattr(self.cfg.training, "base_lr"):
-            if self.cfg.training.base_lr != 0.01:
-                exp_tags.append(f"lr{self.cfg.training.base_lr}")
-        elif hasattr(self.cfg.training, "lr"):
-            if self.cfg.training.lr != 0.01:
-                exp_tags.append(f"lr{self.cfg.training.lr}")
-
-        return exp_tags
+        return get_experiment_tags(self.cfg)
 
     def _setup_logger(self):
         """Setup logger."""
         log_file = self.exp_dir / "train.log"
-        self.logger = setup_logger(str(log_file))
+        self.logger = setup_logger(str(log_file), logger_name="medfm.train")
         self.logger.info(f"Configuration:\n{OmegaConf.to_yaml(self.cfg)}")
 
     def _setup_wandb(self):
         """Setup Weights & Biases logging."""
         wandb_config = self.cfg.get("wandb", {})
+        wandb_mode = wandb_config.get("mode", None)
+        if wandb_config.get("disabled", False):
+            wandb_mode = "disabled"
 
-        wandb.init(
+        # In a sweep, wandb handles the run name. For regular runs, we use a custom name.
+        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+        run_name = (
+            None
+            if is_sweep
+            else f"{self.cfg.model.get('adaptation_mode', self.cfg.model.get('name', 'model'))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+
+        self.wandb_run = wandb.init(
             entity=wandb_config.get("entity", "hheo"),
             project=wandb_config.get("project", "medical_foundation_models"),
-            name=f"{self.cfg.model.get('adaptation_mode', self.cfg.model.get('name', 'model'))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=run_name,
             config=OmegaConf.to_container(self.cfg, resolve=True),
             dir=str(self.exp_dir),
+            mode=wandb_mode,
         )
 
     def _setup_early_stopping(self):
@@ -316,40 +323,6 @@ class BaseTrainer(ABC):
             loader=self.val_loader, vis_dir=vis_dir, epoch=epoch
         )
 
-    def _update_teacher_config(self):
-        """Update the corresponding teacher config with the best model path."""
-        if self.best_model_path is None:
-            return
-
-        model_name = self.cfg.model.get("name")
-        if not model_name:
-            return
-
-        teacher_config_dir = Path("config/teacher")
-        if not teacher_config_dir.exists():
-            return
-
-        for config_file in teacher_config_dir.glob("*.yaml"):
-            try:
-                content = OmegaConf.load(config_file)
-                if content.get("name") == model_name:
-                    self.logger.info(f"Updating teacher config: {config_file}")
-
-                    # Update checkpoint path. Use absolute path for reliability.
-                    best_path_abs = str(self.best_model_path.absolute())
-
-                    # We need to preserve the yaml structure if possible, but OmegaConf.save is fine here
-                    content.checkpoint = best_path_abs
-                    with open(config_file, "w") as f:
-                        OmegaConf.save(content, f)
-
-                    self.logger.info(
-                        f"Successfully updated teacher config '{model_name}' with path: {best_path_abs}"
-                    )
-                    return
-            except Exception as e:
-                self.logger.error(f"Failed to update teacher config {config_file}: {e}")
-
     def train(self):
         """Main training loop."""
         self.logger.info("Starting training")
@@ -395,9 +368,6 @@ class BaseTrainer(ABC):
             test_metrics = self.test()
             self._save_test_results(test_metrics)
 
-            # Update teacher config
-            self._update_teacher_config()
-
         # Cleanup
         wandb.finish()
 
@@ -437,7 +407,8 @@ class BaseTrainer(ABC):
             wandb_metrics.update(
                 {f"epoch_test/{k}": v for k, v in test_metrics.items()}
             )
-        wandb.log(wandb_metrics)
+        if wandb.run is not None:
+            wandb.log(wandb_metrics)
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
@@ -480,7 +451,8 @@ class BaseTrainer(ABC):
         self.logger.info(f"Test results saved to {test_results_path}")
 
         # Log to wandb
-        wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
+        if wandb.run is not None:
+            wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
 
     def run_test_only(self, checkpoint_path: str):
         """Run test-only mode with a specific checkpoint."""
@@ -495,12 +467,17 @@ class BaseTrainer(ABC):
         self._load_checkpoint(checkpoint_path)
 
         # Initialize wandb for test-only run
-        wandb.init(
+        self.wandb_run = wandb.init(
             entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
             project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
             name=f"{self.cfg.model.name}_test_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config=OmegaConf.to_container(self.cfg, resolve=True),
             tags=["test-only"],
+            mode=(
+                "disabled"
+                if self.cfg.get("wandb", {}).get("disabled", False)
+                else self.cfg.get("wandb", {}).get("mode", None)
+            ),
         )
 
         # Run test

@@ -1,0 +1,24 @@
+# WandB Sweep Configuration - GPU 0
+# Models: E0_AL_DL
+project: sam_convlora
+
+program: train.py
+method: grid
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  model:
+    values: [EL_D0, EL_DL, EL_DF]
+  training.moe_loss_weight:
+    values: [0.3, 0.5, 0.7]
+
+# Hydra command pattern
+command:
+  - ${env}
+  - ./.venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - gpu_ids=[0]
+  - wandb.project=sam_convlora
