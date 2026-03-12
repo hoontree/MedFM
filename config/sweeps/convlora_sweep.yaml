@@ -1,5 +1,4 @@
-# WandB Sweep Configuration - GPU 0
-# Models: E0_AL_DL
+# WandB Sweep Configuration - ConvLoRA encoder variants
 project: sam_convlora
 
 program: train.py
@@ -9,8 +8,12 @@ metric:
   goal: maximize
 
 parameters:
-  model:
-    values: [EL_D0, EL_DL, EL_DF]
+  model.encoder_mode:
+    values: [conv_lora]
+  model.decoder_mode:
+    values: [frozen, lora, ft]
+  model.use_alignment:
+    values: [false]
   training.moe_loss_weight:
     values: [0.3, 0.5, 0.7]
 

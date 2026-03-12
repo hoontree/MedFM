@@ -1,50 +1,36 @@
 import random
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import wandb
 from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
 from typing import Optional, Any
-from omegaconf import DictConfig, ListConfig
-
-
-def get_adaptation_short(adaptation_mode: str) -> str:
-    """Convert adaptation mode to short abbreviation.
-
-    Notation: E=Encoder, D=Decoder, 0=Frozen, FT=FineTune, L=LoRA
-    """
-    mode_map = {
-        "encoder_frozen_decoder_ft": "E0-DFT",
-        "encoder_frozen_decoder_lora": "E0-DL",
-        "encoder_ft_decoder_lora": "EFT-DL",
-        "decoder_ft_encoder_lora": "EL-DFT",
-        "dual_lora": "EL-DL",
-        "dual_ft": "EFT-DFT",
-    }
-    return mode_map.get(adaptation_mode, adaptation_mode)
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 
 def get_teacher_short_name(cfg: DictConfig) -> str:
-    """Create a short teacher model identifier."""
+    """Create a short teacher model identifier from encoder_mode/decoder_mode/use_alignment."""
     teacher_name = cfg.teacher.name
 
-    # For SAM hybrid models with adaptation mode
-    if teacher_name == "sam_hybrid" or "E0_" in teacher_name or "EL_" in teacher_name:
+    # SAM-based models: build name from mode fields
+    if teacher_name in ("sam", "sam_hybrid"):
         sam_type = cfg.teacher.get("sam_type", "vit_b")
         backbone = sam_type.replace("vit_", "")
-        adaptation = cfg.teacher.get("adaptation_mode", "")
+        encoder_mode = cfg.teacher.get("encoder_mode", "frozen")
+        decoder_mode = cfg.teacher.get("decoder_mode", "lora")
+        use_alignment = cfg.teacher.get("use_alignment", False)
 
         name = f"sam_{backbone}"
-        if adaptation:
-            adapt_short = get_adaptation_short(adaptation)
-            name = f"{name}_{adapt_short}"
+        if encoder_mode != "frozen":
+            name = f"{name}_e{encoder_mode}"
+        if use_alignment:
+            name = f"{name}_align"
+        if decoder_mode != "frozen":
+            name = f"{name}_d{decoder_mode}"
 
         # Add hyperparameters
-        if "alignment_num_blocks" in cfg.teacher:
+        if cfg.teacher.get("alignment_num_blocks") is not None:
             name = f"{name}_al{cfg.teacher.alignment_num_blocks}"
-        if "r_d" in cfg.teacher:
+        if cfg.teacher.get("r_d") is not None:
             name = f"{name}_rd{cfg.teacher.r_d}"
 
         return name
@@ -178,12 +164,14 @@ def save_experiment_summary(cfg: DictConfig, log_dir: Path):
     ]
 
     # Teacher SAM-specific info
-    if cfg.teacher.name == "sam_hybrid":
+    if cfg.teacher.name in ("sam", "sam_hybrid"):
         lines.extend(
             [
                 f"  Backbone: {cfg.teacher.get('sam_type', 'N/A')}",
-                f"  Adaptation: {cfg.teacher.get('adaptation_mode', 'N/A')}",
-                f"  LoRA Rank: {cfg.teacher.get('rank', 'N/A')}",
+                f"  Encoder Mode: {cfg.teacher.get('encoder_mode', 'N/A')}",
+                f"  Decoder Mode: {cfg.teacher.get('decoder_mode', 'N/A')}",
+                f"  Use Alignment: {cfg.teacher.get('use_alignment', 'N/A')}",
+                f"  LoRA Rank (decoder): {cfg.teacher.get('r_d', 'N/A')}",
             ]
         )
     elif cfg.teacher.name.startswith("vit_"):
@@ -238,179 +226,20 @@ def visualize_distillation(
     num_samples=10,
     epoch=None,
 ):
-    """Visualize teacher vs student predictions."""
-    teacher_model.eval()
-    student_model.eval()
+    """Visualize teacher vs student predictions.
 
-    if epoch is not None:
-        save_dir = Path(save_dir) / f"epoch_{epoch+1}"
-    else:
-        save_dir = Path(save_dir)
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    sample_count = 0
-    wandb_images = []
-
-    with torch.no_grad():
-        for batch_idx, (images, masks, _) in enumerate(
-            tqdm(test_loader, desc="Visualizing distillation")
-        ):
-            images = images.to(device)
-            masks = masks.to(device)
-
-            # Get predictions
-            if hasattr(teacher_model, "image_encoder") or hasattr(
-                teacher_model, "sam"
-            ):  # SAM-like
-                teacher_outputs = teacher_model(images, False, teacher_img_size)
-            else:
-                teacher_outputs = {"masks": teacher_model(images)}
-
-            student_raw = student_model(images)
-            if isinstance(student_raw, tuple):
-                student_logits = student_raw[0]
-            else:
-                student_logits = student_raw
-
-            teacher_logits = teacher_outputs["masks"]
-
-            # Convert to predictions
-            if num_classes == 1:
-                teacher_preds = (torch.sigmoid(teacher_logits) > 0.5).float()
-                student_preds = (torch.sigmoid(student_logits) > 0.5).float()
-            else:
-                teacher_preds = torch.argmax(
-                    torch.softmax(teacher_logits, dim=1), dim=1, keepdim=True
-                )
-                student_preds = torch.argmax(
-                    torch.softmax(student_logits, dim=1), dim=1, keepdim=True
-                )
-
-            for i in range(images.size(0)):
-                if sample_count >= num_samples:
-                    if wandb_images:
-                        wandb.log({"distillation/predictions": wandb_images})
-                    return
-
-                img = images[i].cpu().numpy()
-                t_pred = teacher_preds[i].cpu().numpy()
-                s_pred = student_preds[i].cpu().numpy()
-                gt = masks[i].cpu().numpy()
-
-                # Basic normalization for visualization
-                if img.shape[0] == 3:
-                    img = img.transpose(1, 2, 0)
-                    img = (img - img.min()) / (img.max() - img.min())
-                else:
-                    img = img[0]
-                    img = (img - img.min()) / (img.max() - img.min())
-
-                if num_classes == 1:
-                    t_pred = t_pred[0]
-                    s_pred = s_pred[0]
-                    gt = gt[0]
-                else:
-                    # For multi-class, squeeze channel dimension
-                    t_pred = t_pred.squeeze()
-                    s_pred = s_pred.squeeze()
-                    gt = gt.squeeze()
-
-                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-                axes[0].imshow(img, cmap="gray" if img.ndim == 2 else None)
-                axes[0].set_title("Image")
-                axes[1].imshow(gt, cmap="jet", alpha=0.5)
-                axes[1].set_title("GT")
-                axes[2].imshow(t_pred, cmap="jet", alpha=0.5)
-                axes[2].set_title("Teacher")
-                axes[3].imshow(s_pred, cmap="jet", alpha=0.5)
-                axes[3].set_title("Student")
-                for ax in axes:
-                    ax.axis("off")
-
-                save_path = save_dir / f"sample_{sample_count:03d}.png"
-                plt.savefig(save_path, dpi=150, bbox_inches="tight")
-                wandb_images.append(
-                    wandb.Image(str(save_path), caption=f"Sample {sample_count}")
-                )
-                plt.close()
-                sample_count += 1
-
-
-def find_best_checkpoint(
-    model_cfg: DictConfig, logs_root: str = "logs"
-) -> Optional[Path]:
-    """Find the best checkpoint for a given model configuration automatically.
-
-    Searches for: logs/{phase}/{model_name}/{dataset}/{timestamp}_{tags}/checkpoints/best_*.pth
+    Delegates to the unified implementation in utils.visualize.
     """
-    adaptation_mode = model_cfg.get("adaptation_mode", model_cfg.get("name", "model"))
+    from utils.visualize import visualize_distillation as _visualize_distillation
 
-    logs_root_path = Path(logs_root)
-    if not logs_root_path.exists():
-        return None
-
-    # We search in these subdirectories
-    search_dirs = [
-        logs_root_path / "adaptation" / adaptation_mode,
-        logs_root_path / "train" / adaptation_mode,
-        logs_root_path / adaptation_mode,  # Legacy support
-    ]
-
-    candidates = []
-
-    # Required tags for structural matching
-    required_tags = []
-    if "alignment_num_blocks" in model_cfg:
-        required_tags.append(f"al{model_cfg.alignment_num_blocks}")
-    if "r_d" in model_cfg:
-        required_tags.append(f"rd{model_cfg.r_d}")
-
-    for logs_dir in search_dirs:
-        if not logs_dir.exists():
-            continue
-
-        # Recursively find checkpoints
-        for dataset_path in logs_dir.iterdir():
-            if not dataset_path.is_dir():
-                continue
-
-            for exp_path in dataset_path.iterdir():
-                if not exp_path.is_dir():
-                    continue
-
-                # Check if tags match
-                exp_name = exp_path.name
-                if all(tag in exp_name for tag in required_tags):
-                    # Verify experiment configuration (distillation.enabled and phase)
-                    config_path = exp_path / "config.yaml"
-                    if config_path.exists():
-                        try:
-                            exp_cfg = OmegaConf.load(config_path)
-                            # If we found it in 'adaptation' folder, it's likely correct.
-                            # But if we found it elsewhere, we might want to check if it's strictly a teacher-ready model.
-                            # For now, let's be loose if it matches structural tags.
-                        except Exception:
-                            continue
-
-                    ckpt_dir = exp_path / "checkpoints"
-                    if ckpt_dir.exists():
-                        best_ckpts = list(ckpt_dir.glob("best_*.pth"))
-                        if best_ckpts:
-
-                            def get_dice(p):
-                                try:
-                                    # Handle dice scores in filename
-                                    return float(p.stem.split("dice")[-1])
-                                except:
-                                    return 0.0
-
-                            best_ckpts.sort(key=get_dice, reverse=True)
-                            candidates.append((exp_path.stat().st_mtime, best_ckpts[0]))
-
-    if not candidates:
-        return None
-
-    # Pick the one from the most recent experiment that matches requirements
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    _visualize_distillation(
+        teacher_model=teacher_model,
+        student_model=student_model,
+        test_loader=test_loader,
+        device=device,
+        num_classes=num_classes,
+        teacher_img_size=teacher_img_size,
+        save_dir=save_dir,
+        num_samples=num_samples,
+        epoch=epoch,
+    )

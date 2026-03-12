@@ -1,12 +1,10 @@
 import random
-import numpy as np
 from typing import Optional, List, Dict, Union, Type
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from omegaconf import OmegaConf, ListConfig
-import json
 import copy
 
 from utils.ultrasound_datasets import (
@@ -17,8 +15,6 @@ from utils.ultrasound_datasets import (
     UltrasoundSegmentationDataset,
     B,
 )
-from utils.distill_utils import resolve_distillation_split_path
-
 # Dataset class registry
 DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
     "BUID": BUID,
@@ -186,39 +182,20 @@ class SegDatasetProcessor:
         return train_loader, val_loader, test_loaders
 
     @staticmethod
-    def build_distillation_datasets(
-        cfg, adaptation_ratio=0.5, seed=42, split_file=None, save_split=True
-    ):
-        """Build non-overlapping datasets for distillation workflow."""
+    def build_distillation_datasets(cfg):
+        """Build datasets for distillation workflow (shared train/val)."""
         train_ds, val_ds, test_ds_dict = SegDatasetProcessor.build_dataset(cfg)
 
-        split_path = resolve_distillation_split_path(
-            cfg,
-            adaptation_ratio=adaptation_ratio,
-            seed=seed,
-            split_file=split_file,
-        )
-
-        indices = SegDatasetProcessor._get_split_indices(
-            train_ds, val_ds, adaptation_ratio, seed, split_path, save_split
-        )
-
         return {
-            "adaptation_train": Subset(train_ds, indices["train_adapt"]),
-            "distillation_train": Subset(train_ds, indices["train_distill"]),
-            "adaptation_val": Subset(val_ds, indices["val_adapt"]),
-            "distillation_val": Subset(val_ds, indices["val_distill"]),
+            "train": train_ds,
+            "val": val_ds,
             "test": test_ds_dict,
         }
 
     @staticmethod
-    def build_distillation_data_loaders(
-        cfg, adaptation_ratio=0.5, seed=42, split_file=None, save_split=True
-    ):
-        """Distillation-specific data loader builder with adaptation/distillation splitting."""
-        datasets = SegDatasetProcessor.build_distillation_datasets(
-            cfg, adaptation_ratio, seed, split_file, save_split
-        )
+    def build_distillation_data_loaders(cfg):
+        """Distillation-specific data loader builder using shared train/val."""
+        datasets = SegDatasetProcessor.build_distillation_datasets(cfg)
 
         batch_size = cfg.training.batch_size
         num_workers = cfg.training.num_workers
@@ -233,72 +210,12 @@ class SegDatasetProcessor:
             )
 
         return {
-            "adaptation_train": _get_loader(datasets["adaptation_train"], True),
-            "adaptation_val": _get_loader(datasets["adaptation_val"], False),
-            "distillation_train": _get_loader(datasets["distillation_train"], True),
-            "distillation_val": _get_loader(datasets["distillation_val"], False),
+            "train": _get_loader(datasets["train"], True),
+            "val": _get_loader(datasets["val"], False),
             "test": {
                 name: _get_loader(ds, False) for name, ds in datasets["test"].items()
             },
         }
-
-    @staticmethod
-    def _get_split_indices(train_ds, val_ds, ratio, seed, path, save):
-        """Unified index splitting logic (Stratified-safe)."""
-        if path.exists():
-            try:
-                with open(path, "r") as f:
-                    data = json.load(f)
-                # Structural check
-                if all(
-                    k in data
-                    for k in [
-                        "train_adapt",
-                        "train_distill",
-                        "val_adapt",
-                        "val_distill",
-                    ]
-                ):
-                    if (
-                        data.get("n_train") == len(train_ds)
-                        and data.get("seed") == seed
-                        and data.get("ratio") == ratio
-                    ):
-                        print(f"Loaded valid split indices from {path}")
-                        return data
-            except Exception:
-                pass
-            print(f"Split file {path} invalid or size mismatch. Regenerating.")
-
-        # Generate new split
-        rng = np.random.default_rng(seed)
-
-        def _split_idx(n):
-            idx = rng.permutation(n)
-            k = int(n * ratio)
-            return idx[:k].tolist(), idx[k:].tolist()
-
-        train_a, train_d = _split_idx(len(train_ds))
-        val_a, val_d = _split_idx(len(val_ds))
-
-        result = {
-            "seed": seed,
-            "ratio": ratio,
-            "n_train": len(train_ds),
-            "n_val": len(val_ds),
-            "train_adapt": train_a,
-            "train_distill": train_d,
-            "val_adapt": val_a,
-            "val_distill": val_d,
-        }
-
-        if save:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"Saved new split indices to {path}")
-
-        return result
 
     @staticmethod
     def _add_test_dataset_with_unfiltered(cfg, name, test_datasets_dict):

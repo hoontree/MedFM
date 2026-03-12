@@ -1,8 +1,8 @@
 # WandB Sweep Configuration for Teacher Training (Adaptation)
-# Run this with: wandb sweep config/train_sweep.yaml
+# encoder=frozen, decoder=frozen, alignment=true
 
 program: train.py
-method: grid # grid, random, bayes
+method: grid
 metric:
   name: epoch_val/Dice
   goal: maximize
@@ -14,7 +14,7 @@ parameters:
   model.r_d:
     values: [4]
   model.r_e:
-    values: [4] # Fixed or sweepable if needed
+    values: [4]
     
   # Training Hyperparameters
   training.lr:
@@ -28,6 +28,8 @@ command:
   - ./.venv/bin/python
   - ${program}
   - ${args_no_hyphens}
-  - model=E0_AL_D0 # Default model for sweep
-  - training.num_epochs=100 # Adjust as needed
+  - model.encoder_mode=frozen
+  - model.decoder_mode=frozen
+  - model.use_alignment=true
+  - training.num_epochs=100
   - wandb.project=medical_foundation_models_teacher_sweep

@@ -26,8 +26,7 @@ optimizer:
   use_layer_decay: true
   num_layers: 12
   layer_decay: 0.8
-  grad_clip:
-    enabled: true
+  gradient_clip:
     max_norm: 1.0
 
 # Scheduler settings

@@ -479,11 +479,11 @@ class Evaluator_seg:
             num_classes: Number of classes
             img_size: Image size for SAM
             threshold: Threshold for binary segmentation
-            return_predictions: If True, also return (images, preds, masks) for visualization
+            return_predictions: If True, also return (images, preds, masks, filenames) for visualization
 
         Returns:
             If return_predictions is False: metrics dict
-            If return_predictions is True: (metrics, images_list, preds_list, masks_list)
+            If return_predictions is True: (metrics, images_list, preds_list, masks_list, filenames_list)
         """
         model.eval()
         if num_classes == 1:
@@ -512,11 +512,13 @@ class Evaluator_seg:
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
+        filenames_list = [] if return_predictions else None
 
         with torch.no_grad():
-            for images, labels, _ in data_loader:
-                images = images.to(device)
-                labels = labels.to(device)
+            for batch in data_loader:
+                images = batch[0].to(device)
+                labels = batch[1].to(device)
+                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
 
                 outputs = model(images)
 
@@ -534,6 +536,7 @@ class Evaluator_seg:
                     images_list.append(images.cpu())
                     preds_list.append(preds.cpu())
                     masks_list.append(labels.cpu())
+                    filenames_list.append(batch_fnames)
 
                 for pred, gt in zip(preds, labels):
                     pred_np = pred.squeeze().cpu().numpy().astype(bool)
@@ -583,7 +586,7 @@ class Evaluator_seg:
             "ECE": ece,
         }
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list
+            return metrics, images_list, preds_list, masks_list, filenames_list
         return metrics
 
     @staticmethod
@@ -604,11 +607,13 @@ class Evaluator_seg:
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
+        filenames_list = [] if return_predictions else None
 
         with torch.no_grad():
-            for images, labels, low_res_labels in data_loader:
-                images = images.to(device)
-                labels = labels.to(device)
+            for batch in data_loader:
+                images = batch[0].to(device)
+                labels = batch[1].to(device)
+                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
 
                 outputs = model(images, False, img_size)
                 logits = outputs["masks"]
@@ -625,6 +630,7 @@ class Evaluator_seg:
                     images_list.append(images.cpu())
                     preds_list.append(preds.cpu())
                     masks_list.append(labels.cpu())
+                    filenames_list.append(batch_fnames)
 
                 for pred, gt in zip(preds, labels):
                     pred_np = pred.squeeze().cpu().numpy().astype(bool)
@@ -677,7 +683,7 @@ class Evaluator_seg:
         }
 
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list
+            return metrics, images_list, preds_list, masks_list, filenames_list
         return metrics
 
     @staticmethod
@@ -694,11 +700,13 @@ class Evaluator_seg:
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
+        filenames_list = [] if return_predictions else None
 
         with torch.no_grad():
-            for images, labels, _ in data_loader:
-                images = images.to(device)
-                labels = labels.to(device)  # [B, C, H, W]
+            for batch in data_loader:
+                images = batch[0].to(device)
+                labels = batch[1].to(device)  # [B, C, H, W]
+                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
                 gt_indices = torch.argmax(labels, dim=1)  # [B, H, W]
 
                 outputs = model(images)  # [B, num_classes, H, W]
@@ -710,6 +718,7 @@ class Evaluator_seg:
                         preds.unsqueeze(1).cpu()
                     )  # Add channel dim for consistency
                     masks_list.append(labels.cpu())
+                    filenames_list.append(batch_fnames)
 
                 for pred, gt in zip(preds, gt_indices):
                     pred_np = pred.cpu().numpy()
@@ -794,7 +803,7 @@ class Evaluator_seg:
             )
 
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list
+            return metrics, images_list, preds_list, masks_list, filenames_list
         return metrics
 
     @staticmethod
@@ -812,11 +821,13 @@ class Evaluator_seg:
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
+        filenames_list = [] if return_predictions else None
 
         with torch.no_grad():
-            for images, labels, low_res_labels in data_loader:
-                images = images.to(device)
-                labels = labels.to(device)
+            for batch in data_loader:
+                images = batch[0].to(device)
+                labels = batch[1].to(device)
+                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
                 gt_indices = torch.argmax(labels, dim=1)
 
                 outputs = model(images, True, img_size)
@@ -830,6 +841,7 @@ class Evaluator_seg:
                         preds.unsqueeze(1).cpu()
                     )  # Add channel dim for consistency
                     masks_list.append(labels.cpu())
+                    filenames_list.append(batch_fnames)
 
                 for pred, gt in zip(preds, gt_indices):
                     pred_np = pred.cpu().numpy()
@@ -914,7 +926,7 @@ class Evaluator_seg:
         )
 
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list
+            return metrics, images_list, preds_list, masks_list, filenames_list
         return metrics
 
     @staticmethod

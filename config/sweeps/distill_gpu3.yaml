@@ -1,6 +1,5 @@
-# DEPRECATED: Legacy distillation-only sweep. Prefer train.py pipeline sweeps.
 # WandB Sweep Configuration - GPU 3
-# Model: E0_AL_DL
+# encoder=frozen, no alignment, decoder sweep (frozen, ft)
 project: medfm_teacher_sweep
 
 program: distill.py
@@ -10,8 +9,8 @@ metric:
   goal: maximize
 
 parameters:
-  model:
-    values: [E0_D0, E0_DF]
+  teacher.decoder_mode:
+    values: [frozen, ft]
   distillation.adaptation_ratio:
     values: [0.3, 1.0]
 
@@ -24,5 +23,7 @@ command:
   - ./.venv/bin/python
   - ${program}
   - ${args_no_hyphens}
+  - teacher.encoder_mode=frozen
+  - teacher.use_alignment=false
   - hardware.gpu_ids=[3]
   - wandb.project=medfm_distill_sweep

@@ -1,8 +1,0 @@
-defaults:
-  - /model/sam_hybrid_base@
-
-name: E0_AL_DL
-adaptation_mode: encoder_frozen_alignment_decoder_lora
-r_d: 1
-alignment_num_blocks: 2
-alignment_hidden_channels: 256

@@ -1,16 +1,15 @@
 import hydra
 from omegaconf import DictConfig
-import os
+from hydra.utils import instantiate
+
+from utils.hardware import set_gpu
 
 
 @hydra.main(version_base=None, config_path="config", config_name="distill")
 def main(cfg: DictConfig):
-    gpu_ids = cfg.get("hardware", {}).get("gpu_ids", cfg.get("gpu_ids", [0]))
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    set_gpu(cfg)
 
-    from trainers.model_builder import ModelBuilder
-
-    trainer = ModelBuilder.create_trainer(cfg)
+    trainer = instantiate(cfg.trainer, cfg)
 
     if cfg.get("debug", False):
         trainer.dry_run()

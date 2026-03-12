@@ -163,7 +163,7 @@ class BaseTrainer(ABC):
     def _setup_directories(self, mode: str):
         """Setup experiment directories."""
         # Get model name
-        model_name = self.cfg.model.get("sam_type", "") + "_" + self.cfg.model.get("adaptation_mode", self.cfg.model.name)
+        model_name = self.cfg.model.get("sam_type", "") + "_" + self.cfg.model.name
 
         # Create base directory
         logs_root = Path(self.cfg.get("output", {}).get("dir", "logs"))
@@ -210,7 +210,6 @@ class BaseTrainer(ABC):
         """Setup logger."""
         log_file = self.exp_dir / "train.log"
         self.logger = setup_logger(str(log_file), logger_name="medfm.train")
-        self.logger.info(f"Configuration:\n{OmegaConf.to_yaml(self.cfg)}")
 
     def _setup_wandb(self):
         """Setup Weights & Biases logging."""
@@ -224,17 +223,29 @@ class BaseTrainer(ABC):
         run_name = (
             None
             if is_sweep
-            else f"{self.cfg.model.get('adaptation_mode', self.cfg.model.get('name', 'model'))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            else f"{self.cfg.model.get('encoder_mode', 'default')}_encoder_{self.cfg.model.get('decoder_mode', 'default')}_decoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
+        wandb_run_config = self._build_wandb_config(is_sweep=is_sweep)
 
         self.wandb_run = wandb.init(
             entity=wandb_config.get("entity", "hheo"),
             project=wandb_config.get("project", "medical_foundation_models"),
             name=run_name,
-            config=OmegaConf.to_container(self.cfg, resolve=True),
+            config=wandb_run_config,
             dir=str(self.exp_dir),
             mode=wandb_mode,
         )
+
+    def _build_wandb_config(self, is_sweep: bool) -> Dict[str, Any]:
+        """Build W&B config payload while avoiding sweep key-type collisions."""
+        wandb_run_config = OmegaConf.to_container(self.cfg, resolve=True)
+        if not isinstance(wandb_run_config, dict):
+            return {}
+
+        if is_sweep and isinstance(wandb_run_config.get("model"), dict):
+            wandb_run_config["model_cfg"] = wandb_run_config.pop("model")
+
+        return wandb_run_config
 
     def _setup_early_stopping(self):
         """Setup early stopping."""
@@ -306,11 +317,126 @@ class BaseTrainer(ABC):
         """
         raise NotImplementedError
 
-    def _visualize_predictions(self, loader=None, vis_dir=None, epoch=None):
-        """Visualize predictions. Should be implemented by subclasses."""
-        self.logger.warning(
-            f"{self.__class__.__name__} does not implement _visualize_predictions"
+    def _iter_test_loaders(self):
+        """Iterate over test loaders yielding (name, loader) tuples."""
+        if isinstance(self.test_loader, dict):
+            yield from self.test_loader.items()
+        else:
+            yield "test", self.test_loader
+
+    def _log_data_sizes(self):
+        """Log dataset sizes. Call from _create_dataloaders()."""
+        self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
+        self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
+        if isinstance(self.test_loader, dict):
+            total = sum(len(l.dataset) for l in self.test_loader.values())
+            self.logger.info(f"Test set size (Total): {total}")
+        for name, loader in self._iter_test_loaders():
+            prefix = "  - " if isinstance(self.test_loader, dict) else ""
+            self.logger.info(f"{prefix}{name}: {len(loader.dataset)}")
+
+    def _log_model_info(self):
+        """Log total and trainable parameter counts."""
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Total parameters: {total:,}")
+        self.logger.info(f"Trainable parameters: {trainable:,}")
+        if wandb.run is not None:
+            wandb.summary["model/total_params"] = total
+            wandb.summary["model/trainable_params"] = trainable
+
+    def _log_step_metrics(self, metrics: Dict, step: int):
+        """Log step-level metrics to wandb with step/ prefix."""
+        if wandb.run is not None:
+            data = {"global_step": step}
+            data.update({f"step/{k}": v for k, v in metrics.items()})
+            wandb.log(data)
+
+    def _get_model_type(self) -> str:
+        """Return the model_type string for visualization inference.
+
+        Subclasses can override this to specify 'sam', 'segformer', etc.
+        """
+        return "default"
+
+    def _visualize_predictions(
+        self,
+        loader=None,
+        vis_dir=None,
+        epoch=None,
+        predictions_cache: Dict = None,
+    ):
+        """Visualize predictions with a unified implementation.
+
+        Supports three modes:
+        1. loader provided -> run model inference on loader (validation).
+        2. predictions_cache provided -> use pre-computed results (test).
+        3. Neither -> iterate test_loaders with model inference (fallback).
+
+        Subclasses can override _get_model_type() to customise inference.
+        """
+        from utils.visualize import visualize_predictions, visualize_from_predictions
+
+        num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+        model_type = self._get_model_type()
+        img_size = getattr(self, "img_size", None)
+
+        # Mode 1: validation visualization
+        if loader is not None:
+            visualize_predictions(
+                self.model,
+                loader,
+                self.device,
+                self.cfg.data.num_classes,
+                vis_dir,
+                num_samples=num_vis_samples,
+                model_type=model_type,
+                img_size=img_size,
+                phase_name="val",
+            )
+            return
+
+        # Mode 2/3: test visualization
+        if vis_dir is None:
+            vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+
+        sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
+        self.logger.info(
+            f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}..."
         )
+
+        for name, test_loader in self._iter_test_loaders():
+            save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
+            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+
+            if predictions_cache and name in predictions_cache:
+                cached = predictions_cache[name]
+                images_list, preds_list, masks_list = cached[0], cached[1], cached[2]
+                filenames_list = cached[3] if len(cached) > 3 else None
+                visualize_from_predictions(
+                    images_list,
+                    preds_list,
+                    masks_list,
+                    self.cfg.data.num_classes,
+                    save_dir,
+                    num_samples=num_vis_samples,
+                    phase_name=phase_name,
+                    filenames_list=filenames_list,
+                )
+            else:
+                visualize_predictions(
+                    self.model,
+                    test_loader,
+                    self.device,
+                    self.cfg.data.num_classes,
+                    save_dir,
+                    num_samples=num_vis_samples,
+                    model_type=model_type,
+                    img_size=img_size,
+                    phase_name=phase_name,
+                )
+
+        self.logger.info(f"Visualizations saved to {vis_dir}")
 
     def _visualize_validation(self, epoch: int):
         """Visualize validation predictions."""
@@ -327,9 +453,7 @@ class BaseTrainer(ABC):
         """Main training loop."""
         self.logger.info("Starting training")
 
-        num_epochs = self.cfg.training.get(
-            "num_epochs", self.cfg.training.get("max_epochs", 100)
-        )
+        num_epochs = self.cfg.training.get("num_epochs", 100)
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch
@@ -368,8 +492,18 @@ class BaseTrainer(ABC):
             test_metrics = self.test()
             self._save_test_results(test_metrics)
 
-        # Cleanup
-        wandb.finish()
+        # Capture run ID for pipeline integration before potentially finishing
+        self.wandb_run_id = (
+            self.wandb_run.id
+            if hasattr(self, "wandb_run") and self.wandb_run is not None
+            else None
+        )
+
+        # In pipeline mode, keep the wandb run open so the distillation stage
+        # can continue logging to the same run. Otherwise, finish normally.
+        in_pipeline = self.cfg.get("pipeline", {}).get("enabled", False)
+        if not in_pipeline:
+            wandb.finish()
 
         self.logger.info("Training completed!")
 
@@ -381,32 +515,30 @@ class BaseTrainer(ABC):
         test_metrics: Dict = None,
     ):
         """Log training and validation metrics."""
+        num_epochs = self.cfg.training.get("num_epochs", 100)
+        train_items = {k: v for k, v in train_metrics.items() if isinstance(v, (float, int))}
+        val_items = {k: v for k, v in val_metrics.items() if isinstance(v, (float, int))}
+
         # Log to console
+        self.logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
         self.logger.info(
-            f"\nEpoch {epoch + 1}/{self.cfg.training.get('num_epochs', self.cfg.training.get('max_epochs', 100))}"
+            "Train:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in train_items.items())
         )
-        self.logger.info(f"Train:")
         self.logger.info(
-            f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in train_metrics.items()])
-        )
-        self.logger.info(f"Val:")
-        self.logger.info(
-            f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()])
+            "Val:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
         )
         if test_metrics is not None:
-            self.logger.info(f"Test:")
+            test_items = {k: v for k, v in test_metrics.items() if isinstance(v, (float, int))}
             self.logger.info(
-                f"    " + ", ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()])
+                "Test:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in test_items.items())
             )
 
         # Log to wandb (epoch-level metrics)
         wandb_metrics = {"epoch": epoch + 1}
-        wandb_metrics.update({f"epoch_train/{k}": v for k, v in train_metrics.items()})
-        wandb_metrics.update({f"epoch_val/{k}": v for k, v in val_metrics.items()})
+        wandb_metrics.update({f"train/{k}": v for k, v in train_items.items()})
+        wandb_metrics.update({f"val/{k}": v for k, v in val_items.items()})
         if test_metrics is not None:
-            wandb_metrics.update(
-                {f"epoch_test/{k}": v for k, v in test_metrics.items()}
-            )
+            wandb_metrics.update({f"test/{k}": v for k, v in test_items.items()})
         if wandb.run is not None:
             wandb.log(wandb_metrics)
 
@@ -440,19 +572,26 @@ class BaseTrainer(ABC):
         self.model.load_state_dict(torch.load(str(path)))
 
     def _save_test_results(self, test_metrics: Dict):
-        """Save test results to file."""
+        """Save test results to file and log to wandb as final_test/."""
         test_results_path = self.exp_dir / "test_results.txt"
         with open(test_results_path, "w") as f:
             f.write("Test Results\n")
             f.write(f"Best Model: {self.best_model_path.name}\n")
             for key, value in test_metrics.items():
-                f.write(f"{key}: {value:.4f}\n")
+                if isinstance(value, (float, int)):
+                    f.write(f"{key}: {value:.4f}\n")
 
         self.logger.info(f"Test results saved to {test_results_path}")
 
-        # Log to wandb
+        # Log to wandb with final_test/ prefix
         if wandb.run is not None:
-            wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
+            final_metrics = {
+                f"final_test/{k}": v
+                for k, v in test_metrics.items()
+                if isinstance(v, (float, int))
+            }
+            wandb.log(final_metrics)
+            wandb.run.summary.update(final_metrics)
 
     def run_test_only(self, checkpoint_path: str):
         """Run test-only mode with a specific checkpoint."""
@@ -467,11 +606,12 @@ class BaseTrainer(ABC):
         self._load_checkpoint(checkpoint_path)
 
         # Initialize wandb for test-only run
+        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
         self.wandb_run = wandb.init(
             entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
             project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
             name=f"{self.cfg.model.name}_test_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            config=OmegaConf.to_container(self.cfg, resolve=True),
+            config=self._build_wandb_config(is_sweep=is_sweep),
             tags=["test-only"],
             mode=(
                 "disabled"

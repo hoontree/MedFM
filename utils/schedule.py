@@ -10,7 +10,7 @@ class CosineAnnealingWarmupLR(torch.optim.lr_scheduler._LRScheduler):
     Args:
         optimizer: Wrapped optimizer
         warmup_epochs: Number of warmup epochs
-        max_epochs: Total number of training epochs
+        num_epochs: Total number of training epochs
         base_lr: Base learning rate (max LR after warmup)
         min_lr: Minimum learning rate at the end of training
         last_epoch: The index of last epoch
@@ -20,13 +20,13 @@ class CosineAnnealingWarmupLR(torch.optim.lr_scheduler._LRScheduler):
         self,
         optimizer,
         warmup_epochs: int,
-        max_epochs: int,
+        num_epochs: int,
         base_lr: float,
         min_lr: float = 0.0,
         last_epoch: int = -1,
     ):
         self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
+        self.num_epochs = num_epochs
         self.base_lr = base_lr
         self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
@@ -41,7 +41,7 @@ class CosineAnnealingWarmupLR(torch.optim.lr_scheduler._LRScheduler):
 
         # Cosine annealing phase
         cosine_epoch = epoch - self.warmup_epochs
-        cosine_total = self.max_epochs - self.warmup_epochs
+        cosine_total = self.num_epochs - self.warmup_epochs
 
         # Cosine decay from base_lr to min_lr
         cosine_factor = 0.5 * (1 + math.cos(math.pi * cosine_epoch / cosine_total))
@@ -56,14 +56,14 @@ class WarmupPolyLR(torch.optim.lr_scheduler._LRScheduler):
         self,
         optimizer,
         warmup_epochs: int,
-        max_epochs: int,
+        num_epochs: int,
         base_lr: float,
         end_lr: float = 0.0,
         power: float = 1.0,
         last_epoch: int = -1,
     ):
         self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
+        self.num_epochs = num_epochs
         self.base_lr = base_lr
         self.end_lr = end_lr
         self.power = power
@@ -77,7 +77,7 @@ class WarmupPolyLR(torch.optim.lr_scheduler._LRScheduler):
             return [self.base_lr * factor for _ in self.optimizer.param_groups]
 
         poly_epoch = epoch - self.warmup_epochs
-        poly_total = self.max_epochs - self.warmup_epochs
+        poly_total = self.num_epochs - self.warmup_epochs
         factor = (1 - poly_epoch / poly_total) ** self.power
         return [
             self.end_lr + (self.base_lr - self.end_lr) * factor
@@ -107,7 +107,7 @@ def build_scheduler(optimizer, cfg):
     return CosineAnnealingWarmupLR(
         optimizer=optimizer,
         warmup_epochs=cfg.training.warmup_epochs,
-        max_epochs=cfg.training.num_epochs,
+        num_epochs=cfg.training.num_epochs,
         base_lr=cfg.training.lr,
         min_lr=1e-6,
     )

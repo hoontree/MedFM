@@ -10,11 +10,22 @@ from icecream import ic
 
 from functools import partial
 
-from .modeling import ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer
+from .modeling import (
+    ImageEncoderViT,
+    MaskDecoder,
+    PromptEncoder,
+    Sam,
+    TwoWayTransformer,
+)
 
 
-def build_sam_vit_h(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53], pixel_std=[58.395, 57.12, 57.375],
-                    checkpoint=None):
+def build_sam_vit_h(
+    image_size,
+    num_classes,
+    pixel_mean=[123.675, 116.28, 103.53],
+    pixel_std=[58.395, 57.12, 57.375],
+    checkpoint=None,
+):
     return _build_sam(
         encoder_embed_dim=1280,
         encoder_depth=32,
@@ -24,15 +35,20 @@ def build_sam_vit_h(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53
         num_classes=num_classes,
         image_size=image_size,
         pixel_mean=pixel_mean,
-        pixel_std=pixel_std
+        pixel_std=pixel_std,
     )
 
 
 build_sam = build_sam_vit_h
 
 
-def build_sam_vit_l(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53], pixel_std=[58.395, 57.12, 57.375],
-                    checkpoint=None):
+def build_sam_vit_l(
+    image_size,
+    num_classes,
+    pixel_mean=[123.675, 116.28, 103.53],
+    pixel_std=[58.395, 57.12, 57.375],
+    checkpoint=None,
+):
     return _build_sam(
         encoder_embed_dim=1024,
         encoder_depth=24,
@@ -42,12 +58,17 @@ def build_sam_vit_l(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53
         num_classes=num_classes,
         image_size=image_size,
         pixel_mean=pixel_mean,
-        pixel_std=pixel_std
+        pixel_std=pixel_std,
     )
 
 
-def build_sam_vit_b(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53], pixel_std=[58.395, 57.12, 57.375],
-                    checkpoint=None):
+def build_sam_vit_b(
+    image_size,
+    num_classes,
+    pixel_mean=[123.675, 116.28, 103.53],
+    pixel_std=[58.395, 57.12, 57.375],
+    checkpoint="checkpoints/sam_vit_b_01ec64.pth",
+):
     return _build_sam(
         encoder_embed_dim=768,
         encoder_depth=12,
@@ -58,7 +79,7 @@ def build_sam_vit_b(image_size, num_classes, pixel_mean=[123.675, 116.28, 103.53
         num_classes=num_classes,
         image_size=image_size,
         pixel_mean=pixel_mean,
-        pixel_std=pixel_std
+        pixel_std=pixel_std,
     )
 
 
@@ -71,15 +92,15 @@ sam_model_registry = {
 
 
 def _build_sam(
-        encoder_embed_dim,
-        encoder_depth,
-        encoder_num_heads,
-        encoder_global_attn_indexes,
-        num_classes,
-        image_size,
-        pixel_mean,
-        pixel_std,
-        checkpoint=None,
+    encoder_embed_dim,
+    encoder_depth,
+    encoder_num_heads,
+    encoder_global_attn_indexes,
+    num_classes,
+    image_size,
+    pixel_mean,
+    pixel_std,
+    checkpoint=None,
 ):
     prompt_embed_dim = 256
     image_size = image_size
@@ -122,19 +143,23 @@ def _build_sam(
         # pixel_mean=[123.675, 116.28, 103.53],
         # pixel_std=[58.395, 57.12, 57.375],
         pixel_mean=pixel_mean,
-        pixel_std=pixel_std
+        pixel_std=pixel_std,
     )
-    # sam.eval()
     sam.train()
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
         try:
             sam.load_state_dict(state_dict)
-        except:
+            print(f"Loaded SAM checkpoint from {checkpoint} successfully.")
+        except RuntimeError as e:
             new_state_dict = load_from(sam, state_dict, image_size, vit_patch_size)
             sam.load_state_dict(new_state_dict)
-    return sam, image_embedding_size
+            print(e)
+            print(
+                f"Loaded SAM checkpoint from {checkpoint} with partial matching successfully."
+            )
+    return sam
 
 
 def load_from(sam, state_dict, image_size, vit_patch_size):

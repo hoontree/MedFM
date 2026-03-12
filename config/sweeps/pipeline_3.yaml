@@ -1,6 +1,6 @@
-# WandB Sweep Configuration - GPU 2
-# encoder=frozen, decoder=lora, no alignment
-project: medfm_teacher_sweep
+# WandB Sweep Configuration - GPU 3
+# encoder=frozen, no alignment, decoder sweep (frozen, ft)
+project: medfm_distill_sweep
 
 program: distill.py
 method: grid
@@ -9,13 +9,8 @@ metric:
   goal: maximize
 
 parameters:
-  teacher.r_d:
-    values: [1, 2, 4]
-  distillation.adaptation_ratio:
-    values: [0.3, 1.0]
-
-  method.beta:
-    values: [0, 1.0]
+  model.decoder_mode:
+    values: [frozen, ft]
 
 # Hydra command pattern
 command:
@@ -24,7 +19,8 @@ command:
   - ${program}
   - ${args_no_hyphens}
   - teacher.encoder_mode=frozen
-  - teacher.decoder_mode=lora
   - teacher.use_alignment=false
-  - hardware.gpu_ids=[2]
+  - pipeline.enabled=true
+  - wandb.disabled=true
+  - hardware.gpu_ids=[1]
   - wandb.project=medfm_distill_sweep

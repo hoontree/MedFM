@@ -35,12 +35,6 @@ from model.adaptation_layers import ConvLoRALinear
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-SAM_PRESET_CHECKPOINTS = {
-    "vit_b": "checkpoints/sam_vit_b_01ec64.pth",
-    "vit_l": "checkpoints/sam_vit_l_0b3195.pth",
-    "vit_h": "checkpoints/sam_vit_h_4b8939.pth",
-}
-
 
 class _LoRA_qkv(nn.Module):
     """LoRA adapter for SAM's combined qkv projection in image encoder.
@@ -169,22 +163,6 @@ def inject_adaptation_to_linear_layer(
     return injected_layers
 
 
-def _resolve_checkpoint_for_sam_type(sam_type: str) -> str:
-    """Resolve fixed SAM checkpoint from sam_type."""
-    if sam_type not in SAM_PRESET_CHECKPOINTS:
-        raise ValueError(
-            f"Unsupported sam_type='{sam_type}'. "
-            f"Available: {sorted(SAM_PRESET_CHECKPOINTS.keys())}"
-        )
-
-    ckpt = (PROJECT_ROOT / SAM_PRESET_CHECKPOINTS[sam_type]).resolve()
-    if not ckpt.is_file():
-        raise FileNotFoundError(
-            f"Checkpoint for sam_type='{sam_type}' not found: {ckpt}"
-        )
-    return str(ckpt)
-
-
 class LoRA_Sam(nn.Module):
     """SAM model with flexible adaptation modes for encoder and decoder.
 
@@ -194,7 +172,6 @@ class LoRA_Sam(nn.Module):
     Args:
         sam_model: Base SAM model instance
         r: LoRA rank (used when LoRA is applied)
-        adaptation_mode: String specifying the adaptation strategy
         lora_layer: Optional list of layer indices to apply LoRA (encoder only)
 
     Adaptation mode format:
@@ -210,39 +187,46 @@ class LoRA_Sam(nn.Module):
 
     def __init__(
         self,
-        sam_model: Sam,
+        sam_type: str = "vit_b",
+        img_size: int = 224,
+        num_classes: int = 2,
+        pixel_mean: List[float] = [123.675, 116.28, 103.53],
+        pixel_std: List[float] = [58.395, 57.12, 57.375],
         r_e: int = 4,
         r_d: int = 4,
-        adaptation_mode: str = "dual_lora",
-        lora_layer=None,
+        encoder_mode: Optional[str] = None,
+        decoder_mode: Optional[str] = None,
+        use_alignment: bool = False,
         alignment_num_blocks: int = 4,
-        alignment_hidden_channels: int = 256,
         conv_lora_expert_num: int = 4,
+        checkpoint: Optional[str] = None,
+        **kwargs,
     ):
         super(LoRA_Sam, self).__init__()
 
-        self.adaptation_mode = adaptation_mode
         self.r_e = r_e
         self.r_d = r_d
         self.conv_lora_expert_num = conv_lora_expert_num
 
-        # Parse adaptation mode
-        encoder_mode, decoder_mode, use_alignment = self._parse_adaptation_mode(
-            adaptation_mode
-        )
         self.encoder_mode = encoder_mode
         self.decoder_mode = decoder_mode
         self.use_alignment = use_alignment
 
+        self.sam_type = sam_type
+
         # Alignment layer configuration
         self.alignment_num_blocks = alignment_num_blocks
-        self.alignment_hidden_channels = alignment_hidden_channels
+
+        # 1. Build base SAM model first
+        sam_model = sam_model_registry[sam_type](
+            image_size=img_size,
+            num_classes=num_classes,
+            pixel_mean=pixel_mean,
+            pixel_std=pixel_std,
+        )
 
         # Setup lora layers for encoder
-        if lora_layer:
-            self.lora_layer = lora_layer
-        else:
-            self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))
+        self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))
 
         # Storage for LoRA parameters (for saving/loading)
         self.w_As = []
@@ -275,68 +259,19 @@ class LoRA_Sam(nn.Module):
         # Log trainable parameters
         self._log_trainable_params()
 
-    def _parse_adaptation_mode(self, mode: str):
-        """Parse adaptation mode string into encoder mode, decoder mode, and alignment flag."""
-        if mode == "dual_lora":
-            return "lora", "lora", False
-        elif mode == "dual_ft":
-            return "ft", "ft", False
-        elif mode.startswith("encoder_"):
-            # Robust parsing that supports encoder_mode tokens containing underscores
-            # (e.g., conv_lora).
-            remainder = mode[len("encoder_") :]
-            use_alignment = "_alignment_decoder_" in remainder
-
-            if use_alignment:
-                if "_alignment_decoder_" not in remainder:
-                    raise ValueError(
-                        f"Invalid adaptation_mode format: {mode}. "
-                        "Expected: encoder_{mode}_alignment_decoder_{mode}"
-                    )
-                encoder_mode, decoder_mode = remainder.split("_alignment_decoder_", 1)
-            else:
-                if "_decoder_" not in remainder:
-                    raise ValueError(
-                        f"Invalid adaptation_mode format: {mode}. "
-                        "Expected: encoder_{mode}_decoder_{mode}"
-                    )
-                encoder_mode, decoder_mode = remainder.split("_decoder_", 1)
-
-            if encoder_mode not in self.VALID_ENCODER_MODES:
-                raise ValueError(
-                    f"Invalid encoder mode '{encoder_mode}' in adaptation_mode='{mode}'. "
-                    f"Valid encoder modes: {self.VALID_ENCODER_MODES}"
-                )
-            if decoder_mode not in self.VALID_DECODER_MODES:
-                raise ValueError(
-                    f"Invalid decoder mode '{decoder_mode}' in adaptation_mode='{mode}'. "
-                    f"Valid decoder modes: {self.VALID_DECODER_MODES}"
-                )
-
-            # Conv-LoRA's implementation here is designed for encoder token maps (HxW).
-            # Decoder query lengths are non-square; applying Conv-LoRA there would require
-            # additional reshaping logic and is intentionally disabled for safety.
-            if decoder_mode == "conv_lora":
-                raise ValueError(
-                    "Decoder Conv-LoRA is not supported in this SAM hybrid adapter. "
-                    "Use encoder Conv-LoRA with decoder in {lora, ft, frozen}."
-                )
-
-            return encoder_mode, decoder_mode, use_alignment
-        else:
-            raise ValueError(
-                f"Invalid adaptation_mode: {mode}. "
-                "Examples: dual_lora, dual_ft, encoder_conv_lora_decoder_ft, "
-                "encoder_frozen_alignment_decoder_lora"
+        # Finally load LoRA/finetuned checkpoints if provided
+        if checkpoint is not None and "sam_vit_" not in str(checkpoint):
+            self.load_checkpoint(checkpoint)
+            LOGGER.info(
+                "[LoRA_Sam] Loaded fine-tuned/LoRA checkpoint from %s", checkpoint
             )
 
     def _setup_alignment_layer(self):
         """Setup alignment layer between encoder and decoder."""
         # SAM encoder output is always 256 channels (prompt_embed_dim)
-        encoder_output_dim = 256
         self.alignment_layer = AlignmentLayer(
-            in_channels=encoder_output_dim,
-            hidden_channels=self.alignment_hidden_channels,
+            in_channels=256,
+            hidden_channels=256,
             num_blocks=self.alignment_num_blocks,
         )
         LOGGER.info(
@@ -508,7 +443,6 @@ class LoRA_Sam(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        LOGGER.info("[LoRA_Sam] Adaptation mode: %s", self.adaptation_mode)
         LOGGER.info(
             "[LoRA_Sam] Encoder mode: %s, Decoder mode: %s",
             self.encoder_mode,
@@ -565,7 +499,11 @@ class LoRA_Sam(nn.Module):
         """
         assert str(filename).endswith(".pt") or str(filename).endswith(".pth")
 
-        merged_dict = {"adaptation_mode": self.adaptation_mode}
+        merged_dict = {
+            "encoder_mode": self.encoder_mode,
+            "decoder_mode": self.decoder_mode,
+            "use_alignment": self.use_alignment,
+        }
 
         # Save encoder LoRA if applicable
         if self.encoder_mode == "lora":
@@ -662,22 +600,10 @@ class LoRA_Sam(nn.Module):
 
         Args:
             filename: Path to the checkpoint (.pt or .pth)
-
-        Supports two checkpoint formats:
-            1. Legacy format with __format__, __mode__, __sam_state_dict__ keys
-            2. Current flat format with direct parameter keys
         """
         assert str(filename).endswith(".pt") or str(filename).endswith(".pth")
 
         state_dict = torch.load(filename, map_location="cpu")
-
-        # Handle legacy checkpoint format (hybrid_lora_v1)
-        if (
-            "__format__" in state_dict
-            and state_dict.get("__format__") == "hybrid_lora_v1"
-        ):
-            self._load_legacy_checkpoint(state_dict)
-            return
 
         # Load encoder LoRA if applicable
         if self.encoder_mode == "lora":
@@ -800,83 +726,6 @@ class LoRA_Sam(nn.Module):
                 raise RuntimeError(
                     f"Failed to load checkpoint: {checkpoint_path}"
                 ) from e2
-
-    def _load_legacy_checkpoint(self, state_dict: dict) -> None:
-        """Load checkpoint in legacy hybrid_lora_v1 format.
-
-        Legacy format contains:
-            - __format__: 'hybrid_lora_v1'
-            - __mode__: adaptation mode string
-            - __sam_state_dict__: full SAM state dict (for decoder_ft modes)
-            - LoRA keys (w_a_*, w_b_*, sa_*, cti_*, cit_*, fati_*)
-            - prompt_encoder and mask_decoder keys
-        """
-        # Load full SAM state dict if present (used for decoder_ft modes)
-        if "__sam_state_dict__" in state_dict:
-            sam_state = state_dict["__sam_state_dict__"]
-            current_sam_dict = self.sam.state_dict()
-
-            # Only load prompt_encoder and mask_decoder (non-transformer) parts
-            for k, v in sam_state.items():
-                if "prompt_encoder" in k:
-                    current_sam_dict[k] = v
-                elif "mask_decoder" in k and "transformer" not in k:
-                    current_sam_dict[k] = v
-                # For decoder_ft mode, also load transformer weights
-                elif self.decoder_mode == "ft" and "mask_decoder" in k:
-                    current_sam_dict[k] = v
-
-            self.sam.load_state_dict(current_sam_dict)
-
-        # Load encoder LoRA if applicable
-        if self.encoder_mode == "lora":
-            for i, w_A_linear in enumerate(self.w_As):
-                saved_key = f"w_a_{i:03d}"
-                if saved_key in state_dict:
-                    w_A_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, w_B_linear in enumerate(self.w_Bs):
-                saved_key = f"w_b_{i:03d}"
-                if saved_key in state_dict:
-                    w_B_linear.weight.data.copy_(state_dict[saved_key])
-
-        # Load decoder LoRA if applicable
-        if self.decoder_mode == "lora":
-            for i, sa_A_linear in enumerate(self.self_attn_As):
-                saved_key = f"sa_a_{i:03d}"
-                if saved_key in state_dict:
-                    sa_A_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, sa_B_linear in enumerate(self.self_attn_Bs):
-                saved_key = f"sa_b_{i:03d}"
-                if saved_key in state_dict:
-                    sa_B_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, cti_a_linear in enumerate(self.cross_attn_ti_As):
-                saved_key = f"cti_a_{i:03d}"
-                if saved_key in state_dict:
-                    cti_a_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, cti_b_linear in enumerate(self.cross_attn_ti_Bs):
-                saved_key = f"cti_b_{i:03d}"
-                if saved_key in state_dict:
-                    cti_b_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, cit_a_linear in enumerate(self.cross_attn_it_As):
-                saved_key = f"cit_a_{i:03d}"
-                if saved_key in state_dict:
-                    cit_a_linear.weight.data.copy_(state_dict[saved_key])
-
-            for i, cit_b_linear in enumerate(self.cross_attn_it_Bs):
-                saved_key = f"cit_b_{i:03d}"
-                if saved_key in state_dict:
-                    cit_b_linear.weight.data.copy_(state_dict[saved_key])
-
-            if "fati_qa" in state_dict:
-                self.fa_ti_q_proj_A.weight.data.copy_(state_dict["fati_qa"])
-                self.fa_ti_q_proj_B.weight.data.copy_(state_dict["fati_qb"])
-                self.fa_ti_v_proj_A.weight.data.copy_(state_dict["fati_va"])
-                self.fa_ti_v_proj_B.weight.data.copy_(state_dict["fati_vb"])
 
     def forward(self, batched_input, multimask_output, image_size):
         """Forward pass through the SAM model.
@@ -1005,55 +854,3 @@ class LoRA_Sam(nn.Module):
                 }
             )
         return self._attach_moe_loss(outputs)
-
-
-def build_sam_hybrid(
-    sam_type="vit_b",
-    img_size=224,
-    num_classes=2,
-    pixel_mean=[0, 0, 0],
-    pixel_std=[1, 1, 1],
-    r_e=4,
-    r_d=4,
-    adaptation_mode="dual_lora",
-    lora_layer=None,
-    alignment_num_blocks=4,
-    alignment_hidden_channels=256,
-    conv_lora_expert_num=4,
-    **kwargs,
-):
-    """Factory function for Hydra instantiation."""
-
-    resolved_checkpoint = _resolve_checkpoint_for_sam_type(sam_type)
-    LOGGER.info(
-        "[build_sam_hybrid] sam_type=%s, checkpoint=%s",
-        sam_type,
-        resolved_checkpoint,
-    )
-
-    # 1. Build base SAM model
-    sam, _ = sam_model_registry[sam_type](
-        image_size=img_size,
-        num_classes=num_classes,
-        checkpoint=resolved_checkpoint,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
-
-    # 2. Wrap with LoRA_Sam
-    model = LoRA_Sam(
-        sam,
-        r_e=r_e,
-        r_d=r_d,
-        adaptation_mode=adaptation_mode,
-        lora_layer=lora_layer,
-        alignment_num_blocks=alignment_num_blocks,
-        alignment_hidden_channels=alignment_hidden_channels,
-        conv_lora_expert_num=conv_lora_expert_num,
-    )
-    model.sam_type = sam_type
-    model.resolved_sam_checkpoint = resolved_checkpoint
-    model.pretrained_weight_name = "fixed_by_sam_type"
-    model.pretrained_weight_source = "sam_type"
-
-    return model

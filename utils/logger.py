@@ -12,7 +12,6 @@ def setup_logger(log_path: str, logger_name: str = "medfm"):
     """
     log_file_path = Path(log_path)
     if log_file_path.exists() and log_file_path.is_dir():
-        # Recover from legacy bug where a ".log" path may have been created as a directory.
         log_file_path = log_file_path / "train.log"
     elif log_file_path.suffix == "":
         log_file_path = log_file_path / "train.log"

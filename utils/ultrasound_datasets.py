@@ -142,17 +142,18 @@ class BaseUltrasoundDataset(Dataset):
         return image_tensor
 
     def _create_tensors(
-        self, image: Image.Image, mask: Image.Image
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, image: Image.Image, mask: Image.Image, filename: str = "",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Convert PIL images to tensors with proper formatting.
 
         Args:
             image: PIL Image (RGB)
             mask: PIL Image (grayscale or class labels)
+            filename: Source image filename (stem) for visualization.
 
         Returns:
-            Tuple of (image_tensor, mask_tensor, low_res_mask_tensor)
+            Tuple of (image_tensor, mask_tensor, low_res_mask_tensor, filename)
         """
         # Image tensorization and normalization
         image_tensor = TF.to_tensor(image)
@@ -165,7 +166,7 @@ class BaseUltrasoundDataset(Dataset):
         low_res_mask_img = mask.resize(self.low_res_size, Image.NEAREST)
         low_res_tensor = _format_mask(low_res_mask_img, self.num_classes)
 
-        return image_tensor, mask_tensor, low_res_tensor
+        return image_tensor, mask_tensor, low_res_tensor, filename
 
     def _joint_transform(
         self, image: Image.Image, label: Image.Image
@@ -361,7 +362,7 @@ class BUID(BaseUltrasoundDataset):
             image, mask = self._joint_transform(image, mask)
 
         # Create tensors using base class method
-        return self._create_tensors(image, mask)
+        return self._create_tensors(image, mask, Path(image_path).stem)
 
 
 class BUS_UCLM(BaseUltrasoundDataset):
@@ -606,7 +607,7 @@ class BUS_UCLM(BaseUltrasoundDataset):
             image, mask = self._joint_transform(image, mask)
 
         # Create tensors using base class method
-        return self._create_tensors(image, mask)
+        return self._create_tensors(image, mask, Path(image_path).stem)
 
 
 class BUSI(BaseUltrasoundDataset):
@@ -777,7 +778,7 @@ class BUSI(BaseUltrasoundDataset):
             image, mask = self._joint_transform(image, mask)
 
         # Create tensors using base class method
-        return self._create_tensors(image, mask)
+        return self._create_tensors(image, mask, Path(image_path).stem)
 
 
 class BUSBRA(BaseUltrasoundDataset):
@@ -913,7 +914,7 @@ class BUSBRA(BaseUltrasoundDataset):
             image, mask = self._joint_transform(image, mask)
 
         # Create tensors using base class method
-        return self._create_tensors(image, mask)
+        return self._create_tensors(image, mask, Path(img_path).stem)
 
 
 class BUSBRA_SegFormer(BUSBRA):
@@ -935,7 +936,7 @@ class BUSBRA_SegFormer(BUSBRA):
         for k in inputs:
             inputs[k] = inputs[k].squeeze(0)
 
-        return inputs["pixel_values"], inputs["labels"]
+        return inputs["pixel_values"], inputs["labels"], Path(img_path).stem
 
 
 class UltrasoundSegmentationDataset(BaseUltrasoundDataset):
@@ -1000,7 +1001,7 @@ class UltrasoundSegmentationDataset(BaseUltrasoundDataset):
         # Format mask (without low-res tensor)
         label_tensor = _format_mask(label, self.num_classes)
 
-        return image_tensor, label_tensor
+        return image_tensor, label_tensor, Path(img_path).stem
 
 
 class B(BaseUltrasoundDataset):
@@ -1099,7 +1100,7 @@ class B(BaseUltrasoundDataset):
             image, mask = self._joint_transform(image, mask)
 
         # Create tensors using base class method
-        return self._create_tensors(image, mask)
+        return self._create_tensors(image, mask, Path(image_path).stem)
 
 
 class DDTI(BaseUltrasoundDataset):

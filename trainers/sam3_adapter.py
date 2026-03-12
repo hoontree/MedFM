@@ -45,7 +45,7 @@ class SAM3Config:
     enable_segmentation: bool = True
 
     # Training
-    max_epochs: int = 20
+    num_epochs: int = 20
     batch_size: int = 1
     num_workers: int = 4
     gradient_accumulation_steps: int = 1
@@ -581,7 +581,6 @@ class SAM3TrainerAdapter(BaseTrainer):
         self.optimizer = torch.optim.AdamW(
             param_groups,
             weight_decay=weight_decay,
-            betas=(0.9, 0.999),
         )
 
         self.logger.info(f"Optimizer: AdamW")

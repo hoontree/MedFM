@@ -96,13 +96,13 @@ def print_cfg(cfg):
     logging.info(OmegaConf.to_yaml(cfg))
 
 
-def set_seeds(seed_value, max_epochs, dist_rank):
+def set_seeds(seed_value, num_epochs, dist_rank):
     """
     Set the python random, numpy and torch seed for each gpu. Also set the CUDA
     seeds if the CUDA is available. This ensures deterministic nature of the training.
     """
     # Since in the pytorch sampler, we increment the seed by 1 for every epoch.
-    seed_value = (seed_value + dist_rank) * max_epochs
+    seed_value = (seed_value + dist_rank) * num_epochs
     logging.info(f"MACHINE SEED: {seed_value}")
     random.seed(seed_value)
     np.random.seed(seed_value)

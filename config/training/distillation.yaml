@@ -8,7 +8,6 @@ training:
   batch_size: 8
   num_workers: 8
   limit_train_batches: null
-
   early_stopping:
     enabled: true
     patience: 30
@@ -16,10 +15,8 @@ training:
 
 # Optimizer configuration
 optimizer:
-  name: AdamW          # AdamW or Adam
   weight_decay: 0.01
   gradient_clip:
-    enabled: true
     max_norm: 1.0
 
 # Scheduler configuration
@@ -33,7 +30,3 @@ scheduler:
 # Distillation dataset split configuration
 distillation:
   enabled: true
-  phase: distillation
-  adaptation_ratio: 0.3
-  split_seed: 42
-  split_file: splits/distillation_stratified_split_BUSBRA_BUSI_B_seed42.json

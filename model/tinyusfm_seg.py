@@ -390,10 +390,7 @@ class SegmentationModel(nn.Module):
     ):
         super().__init__()
 
-        if checkpoint:
-            self.checkpoint_path = checkpoint
-        else:
-            self.checkpoint_path = kwargs.get("checkpoint", None)
+        self.checkpoint_path = checkpoint
 
         self.backbone = MAEBackbone(
             img_size=(224, 224),
@@ -440,6 +437,9 @@ class SegmentationModel(nn.Module):
             )
         else:
             self.alignment_layer = None
+
+        if self.checkpoint_path:
+            self.load_checkpoint(self.checkpoint_path)
 
     def forward(self, x, return_features=False):
         # Extract features from backbone

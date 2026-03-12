@@ -1,5 +1,0 @@
-defaults:
-  - /model/sam_hybrid_base@
-
-name: EL_DL
-adaptation_mode: dual_lora

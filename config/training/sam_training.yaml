@@ -1,7 +1,4 @@
 # @package _global_
-
-multimask_output: false
-
 # Training configuration
 training:
   num_epochs: 1000
@@ -11,14 +8,11 @@ training:
   num_workers: 4
   limit_train_batches: null
   dice_weight: 0.8
-  moe_loss_weight: 0.0
-  # Compatibility aliases for trainers that expect legacy keys
-  max_epochs: ${training.num_epochs}
-  base_lr: ${training.lr}
-  dice_param: ${training.dice_weight}
+  moe_loss_weight: 100
   # Iter-based warmup used by some trainers (kept in sync with scheduler.warmup_iters)
-  warmup: true
-  warmup_period: ${scheduler.warmup_iters}
+  warmup:
+    enabled: true
+    steps: 200
   early_stopping:
     enabled: true
     patience: 15
@@ -26,18 +20,13 @@ training:
 
 # Optimizer configuration
 optimizer:
-  name: AdamW
   weight_decay: 0.01
   gradient_clip:
-    enabled: true
     max_norm: 1.0
-  # Compatibility alias
-  grad_clip: ${optimizer.gradient_clip}
 
 # Scheduler configuration
 scheduler:
   use_reduce_on_plateau: false
-  warmup_iters: 200
   total_iters: 5000
   power: 0.9
   min_lr: 1e-6
@@ -60,16 +49,3 @@ wandb:
   project: medical_foundation_models
   entity: hheo
   log_model: true
-
-# Distillation dataset split configuration
-# When enabled, splits training data into adaptation/distillation subsets
-distillation:
-  enabled: false
-  # Phase: 'adaptation' (teacher adaptation) or 'distillation' (student training)
-  phase: adaptation
-  # Ratio of data for adaptation (teacher adaptation)
-  adaptation_ratio: 1.0
-  # Random seed for reproducible splitting
-  split_seed: 42
-  # Optional: explicit path to split file (auto-generated if null)
-  split_file: null

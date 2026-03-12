@@ -23,10 +23,10 @@ training:
   max_epochs: 200
   stop_epoch: 160
   batch_size: 16
-  base_lr: 0.00006              # Segformer typically uses lower LR (6e-5)
+  lr: 0.00006              # Segformer typically uses lower LR (6e-5)
   warmup: true
   warmup_period: 250
-  dice_param: 0.8               # Weight for dice loss (0.8 = 80% dice, 20% CE)
+  dice_weight: 0.8               # Weight for dice loss (0.8 = 80% dice, 20% CE)
   save_interval: 20             # Save checkpoint every N epochs
   early_stopping:
     enabled: true
@@ -35,12 +35,9 @@ training:
 
 # Optimizer configuration
 optimizer:
-  name: AdamW                   # AdamW is recommended for Transformers
   weight_decay: 0.01
-  grad_clip:
-    enabled: true
+  gradient_clip:
     max_norm: 1.0
-    norm_type: 2
 
 # Hardware configuration
 hardware:

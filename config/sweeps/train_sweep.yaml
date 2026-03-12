@@ -1,15 +1,21 @@
 # WandB Sweep Configuration for Teacher Training (Adaptation)
-# Run this with: wandb sweep config/train_sweep.yaml
+# Run this with: wandb sweep config/sweeps/train_sweep.yaml
 
 program: train.py
-method: grid # grid, random, bayes
+method: grid
 metric:
-  name: pipeline/distill_final_dice
+  name: final_test/BUID/dice
   goal: maximize
 
 parameters:
-  model:
-    values: [E0_AL_D0, E0_AL_DL, E0_AL_DF, E0_D0, E0_DL, E0_DF]
+  # Model Architecture Sweep
+  model.encoder_mode:
+    values: [frozen, conv_lora]
+  model.decoder_mode:
+    values: [frozen, lora, ft]
+  model.use_alignment:
+    values: [true, false]
+
   # Model Structural Hyperparameters
   model.alignment_num_blocks:
     values: [2, 4, 8]
@@ -26,7 +32,5 @@ command:
   - ${program}
   - ${args_no_hyphens}
   - pipeline.enabled=true
-  - distillation.enabled=true
-  - distillation.phase=adaptation
   - wandb.disabled=true
   - wandb.project=medical_foundation_models_teacher_sweep

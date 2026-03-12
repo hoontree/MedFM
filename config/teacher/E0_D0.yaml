@@ -1,5 +1,0 @@
-defaults:
-  - /model/sam_hybrid_base@
-
-name: E0_D0
-adaptation_mode: encoder_frozen_decoder_frozen

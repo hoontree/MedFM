@@ -1,5 +1,4 @@
-# WandB Sweep Configuration - GPU 3
-# Model: E0_D*
+# WandB Sweep Configuration - SAM encoder frozen variants
 project: sam_sweep
 
 program: train.py
@@ -9,8 +8,12 @@ metric:
   goal: maximize
 
 parameters:
-  model:
-    values: [E0_DL, E0_D0, E0_DF]
+  model.encoder_mode:
+    values: [frozen]
+  model.decoder_mode:
+    values: [lora, frozen, ft]
+  model.use_alignment:
+    values: [false]
   model.sam_type:
     values: [vit_h, vit_l]
 

@@ -137,44 +137,28 @@ class DistillationDataModule(L.LightningDataModule):
     """
     PyTorch Lightning DataModule for knowledge distillation workflows.
 
-    Provides non-overlapping datasets for:
-    - Adaptation phase: Teacher fine-tuning (e.g., LoRA adaptation)
-    - Distillation phase: Student training with teacher guidance
+    Provides shared train/val datasets for teacher and student stages.
 
     Args:
         cfg: Hydra configuration object
-        adaptation_ratio: Ratio of data for adaptation (default: 0.5)
         seed: Random seed for reproducibility
-        split_file: Optional path to pre-computed split file
-        save_split: Whether to save split indices for reproducibility
-        phase: 'adaptation' or 'distillation' - determines which loaders to use
     """
 
     def __init__(
         self,
         cfg,
-        adaptation_ratio: float = 0.5,
         seed: int = 42,
-        split_file: Optional[str] = None,
-        save_split: bool = True,
-        phase: str = "distillation",
     ):
         super().__init__()
         self.cfg = cfg
-        self.adaptation_ratio = adaptation_ratio
         self.seed = seed
-        self.split_file = split_file
-        self.save_split = save_split
-        self.phase = phase
 
         self.batch_size = cfg.training.batch_size
         self.num_workers = cfg.training.num_workers
 
         # Datasets
-        self.adaptation_train: Optional[Dataset] = None
-        self.adaptation_val: Optional[Dataset] = None
-        self.distillation_train: Optional[Dataset] = None
-        self.distillation_val: Optional[Dataset] = None
+        self.train_dataset: Optional[Dataset] = None
+        self.val_dataset: Optional[Dataset] = None
         self.test_datasets: Dict[str, Dataset] = {}
 
         # Save hyperparameters for checkpointing
@@ -186,35 +170,21 @@ class DistillationDataModule(L.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         """
-        Setup stratified datasets for distillation workflow.
+        Setup shared datasets for distillation workflow.
 
         Args:
             stage: 'fit', 'validate', 'test', or 'predict'
         """
         if stage == "fit" or stage is None:
-            datasets = SegDatasetProcessor.build_distillation_datasets(
-                self.cfg,
-                adaptation_ratio=self.adaptation_ratio,
-                seed=self.seed,
-                split_file=self.split_file,
-                save_split=self.save_split,
-            )
+            datasets = SegDatasetProcessor.build_distillation_datasets(self.cfg)
 
-            self.adaptation_train = datasets["adaptation_train"]
-            self.adaptation_val = datasets["adaptation_val"]
-            self.distillation_train = datasets["distillation_train"]
-            self.distillation_val = datasets["distillation_val"]
+            self.train_dataset = datasets["train"]
+            self.val_dataset = datasets["val"]
             self.test_datasets = datasets.get("test", {})
 
         if stage == "test":
             if not self.test_datasets:
-                datasets = SegDatasetProcessor.build_distillation_datasets(
-                    self.cfg,
-                    adaptation_ratio=self.adaptation_ratio,
-                    seed=self.seed,
-                    split_file=self.split_file,
-                    save_split=False,
-                )
+                datasets = SegDatasetProcessor.build_distillation_datasets(self.cfg)
                 self.test_datasets = datasets.get("test", {})
 
     def _worker_init_fn(self, worker_id: int):
@@ -225,20 +195,9 @@ class DistillationDataModule(L.LightningDataModule):
         torch.manual_seed(worker_seed)
 
     def train_dataloader(self) -> DataLoader:
-        """
-        Returns training DataLoader based on current phase.
-
-        - adaptation phase: uses adaptation_train
-        - distillation phase: uses distillation_train
-        """
-        dataset = (
-            self.adaptation_train
-            if self.phase == "adaptation"
-            else self.distillation_train
-        )
-
+        """Return shared training DataLoader."""
         return DataLoader(
-            dataset,
+            self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
@@ -247,18 +206,9 @@ class DistillationDataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader:
-        """
-        Returns validation DataLoader based on current phase.
-
-        - adaptation phase: uses adaptation_val
-        - distillation phase: uses distillation_val
-        """
-        dataset = (
-            self.adaptation_val if self.phase == "adaptation" else self.distillation_val
-        )
-
+        """Return shared validation DataLoader."""
         return DataLoader(
-            dataset,
+            self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -294,33 +244,15 @@ class DistillationDataModule(L.LightningDataModule):
             for ds in self.test_datasets.values()
         ]
 
-    def set_phase(self, phase: str):
-        """
-        Switch between adaptation and distillation phases.
-
-        Args:
-            phase: 'adaptation' or 'distillation'
-        """
-        if phase not in ("adaptation", "distillation"):
-            raise ValueError(
-                f"Invalid phase: {phase}. Use 'adaptation' or 'distillation'."
-            )
-        self.phase = phase
-
     @property
     def test_dataset_names(self) -> List[str]:
         """Return names of test datasets for logging purposes."""
         return list(self.test_datasets.keys())
 
     @property
-    def adaptation_train_size(self) -> int:
-        """Number of samples in adaptation training set."""
-        return len(self.adaptation_train) if self.adaptation_train else 0
-
-    @property
-    def distillation_train_size(self) -> int:
-        """Number of samples in distillation training set."""
-        return len(self.distillation_train) if self.distillation_train else 0
+    def train_size(self) -> int:
+        """Number of samples in shared training set."""
+        return len(self.train_dataset) if self.train_dataset else 0
 
     def on_exception(self, exception: Exception):
         """Handle exceptions during data loading."""

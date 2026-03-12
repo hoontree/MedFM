@@ -1,16 +1,14 @@
 # WandB Sweep Configuration - GPU 0
-# Models: E0_AL_DL
+# encoder=frozen, decoder=lora, alignment=true
 project: medfm_teacher_sweep
 
 program: train.py
 method: grid
 metric:
-  name: pipeline/distill_final_dice
+  name: final_test/BUID/dice
   goal: maximize
 
 parameters:
-  model:
-    values: [E0_AL_DL]
   model.alignment_num_blocks:
     values: [2, 4, 8]
   model.r_d:
@@ -24,9 +22,10 @@ command:
   - ./.venv/bin/python
   - ${program}
   - ${args_no_hyphens}
+  - model.encoder_mode=frozen
+  - model.decoder_mode=lora
+  - model.use_alignment=true
   - pipeline.enabled=true
-  - distillation.enabled=true
-  - distillation.phase=adaptation
   - wandb.disabled=true
   - hardware.gpu_ids=[0]
   - wandb.project=medfm_teacher_sweep

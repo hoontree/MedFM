@@ -80,12 +80,9 @@ training:
 
 # Optimizer configuration
 optimizer:
-  name: AdamW
   weight_decay: 0.1
-  grad_clip:
-    enabled: true
+  gradient_clip:
     max_norm: 0.1
-    norm_type: 2
 
 # Hardware configuration
 hardware:

@@ -1,7 +1,7 @@
 # Knowledge Distillation Configuration
 defaults:
   - data: dynamic
-  - teacher: E0_AL_DL
+  - teacher: sam
   - student: tinyusfm
   - method: unified
   - training: distillation

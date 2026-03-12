@@ -61,6 +61,7 @@ class Sam(nn.Module):
     def forward_train(self, batched_input, multimask_output, image_size):
         input_images = self.preprocess(batched_input)
         image_embeddings = self.image_encoder(input_images)
+        # For training, we assume that all prompts are present in the input batch and do not iterate over images in the batch.
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=None, boxes=None, masks=None
         )

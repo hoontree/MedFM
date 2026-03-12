@@ -1,5 +1,0 @@
-defaults:
-  - /model/sam_hybrid_base@
-
-name: EL_DF
-adaptation_mode: encoder_lora_decoder_ft

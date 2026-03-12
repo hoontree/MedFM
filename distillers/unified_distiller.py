@@ -36,6 +36,17 @@ class UnifiedDistiller(BaseDistiller):
     5. Alignment Layer Distillation (MSE on specific SAM output) - gamma_align
     """
 
+    LOSS_WEIGHT_MAP = {
+        "task_loss": "alpha",
+        "distill_loss": "beta",
+        "feature_loss": "gamma",
+        "attn_loss": "gamma_attn",
+        "align_loss": "gamma_align",
+        "boundary_loss": "lambda_boundary",
+        "shape_loss": "lambda_shape",
+        "uncertainty_loss": "lambda_uncertainty",
+    }
+
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg)
         self.num_classes = cfg.data.num_classes
@@ -267,28 +278,27 @@ class UnifiedDistiller(BaseDistiller):
         self.teacher_attn_maps.clear()
         self.student_attn_maps.clear()
 
+    def _zero(self, device):
+        """Return a zero scalar tensor on the given device."""
+        return torch.tensor(0.0, device=device)
+
     def _compute_task_loss(self, student_logits, targets):
         """Task Loss (GT Dice/CE) - alpha"""
         if self.alpha <= 0:
-            return torch.tensor(0.0, device=student_logits.device)
+            return self._zero(student_logits.device)
 
         target_mask = targets.float()
-        ce_loss = torch.tensor(0.0, device=student_logits.device)
-        dice_loss = torch.tensor(0.0, device=student_logits.device)
-
+        losses = []
         if self.use_ce:
-            ce_loss = self.task_criterion(student_logits, target_mask)
+            losses.append(self.task_criterion(student_logits, target_mask))
         if self.use_dice:
-            dice_loss = self.dice_loss(student_logits, target_mask)
-
-        if self.use_ce and self.use_dice:
-            return 0.5 * ce_loss + 0.5 * dice_loss
-        return ce_loss if self.use_ce else dice_loss
+            losses.append(self.dice_loss(student_logits, target_mask))
+        return sum(losses) / len(losses) if losses else self._zero(student_logits.device)
 
     def _compute_logit_loss(self, student_logits, teacher_logits):
         """Logit Distillation (KL Div) - beta"""
         if self.beta <= 0:
-            return torch.tensor(0.0, device=student_logits.device)
+            return self._zero(student_logits.device)
 
         if self.num_classes == 1:
             s_soft = F.log_softmax(
@@ -318,12 +328,12 @@ class UnifiedDistiller(BaseDistiller):
             or self.teacher_extractor is None
             or self.student_extractor is None
         ):
-            return torch.tensor(0.0, device=device)
+            return self._zero(device)
 
         s_feats = self.student_extractor.get_features()
         t_feats = self.teacher_extractor.get_features()
 
-        feature_loss = torch.tensor(0.0, device=device)
+        feature_loss = self._zero(device)
         count = 0
         for s_layer, t_layer in self.layer_mapping.items():
             s_f = s_feats.get(s_layer)
@@ -368,10 +378,10 @@ class UnifiedDistiller(BaseDistiller):
             or not self.teacher_attn_maps
             or not self.student_attn_maps
         ):
-            return torch.tensor(0.0, device=device)
+            return self._zero(device)
 
         num_blocks = min(len(self.teacher_attn_maps), len(self.student_attn_maps))
-        attn_loss = torch.tensor(0.0, device=device)
+        attn_loss = self._zero(device)
         for i in range(num_blocks):
             t_a = self.teacher_attn_maps[i]
             s_a = self.student_attn_maps[i]
@@ -398,7 +408,7 @@ class UnifiedDistiller(BaseDistiller):
     def _compute_align_loss(self, student_outputs, teacher_outputs, device):
         """Alignment Layer Distillation (MSE) - gamma_align"""
         if self.gamma_align <= 0:
-            return torch.tensor(0.0, device=device)
+            return self._zero(device)
 
         s_f = student_outputs.get("features")
         t_f = teacher_outputs.get("image_embeddings")
@@ -411,15 +421,15 @@ class UnifiedDistiller(BaseDistiller):
                     s_f, size=t_f.shape[-2:], mode="bilinear", align_corners=False
                 )
             return self.mse_loss(s_f, t_f)
-        return torch.tensor(0.0, device=device)
+        return self._zero(device)
 
     def _compute_advanced_kd_losses(self, student_logits, teacher_logits):
         """Compute Boundary, Shape, and Uncertainty KD losses."""
         device = student_logits.device
         res = {
-            "boundary": torch.tensor(0.0, device=device),
-            "shape": torch.tensor(0.0, device=device),
-            "uncertainty": torch.tensor(0.0, device=device),
+            "boundary": self._zero(device),
+            "shape": self._zero(device),
+            "uncertainty": self._zero(device),
         }
 
         if self.num_classes == 1:
@@ -514,17 +524,7 @@ class UnifiedDistiller(BaseDistiller):
             self._apply_gradnorm(losses)
         else:
             # Basic logging even if not training or GradNorm is not applicable
-            key_map = {
-                "task_loss": "alpha",
-                "distill_loss": "beta",
-                "feature_loss": "gamma",
-                "attn_loss": "gamma_attn",
-                "align_loss": "gamma_align",
-                "boundary_loss": "lambda_boundary",
-                "shape_loss": "lambda_shape",
-                "uncertainty_loss": "lambda_uncertainty",
-            }
-            for key, weight_key in key_map.items():
+            for key, weight_key in self.LOSS_WEIGHT_MAP.items():
                 if key in losses:
                     raw_val = losses[key].item()
                     weight_val = self.loss_weights[weight_key].item()
@@ -536,18 +536,6 @@ class UnifiedDistiller(BaseDistiller):
 
     def _apply_gradnorm(self, losses: Dict[str, torch.Tensor]):
         """Adjust loss weights and log detailed gradient contributions."""
-        # Map loss keys to weight parameter names
-        key_map = {
-            "task_loss": "alpha",
-            "distill_loss": "beta",
-            "feature_loss": "gamma",
-            "attn_loss": "gamma_attn",
-            "align_loss": "gamma_align",
-            "boundary_loss": "lambda_boundary",
-            "shape_loss": "lambda_shape",
-            "uncertainty_loss": "lambda_uncertainty",
-        }
-
         norms = []
         active_keys = []
 
@@ -562,7 +550,7 @@ class UnifiedDistiller(BaseDistiller):
             ):
                 continue
 
-            weight_key = key_map.get(key)
+            weight_key = self.LOSS_WEIGHT_MAP.get(key)
             if weight_key is None:
                 continue
 

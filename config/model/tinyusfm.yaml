@@ -12,4 +12,5 @@ model:
   _target_: model.tinyusfm_seg.SegmentationModel
   name: TinyUSFM
   num_classes: ${data.num_classes}
+  img_size: ${data.img_size}
   checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights

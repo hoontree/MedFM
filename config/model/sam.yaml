@@ -1,73 +1,25 @@
 # @package _global_
-# SAM Model Configuration (default: dual LoRA)
-
 defaults:
   - _self_
-  - /data: Standard
-  - encoder: vit_b
+  - /training: sam_training
 
 trainer:
   _target_: trainers.sam_trainer.SAMTrainer
 
 model:
-  _target_: model.sam_hybrid_adapter.build_sam_hybrid
   name: sam
+  _target_: model.sam_hybrid_adapter.LoRA_Sam
   sam_type: vit_b
-  num_classes: ${data.num_classes}
   img_size: ${data.img_size}
-  r_e: 4
-  r_d: 4
-  adaptation_mode: dual_lora
-  sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  num_classes: ${data.num_classes}
   pixel_mean: [123.675, 116.28, 103.53]
   pixel_std: [58.395, 57.12, 57.375]
-  checkpoint: null  # Set to path to load trained weights
-
-# Training configuration
-training:
-  num_workers: 8
-  max_iterations: 30000
-  max_epochs: 200
-  stop_epoch: 160
-  batch_size: 16
-  base_lr: 0.005
-  warmup: false
-  warmup_period: 250
-  dice_param: 0.8
-  moe_loss_weight: 0.0
-  save_interval: 20               # Save checkpoint every N epochs
-  early_stopping:
-    enabled: true
-    patience: 20
-    min_delta: 0.001
-
-# Optimizer configuration
-optimizer:
-  name: AdamW                     # AdamW or SGD
-  weight_decay: 0.01
-  grad_clip:
-    enabled: true
-    max_norm: 1.0
-    norm_type: 2
-
-# Hardware configuration
-hardware:
-  n_gpu: 1
-  deterministic: 1
-  seed: 1234
-  gpu_ids: [0]
-
-# Output configuration
-output:
-  dir: logs
-  is_pretrain: true               # Pretrained or scratch
-
-# Visualization
-visualization:
-  num_samples: 10                 # Number of samples to visualize during test
-
-# WandB configuration
-wandb:
-  project: TinyUSFM
-  entity: hheo
-  log_model: true
+  encoder_mode: "conv_lora"
+  decoder_mode: "lora"
+  use_alignment: false
+  r_e: 4
+  r_d: 4
+  alignment_num_blocks: 4
+  alignment_hidden_channels: 256
+  conv_lora_expert_num: 4
+  checkpoint: null

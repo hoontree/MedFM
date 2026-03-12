@@ -9,11 +9,15 @@ metric:
   goal: maximize
 
 parameters:
-  # 1. Teacher Configuration Preset
-  teacher:
-    values: [E0_AL_DL, E0_AL_D0, E0_DL, E0_DF, E0_D0]
+  # 1. Teacher Architecture Sweep
+  teacher.encoder_mode:
+    values: [frozen]
+  teacher.decoder_mode:
+    values: [frozen, lora, ft]
+  teacher.use_alignment:
+    values: [true, false]
 
-  # 2. Structural Hyperparameters (Overrides presets)
+  # 2. Structural Hyperparameters
   teacher.alignment_num_blocks:
     values: [2, 4, 8]
   teacher.r_d:

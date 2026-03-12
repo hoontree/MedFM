@@ -1,5 +1,0 @@
-defaults:
-  - /model/sam_hybrid_base@
-
-name: EF_DL
-adaptation_mode: encoder_ft_decoder_lora

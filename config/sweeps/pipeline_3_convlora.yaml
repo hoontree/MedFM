@@ -1,28 +1,26 @@
 # WandB Sweep Configuration - GPU 3
-# encoder=frozen, no alignment, decoder sweep (frozen, ft)
-project: medfm_teacher_sweep
+# encoder=conv_lora, decoder sweep (frozen, ft)
+project: medfm_distill_sweep
 
 program: train.py
 method: grid
 metric:
-  name: final_test/BUID/dice
+  name: epoch_val/Dice
   goal: maximize
 
 parameters:
   model.decoder_mode:
     values: [frozen, ft]
-  distillation.adaptation_ratio:
-    values: [0.3, 1.0]
+  model.conv_lora_expert_num:
+    values: [4, 8]
 
 # Hydra command pattern
 command:
-  - ${env}
-  - ./.venv/bin/python
+  - .venv/bin/python
   - ${program}
   - ${args_no_hyphens}
-  - model.encoder_mode=frozen
+  - model.encoder_mode=conv_lora
   - model.use_alignment=false
   - pipeline.enabled=true
-  - wandb.disabled=true
   - hardware.gpu_ids=[3]
-  - wandb.project=medfm_teacher_sweep
+  - wandb.project=medfm_distill_sweep

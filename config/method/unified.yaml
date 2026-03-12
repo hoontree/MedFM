@@ -13,6 +13,12 @@ gamma: 0        # Feature KD (MSE on intermediate layers)
 gamma_attn: 0.5   # Attention Map KD (MSE)
 gamma_align: 1  # Alignment Layer KD (MSE)
 
+# --- Advanced Distillation Losses (lambda > 0) ---
+lambda_boundary: 0.1     # Boundary KD (Sobel edge map)
+lambda_shape: 0.2        # Shape KD (Signed Distance Transform)
+lambda_uncertainty: 0.2  # Uncertainty KD (Entropy map)
+
+
 # Task loss components
 use_dice: true
 use_ce: true
@@ -46,11 +52,6 @@ layer_channels:
   sam.image_encoder.blocks.9: 768
   sam.image_encoder.blocks.10: 768
   sam.image_encoder.blocks.11: 768
-
-# --- Advanced Distillation Losses (lambda > 0) ---
-lambda_boundary: 0.1     # Boundary KD (Sobel edge map)
-lambda_shape: 0.2        # Shape KD (Signed Distance Transform)
-lambda_uncertainty: 0.2  # Uncertainty KD (Entropy map)
 
 # --- GradNorm Configuration ---
 use_gradnorm: ${use_gradnorm}      # Automatically balance loss weights

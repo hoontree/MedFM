@@ -51,7 +51,7 @@ class SegformerTrainer(BaseTrainer):
                 ignore_mismatched_sizes=True,
             )
 
-        self.model = self.model.cuda()
+        self.model = self.model.to(self.device)
 
         # Setup image processor
         self.image_processor = SegformerImageProcessor.from_pretrained(
@@ -63,29 +63,14 @@ class SegformerTrainer(BaseTrainer):
         self.dice_loss = DiceLoss(self.cfg.data.num_classes)
 
         # Log model info
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
-        self.logger.info(f"Total parameters: {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable_params:,}")
+        self._log_model_info()
 
     def _create_dataloaders(self):
         """Create data loaders."""
         self.train_loader, self.val_loader, self.test_loader = (
             SegDatasetProcessor.build_data_loaders(self.cfg)
         )
-        self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
-        self.logger.info(f"Val set size: {len(self.val_loader.dataset)}")
-        if isinstance(self.test_loader, dict):
-            total_test = sum(
-                len(loader.dataset) for loader in self.test_loader.values()
-            )
-            self.logger.info(f"Test set size (Total): {total_test}")
-            for name, loader in self.test_loader.items():
-                self.logger.info(f"  - {name}: {len(loader.dataset)}")
-        else:
-            self.logger.info(f"Test set size: {len(self.test_loader.dataset)}")
+        self._log_data_sizes()
 
     def _create_optimizer(self):
         """Create optimizer."""
@@ -96,30 +81,13 @@ class SegformerTrainer(BaseTrainer):
         # Adjust learning rate for warmup
         b_lr = base_lr / warmup_period if warmup else base_lr
 
-        optimizer_name = self.cfg.optimizer.get("name", "AdamW")
+        self.optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=b_lr,
+            weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
+        )
 
-        if optimizer_name == "AdamW":
-            self.optimizer = optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=b_lr,
-                betas=(0.9, 0.999),
-                weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
-            )
-        elif optimizer_name == "SGD":
-            self.optimizer = optim.SGD(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=b_lr,
-                momentum=0.9,
-                weight_decay=0.0001,
-            )
-        else:
-            self.optimizer = optim.Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=b_lr,
-                weight_decay=self.cfg.optimizer.get("weight_decay", 0.01),
-            )
-
-        self.logger.info(f"Optimizer: {optimizer_name}, Initial LR: {b_lr}")
+        self.logger.info(f"Optimizer: AdamW, Initial LR: {b_lr}")
 
     def _create_scheduler(self):
         """Create learning rate scheduler (using manual update in train_epoch)."""
@@ -131,7 +99,7 @@ class SegformerTrainer(BaseTrainer):
         base_lr = self.cfg.training.base_lr
         warmup = self.cfg.training.get("warmup", False)
         warmup_period = self.cfg.training.get("warmup_period", 250)
-        max_iterations = self.cfg.training.max_epochs * len(self.train_loader)
+        max_iterations = self.cfg.training.num_epochs * len(self.train_loader)
 
         if warmup and iter_num < warmup_period:
             # Warmup phase
@@ -154,7 +122,7 @@ class SegformerTrainer(BaseTrainer):
 
     def _calc_loss(self, outputs, label_batch):
         """Calculate loss using unified channel-based approach."""
-        dice_weight = self.cfg.training.get("dice_param", 0.8)
+        dice_weight = self.cfg.training.get("dice_weight", 0.8)
 
         # Both binary and multi-class are now [B, C, H, W] float
         logits = outputs
@@ -180,12 +148,12 @@ class SegformerTrainer(BaseTrainer):
         total_dice_loss = 0.0
 
         train_pbar = tqdm(
-            self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.max_epochs}"
+            self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
         )
 
-        for batch_idx, (image_batch, label_batch) in enumerate(train_pbar):
-            image_batch = image_batch.cuda()
-            label_batch = label_batch.cuda()
+        for batch_idx, (image_batch, label_batch, *_) in enumerate(train_pbar):
+            image_batch = image_batch.to(self.device)
+            label_batch = label_batch.to(self.device)
 
             # Forward pass
             model_outputs = self.model(image_batch)
@@ -210,10 +178,8 @@ class SegformerTrainer(BaseTrainer):
             loss.backward()
 
             # Gradient clipping
-            grad_clip_config = self.cfg.get("optimizer", {}).get("grad_clip", {})
-            if grad_clip_config.get("enabled", False):
-                max_norm = grad_clip_config.get("max_norm", 1.0)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            max_norm = self.cfg.optimizer.gradient_clip.get("max_norm", 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
 
             self.optimizer.step()
 
@@ -230,14 +196,14 @@ class SegformerTrainer(BaseTrainer):
 
             # Log to wandb (step-level metrics)
             if self.global_step % 10 == 0:
-                wandb.log(
+                self._log_step_metrics(
                     {
-                        "step_train/loss": loss.item(),
-                        "step_train/loss_ce": loss_ce.item(),
-                        "step_train/loss_dice": loss_dice.item(),
-                        "step_train/learning_rate": lr,
-                        "global_step": self.global_step,
-                    }
+                        "loss": loss.item(),
+                        "loss_ce": loss_ce.item(),
+                        "loss_dice": loss_dice.item(),
+                        "lr": lr,
+                    },
+                    self.global_step,
                 )
 
             self.global_step += 1
@@ -312,9 +278,9 @@ class SegformerTrainer(BaseTrainer):
         threshold = 0.5
 
         with torch.no_grad():
-            for image_batch, label_batch in tqdm(dataloader, desc="Evaluating"):
-                image_batch = image_batch.cuda()
-                label_batch = label_batch.cuda()
+            for image_batch, label_batch, *_ in tqdm(dataloader, desc="Evaluating"):
+                image_batch = image_batch.to(self.device)
+                label_batch = label_batch.to(self.device)
 
                 # Forward pass
                 model_outputs = self.model(image_batch)
@@ -403,9 +369,9 @@ class SegformerTrainer(BaseTrainer):
         hd95_per_class = [[] for _ in range(num_classes)]
 
         with torch.no_grad():
-            for image_batch, label_batch in tqdm(dataloader, desc="Evaluating"):
-                image_batch = image_batch.cuda()
-                label_batch = label_batch.cuda()
+            for image_batch, label_batch, *_ in tqdm(dataloader, desc="Evaluating"):
+                image_batch = image_batch.to(self.device)
+                label_batch = label_batch.to(self.device)
 
                 # Forward pass
                 model_outputs = self.model(image_batch)
@@ -522,38 +488,6 @@ class SegformerTrainer(BaseTrainer):
             return 1.0 if intersection == 0 else 0.0
         return intersection / union
 
-    def _visualize_predictions(self):
-        """Visualize test predictions."""
-        from utils.visualize import visualize_predictions
-
-        vis_dir = self.exp_dir / "visualizations"
-        num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
-
-        self.logger.info(f"Generating {num_vis_samples} visualizations...")
-
-        if isinstance(self.test_loader, dict):
-            for name, loader in self.test_loader.items():
-                self.logger.info(f"Visualizing results for {name}...")
-                visualize_predictions(
-                    self.model,
-                    loader,
-                    self.device,
-                    self.cfg.data.num_classes,
-                    vis_dir / name,
-                    num_samples=num_vis_samples,
-                    model_type="segformer",
-                    phase_name=f"test_{name}",
-                )
-        else:
-            visualize_predictions(
-                self.model,
-                self.test_loader,
-                self.device,
-                self.cfg.data.num_classes,
-                vis_dir,
-                num_samples=num_vis_samples,
-                model_type="segformer",
-                phase_name="test",
-            )
-
-        self.logger.info(f"Visualizations saved to {vis_dir}")
+    def _get_model_type(self) -> str:
+        """SegFormer model type for visualization inference."""
+        return "segformer"

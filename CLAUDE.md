@@ -109,22 +109,18 @@ python run_distill_experiments.py --debug  # Quick debug run
 
 ```bash
 # Train teacher, then automatically run distillation with the same data/hardware/split context
-./.venv/bin/python train.py pipeline.enabled=true model=E0_AL_DL
+./.venv/bin/python train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora model.use_alignment=true
 
-# Example with explicit split ratio
+# Example with explicit encoder/decoder modes
 ./.venv/bin/python train.py \
   pipeline.enabled=true \
-  distillation.enabled=true \
-  distillation.phase=adaptation \
-  distillation.adaptation_ratio=0.3 \
-  model=E0_AL_DL
+  model.encoder_mode=conv_lora \
+  model.decoder_mode=lora
 ```
 
 Pipeline behavior:
 - Distillation uses the teacher best checkpoint from the same run.
-- Sweep metric is `pipeline/distill_final_dice`.
-- Preferred metric source is `final_test/BUID/dice`.
-- If `BUID` is missing in `data.test`, it falls back to the first test dataset Dice.
+- Sweep metric is `final_test/BUID/dice`.
 
 ### Evaluation
 
@@ -289,7 +285,7 @@ logs/distillation/{dataset}/{timestamp}/
 - Entity: `hheo`
 - Automatically logs: losses, metrics, learning rate, visualizations
 - Config stored in `.env` file
-- Pipeline sweeps should run with teacher W&B disabled (`wandb.disabled=true`) so one sweep trial maps to one distillation run metric.
+- Pipeline sweeps should run with teacher W&B disabled (`wandb.disabled=true`) so one sweep trial maps to one distillation run metric (`final_test/BUID/dice`).
 
 ### GPU Management
 
