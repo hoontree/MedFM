@@ -6,6 +6,9 @@ from functools import partial
 import timm.models.vision_transformer
 from timm.models.vision_transformer import DropPath, Mlp, Attention as BaseAttn
 
+from model.segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
+from model.segment_anything.modeling.common import LayerNorm2d
+
 
 class Attention(BaseAttn):
     def __init__(self, *args, **kwargs):
@@ -378,7 +381,17 @@ class FPNHead(nn.Module):
 
 
 class SegmentationModel(nn.Module):
-    """Complete segmentation model using the provided VisionTransformer"""
+    """Complete segmentation model using the provided VisionTransformer.
+
+    Args:
+        decoder_type (str): Which decoder branch to use at runtime.
+            ``"fpn"``  – the original Feature2Pyramid_Scale → FPNHead pipeline
+                         (default, fully backward-compatible).
+            ``"sam_mask"`` – experimental branch using SAM PromptEncoder +
+                         MaskDecoder with prompt-free inputs.
+        sam_transformer_dim (int): Channel width for the SAM decoder
+            (transformer_dim).  256 matches SAM-vit_b pretrained weights.
+    """
 
     def __init__(
         self,
@@ -386,11 +399,14 @@ class SegmentationModel(nn.Module):
         checkpoint=None,
         use_alignment=False,
         alignment_out_channels=256,
+        decoder_type="fpn",
+        sam_transformer_dim=256,
         **kwargs,
     ):
         super().__init__()
 
         self.checkpoint_path = checkpoint
+        self.decoder_type = decoder_type
 
         self.backbone = MAEBackbone(
             img_size=(224, 224),
@@ -406,12 +422,12 @@ class SegmentationModel(nn.Module):
             norm_eval=False,
         )
 
-        # Neck
+        # Neck (always instantiated to keep checkpoint compatibility)
         self.neck = Feature2Pyramid_Scale(
             embed_dim=192, rescales=[4, 2, 1, 0.5], scale_factor=0.25
         )
 
-        # Decode head
+        # Decode head (always instantiated to keep checkpoint compatibility)
         self.decode_head = FPNHead(
             in_channels=[48, 48, 48, 48],
             in_index=[0, 1, 2, 3],
@@ -438,6 +454,61 @@ class SegmentationModel(nn.Module):
         else:
             self.alignment_layer = None
 
+        # ------------------------------------------------------------------ #
+        # SAM-mask decoder branch (experimental)                             #
+        # ------------------------------------------------------------------ #
+        if decoder_type == "sam_mask":
+            num_out_feats = len(self.backbone.out_indices)   # 4
+            fused_in_ch = num_out_feats * self.backbone.embed_dims  # 4*192=768
+
+            # Fuse all backbone feature maps (same spatial size) into one map
+            # at the SAM decoder width.  Only this conv + norm are trained from
+            # scratch; SAM decoder weights load without name conflicts.
+            self.sam_feature_proj = nn.Sequential(
+                nn.Conv2d(fused_in_ch, sam_transformer_dim, kernel_size=1, bias=False),
+                LayerNorm2d(sam_transformer_dim),
+                nn.GELU(),
+            )
+
+            # Derive SAM prompt-encoder grid dimensions from backbone geometry
+            img_h, img_w = (
+                self.backbone.img_size
+                if isinstance(self.backbone.img_size, (tuple, list))
+                else (self.backbone.img_size, self.backbone.img_size)
+            )
+            h_tok = img_h // self.backbone.patch_size   # 14 for 224/16
+            w_tok = img_w // self.backbone.patch_size   # 14 for 224/16
+
+            self.prompt_encoder = PromptEncoder(
+                embed_dim=sam_transformer_dim,
+                image_embedding_size=(h_tok, w_tok),
+                input_image_size=(img_h, img_w),
+                mask_in_chans=16,
+            )
+
+            self.mask_decoder = MaskDecoder(
+                transformer_dim=sam_transformer_dim,
+                transformer=TwoWayTransformer(
+                    depth=2,
+                    embedding_dim=sam_transformer_dim,
+                    mlp_dim=2048,
+                    num_heads=8,
+                ),
+                num_multimask_outputs=3,
+                iou_head_depth=3,
+                iou_head_hidden_dim=sam_transformer_dim,
+            )
+
+            # Final channel projection to match the num_classes expected by
+            # the training loop (SAM mask decoder always outputs 1 channel in
+            # single-mask mode).
+            self.sam_cls_conv = nn.Conv2d(1, num_classes, kernel_size=1)
+        else:
+            self.sam_feature_proj = None
+            self.prompt_encoder = None
+            self.mask_decoder = None
+            self.sam_cls_conv = None
+
         if self.checkpoint_path:
             self.load_checkpoint(self.checkpoint_path)
 
@@ -445,6 +516,10 @@ class SegmentationModel(nn.Module):
         # Extract features from backbone
         features = self.backbone(x)
 
+        if self.decoder_type == "sam_mask":
+            return self._forward_sam_mask(x, features, return_features)
+
+        # ---- FPN path (original, fully intact) ----
         # Transform features through neck
         neck_features = self.neck(features)
 
@@ -460,9 +535,80 @@ class SegmentationModel(nn.Module):
             # Return seg_logits and the 3rd scale feature (14x14 for 224 input)
             # neck_features[2] corresponds to rescale=1.0, matching ViT output size
             feat = neck_features[2]
-            if self.use_alignment:
-                feat = self.alignment_layer(feat)
+            # if self.use_alignment:
+            #     feat = self.alignment_layer(feat)
             return seg_logits, feat
+
+        return seg_logits
+
+    def _forward_sam_mask(self, x, features, return_features=False):
+        """SAM-style prompt-free decoder branch.
+
+        Uses the PromptEncoder (with all-None prompts) and MaskDecoder from SAM.
+        The forward pass is written explicitly at batch level to avoid the
+        ``repeat_interleave`` in ``MaskDecoder.predict_masks`` which assumes one
+        image at a time and one prompt set replicated across the batch dimension.
+
+        Concretely, for prompt-free batched inference we use:
+            src     = image_embedding + dense_prompt_embeddings   (broadcast)
+            pos_src = image_pe.expand(B, -1, -1, -1)
+        """
+        # 1. Fuse all backbone feature maps (same spatial size H_tok x W_tok)
+        fused = torch.cat(features, dim=1)          # (B, 4*192=768, H_tok, W_tok)
+        image_embedding = self.sam_feature_proj(fused)  # (B, transformer_dim=256, H_tok, W_tok)
+
+        B, C, H_tok, W_tok = image_embedding.shape
+
+        # 2. Get prompt-free embeddings from PromptEncoder (batch size = 1)
+        #    sparse_pe: (1, 0, C)   dense_pe: (1, C, H_tok, W_tok)
+        _sparse_pe, dense_pe = self.prompt_encoder(None, None, None)
+        image_pe = self.prompt_encoder.get_dense_pe()   # (1, C, H_tok, W_tok)
+
+        # 3. Build token sequence directly at batch dim B to avoid
+        #    repeat_interleave incompatibility in predict_masks.
+        iou_tok = self.mask_decoder.iou_token.weight        # (1, C)
+        mask_toks = self.mask_decoder.mask_tokens.weight    # (num_mask_tokens, C)
+        output_tokens = torch.cat([iou_tok, mask_toks], dim=0)          # (1+num_mask_tokens, C)
+        tokens = output_tokens.unsqueeze(0).expand(B, -1, -1)           # (B, 1+num_mask_tokens, C)
+        # No sparse prompt tokens (prompt-free), so tokens == output_tokens
+
+        # 4. Batch-aligned src / pos_src (no repeat_interleave)
+        src = image_embedding + dense_pe.expand(B, -1, -1, -1)          # (B, C, H_tok, W_tok)
+        pos_src = image_pe.expand(B, -1, -1, -1)                        # (B, C, H_tok, W_tok)
+
+        # 5. Two-way transformer
+        hs, src_out = self.mask_decoder.transformer(src, pos_src, tokens)
+        # hs:     (B, 1+num_mask_tokens, C)
+        # src_out:(B, H_tok*W_tok, C)
+        mask_tokens_out = hs[:, 1 : 1 + self.mask_decoder.num_mask_tokens, :]  # (B, num_mask_tokens, C)
+
+        # 6. Upscale image embedding
+        #    ConvTranspose2d x2: (B, C, H_tok, W_tok) → (B, C//8, H_tok*4, W_tok*4)
+        src_2d = src_out.transpose(1, 2).view(B, C, H_tok, W_tok)
+        upscaled = self.mask_decoder.output_upscaling(src_2d)           # (B, C//8, H_tok*4, W_tok*4)
+
+        # 7. Hypernetwork: generate per-mask prediction kernels
+        hyper_in_list = [
+            self.mask_decoder.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
+            for i in range(self.mask_decoder.num_mask_tokens)
+        ]
+        hyper_in = torch.stack(hyper_in_list, dim=1)                    # (B, num_mask_tokens, C//8)
+
+        b, c_up, h_up, w_up = upscaled.shape
+        masks = (hyper_in @ upscaled.view(b, c_up, h_up * w_up)).view(b, -1, h_up, w_up)
+        # masks: (B, num_mask_tokens, H_tok*4, W_tok*4)
+
+        # 8. Single-mask mode: take token index 0 (same as multimask_output=False)
+        seg_logits = masks[:, 0:1, :, :]                                # (B, 1, H_tok*4, W_tok*4)
+
+        # 9. Project to num_classes and upsample to input resolution
+        seg_logits = self.sam_cls_conv(seg_logits)                      # (B, num_classes, H_tok*4, W_tok*4)
+        seg_logits = F.interpolate(
+            seg_logits, size=x.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        if return_features:
+            return seg_logits, image_embedding
 
         return seg_logits
 
@@ -487,3 +633,54 @@ class SegmentationModel(nn.Module):
             print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
         except Exception as e:
             print(f"Warning: Failed to load checkpoint. Error: {e}")
+
+    def load_sam_decoder_weights(self, path: str) -> None:
+        """Load pretrained SAM weights into the sam_mask branch modules.
+
+        Only ``prompt_encoder`` and ``mask_decoder`` are touched; backbone and
+        FPN submodules are left unchanged.  The ``sam_feature_proj`` and
+        ``sam_cls_conv`` projection layers are intentionally excluded and keep
+        their random initialization so they can be trained from scratch.
+
+        The SAM checkpoint can be a full SAM ``.pth`` file (keys prefixed with
+        ``mask_decoder.`` / ``prompt_encoder.``) or a standalone decoder
+        checkpoint (keys without prefix).
+
+        Args:
+            path: Path to the SAM checkpoint file.
+
+        Raises:
+            RuntimeError: If ``decoder_type != "sam_mask"`` (no modules to
+                load into).
+        """
+        if self.decoder_type != "sam_mask":
+            raise RuntimeError(
+                "load_sam_decoder_weights() called but decoder_type is "
+                f"'{self.decoder_type}', not 'sam_mask'."
+            )
+
+        raw = torch.load(path, map_location="cpu")
+        # Raw SAM checkpoints are sometimes wrapped; unwrap if needed.
+        state_dict = raw.get("model", raw)
+
+        # Extract only the decoder/prompt-encoder keys, strip any leading
+        # "image_encoder." prefix that might appear in full SAM files.
+        targets = {
+            "prompt_encoder": self.prompt_encoder,
+            "mask_decoder": self.mask_decoder,
+        }
+        for module_name, module in targets.items():
+            prefix = module_name + "."
+            sub_dict = {
+                k[len(prefix):]: v
+                for k, v in state_dict.items()
+                if k.startswith(prefix)
+            }
+            if not sub_dict:
+                print(f"[load_sam_decoder_weights] No keys found for '{module_name}' – skipped.")
+                continue
+            info = module.load_state_dict(sub_dict, strict=True)
+            print(
+                f"[load_sam_decoder_weights] Loaded '{module_name}': "
+                f"missing={info.missing_keys}, unexpected={info.unexpected_keys}"
+            )

@@ -52,10 +52,13 @@ class UnifiedDistiller(BaseDistiller):
         self.num_classes = cfg.data.num_classes
 
         # Hyperparameters
+        self.gamma = cfg.method.get("gamma", 0.0)
         self.gamma_align = cfg.method.get(
             "gamma_align", 0.0
-        )  # alignment layer distillation
-        self.gamma_attn = 1 - self.gamma_align  # attention map distillation
+        )  # alignment layer distillation (0 when teacher has no alignment)
+        self.gamma_attn = cfg.method.get(
+            "gamma_attn", 1.0
+        )  # attention map distillation
 
         # Advanced KD Coefficients
         self.lambda_boundary = cfg.method.get("lambda_boundary", 0.0)
@@ -293,7 +296,9 @@ class UnifiedDistiller(BaseDistiller):
             losses.append(self.task_criterion(student_logits, target_mask))
         if self.use_dice:
             losses.append(self.dice_loss(student_logits, target_mask))
-        return sum(losses) / len(losses) if losses else self._zero(student_logits.device)
+        return (
+            sum(losses) / len(losses) if losses else self._zero(student_logits.device)
+        )
 
     def _compute_logit_loss(self, student_logits, teacher_logits):
         """Logit Distillation (KL Div) - beta"""
@@ -492,29 +497,29 @@ class UnifiedDistiller(BaseDistiller):
         losses["feature_loss"] = self._compute_feature_loss(device)
 
         # 4. Attention Distillation
-        losses["attn_loss"] = self._compute_attn_loss(device)
+        # losses["attn_loss"] = self._compute_attn_loss(device)
 
         # 5. Alignment Layer Distillation
-        losses["align_loss"] = self._compute_align_loss(
-            student_outputs, teacher_outputs, device
-        )
+        # losses["align_loss"] = self._compute_align_loss(
+        #     student_outputs, teacher_outputs, device
+        # )
 
         # 6-8. Advanced KD Losses
-        adv_losses = self._compute_advanced_kd_losses(student_logits, teacher_logits)
-        losses["boundary_loss"] = adv_losses["boundary"]
-        losses["shape_loss"] = adv_losses["shape"]
-        losses["uncertainty_loss"] = adv_losses["uncertainty"]
+        # adv_losses = self._compute_advanced_kd_losses(student_logits, teacher_logits)
+        # losses["boundary_loss"] = adv_losses["boundary"]
+        # losses["shape_loss"] = adv_losses["shape"]
+        # losses["uncertainty_loss"] = adv_losses["uncertainty"]
 
         # Total Loss (Weighted)
         total_loss = (
             self.loss_weights["alpha"] * losses["task_loss"]
             + self.loss_weights["beta"] * losses["distill_loss"]
             + self.loss_weights["gamma"] * losses["feature_loss"]
-            + self.loss_weights["gamma_attn"] * losses["attn_loss"]
-            + self.loss_weights["gamma_align"] * losses["align_loss"]
-            + self.loss_weights["lambda_boundary"] * losses["boundary_loss"]
-            + self.loss_weights["lambda_shape"] * losses["shape_loss"]
-            + self.loss_weights["lambda_uncertainty"] * losses["uncertainty_loss"]
+            # + self.loss_weights["gamma_attn"] * losses["attn_loss"]
+            # + self.loss_weights["gamma_align"] * losses["align_loss"]
+            # + self.loss_weights["lambda_boundary"] * losses["boundary_loss"]
+            # + self.loss_weights["lambda_shape"] * losses["shape_loss"]
+            # + self.loss_weights["lambda_uncertainty"] * losses["uncertainty_loss"]
         )
 
         losses["loss"] = total_loss

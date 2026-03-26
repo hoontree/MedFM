@@ -2,9 +2,9 @@
 
 # Training settings
 training:
-  lr: 0.0001                      # Learning rate
-  batch_size: 64
-  num_epochs: 500
+  lr: 1e-4                      # Learning rate
+  batch_size: 8
+  num_epochs: 1000
   warmup_epochs: 5
   train_head_only: true           # Train only decoder parts
   num_workers: 8
@@ -20,7 +20,7 @@ training:
 optimizer:
   _target_: torch.optim.AdamW
   lr: ${training.lr}
-  weight_decay: 0.01
+  weight_decay: 0
   betas: [0.9, 0.999]
   # Custom flags for TinyUSFMTrainer
   use_layer_decay: true
@@ -33,7 +33,7 @@ optimizer:
 scheduler:
   _target_: utils.schedule.WarmupPolyLR
   warmup_epochs: ${training.warmup_epochs}
-  max_epochs: ${training.num_epochs}
+  num_epochs: ${training.num_epochs}
   base_lr: ${training.lr}
   end_lr: 1e-6
   power: 0.9
@@ -48,10 +48,6 @@ hardware:
 output:
   dir: logs
   is_pretrain: true               # Pretrained or scratch
-
-# Task settings
-task:
-  type: organ                     # tumor or organ
 
 # Visualization
 visualization:

@@ -10,6 +10,7 @@ import copy
 from utils.ultrasound_datasets import (
     BUID,
     BUS_UCLM,
+    BUS_UCLM_filtered,
     BUSI,
     BUSBRA,
     UltrasoundSegmentationDataset,
@@ -19,6 +20,7 @@ from utils.ultrasound_datasets import (
 DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
     "BUID": BUID,
     "BUS_UCLM": BUS_UCLM,
+    "BUS_UCLM_filtered": BUS_UCLM_filtered,
     "BUSI": BUSI,
     "BUSBRA": BUSBRA,
     "UltrasoundSegmentationDataset": UltrasoundSegmentationDataset,

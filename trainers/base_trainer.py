@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, Tuple
-import random
 import logging
 
 import numpy as np
@@ -21,6 +20,11 @@ import wandb
 
 from utils.logger import setup_logger
 from utils.evaluate import Evaluator_seg
+from utils.utils import set_seed
+from utils.distill_utils import get_experiment_tags
+
+_UNSET = object()  # sentinel for "use config default"
+
 
 
 class EarlyStopping:
@@ -115,10 +119,12 @@ class BaseTrainer(ABC):
             mode: 'train' or 'test'
         """
         # Set random seeds
-        self._set_seed()
+        seed = self.cfg.get("hardware", {}).get("seed", 42)
+        deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
+        set_seed(seed, deterministic=deterministic)
 
         # Setup directories
-        self._setup_directories(mode)
+        self._setup_directories()
 
         # Setup logger
         self._setup_logger()
@@ -132,6 +138,8 @@ class BaseTrainer(ABC):
 
         # Create model
         self._create_model()
+        
+        self._log_model_info()
 
         # Setup training components (only for training mode)
         if mode == "train":
@@ -143,49 +151,28 @@ class BaseTrainer(ABC):
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Experiment directory: {self.exp_dir}")
 
-    def _set_seed(self):
-        """Set random seeds for reproducibility."""
-        seed = self.cfg.get("hardware", {}).get("seed", 1234)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-        deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
-        if deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        else:
-            torch.backends.cudnn.deterministic = False
-            torch.backends.cudnn.benchmark = True
-
-    def _setup_directories(self, mode: str):
+    def _setup_directories(self):
         """Setup experiment directories."""
         # Get model name
-        model_name = self.cfg.model.get("sam_type", "") + "_" + self.cfg.model.name
-
+        model_name = self.cfg.model.name
+        
         # Create base directory
         logs_root = Path(self.cfg.get("output", {}).get("dir", "logs"))
 
-        # Determine if this is an adaptation phase (pre-distillation training)
-        distill_cfg = self.cfg.get("distillation", {})
-        phase = "train"
-        if (
-            distill_cfg.get("enabled", False)
-            and distill_cfg.get("phase") == "adaptation"
-        ):
-            phase = "adaptation"
-
         # Create experiment tags
-        exp_tags = self._create_exp_tags()
+        exp_tags = get_experiment_tags(self.cfg)
 
         # Create timestamp-based experiment directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
 
         # Final experiment directory
-        self.exp_dir = logs_root / phase / model_name / exp_dir_name
+        if model_name == "sam":
+            peft_mode = f"e_{self.cfg.model.encoder_mode}_d_{self.cfg.model.decoder_mode}"
+            self.exp_dir = logs_root / model_name / peft_mode / exp_dir_name
+
+        else:
+            self.exp_dir = logs_root / model_name / exp_dir_name
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         # Checkpoint directory
@@ -199,12 +186,6 @@ class BaseTrainer(ABC):
         config_file = self.exp_dir / "config.yaml"
         with open(config_file, "w") as f:
             OmegaConf.save(self.cfg, f)
-
-    def _create_exp_tags(self) -> list:
-        """Create experiment tags based on hyperparameters."""
-        from utils.distill_utils import get_experiment_tags
-
-        return get_experiment_tags(self.cfg)
 
     def _setup_logger(self):
         """Setup logger."""
@@ -225,7 +206,7 @@ class BaseTrainer(ABC):
             if is_sweep
             else f"{self.cfg.model.get('encoder_mode', 'default')}_encoder_{self.cfg.model.get('decoder_mode', 'default')}_decoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
-        wandb_run_config = self._build_wandb_config(is_sweep=is_sweep)
+        wandb_run_config = self._build_wandb_config()
 
         self.wandb_run = wandb.init(
             entity=wandb_config.get("entity", "hheo"),
@@ -236,15 +217,22 @@ class BaseTrainer(ABC):
             mode=wandb_mode,
         )
 
-    def _build_wandb_config(self, is_sweep: bool) -> Dict[str, Any]:
-        """Build W&B config payload while avoiding sweep key-type collisions."""
-        wandb_run_config = OmegaConf.to_container(self.cfg, resolve=True)
-        if not isinstance(wandb_run_config, dict):
-            return {}
-
-        if is_sweep and isinstance(wandb_run_config.get("model"), dict):
-            wandb_run_config["model_cfg"] = wandb_run_config.pop("model")
-
+    def _build_wandb_config(self) -> Dict[str, Any]:
+        """Build W&B config payload with model and training configs only."""
+        wandb_run_config = {}
+        
+        # Add model config
+        if "model" in self.cfg:
+            model_cfg = OmegaConf.to_container(self.cfg.model, resolve=True)
+            if isinstance(model_cfg, dict):
+                wandb_run_config["model"] = model_cfg
+        
+        # Add training config
+        if "training" in self.cfg:
+            training_cfg = OmegaConf.to_container(self.cfg.training, resolve=True)
+            if isinstance(training_cfg, dict):
+                wandb_run_config["training"] = training_cfg
+        
         return wandb_run_config
 
     def _setup_early_stopping(self):
@@ -365,6 +353,9 @@ class BaseTrainer(ABC):
         vis_dir=None,
         epoch=None,
         predictions_cache: Dict = None,
+        num_samples=_UNSET,
+        log_to_wandb: bool = True,
+        max_wandb_images: Optional[int] = None,
     ):
         """Visualize predictions with a unified implementation.
 
@@ -374,16 +365,26 @@ class BaseTrainer(ABC):
         3. Neither -> iterate test_loaders with model inference (fallback).
 
         Subclasses can override _get_model_type() to customise inference.
-        """
-        from utils.visualize import visualize_predictions, visualize_from_predictions
 
-        num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+        Args:
+            num_samples: Max samples to visualize. Defaults to config value.
+                         Pass None explicitly to visualize all samples.
+            log_to_wandb: If True, upload saved images to W&B.
+            max_wandb_images: Max number of images to upload to W&B.
+                Does not affect how many files are saved to disk.
+        """
+        from utils.visualize import visualize_predictions_with_inference, visualize_precomputed_predictions
+
+        if num_samples is _UNSET:
+            num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+        else:
+            num_vis_samples = num_samples
         model_type = self._get_model_type()
         img_size = getattr(self, "img_size", None)
 
         # Mode 1: validation visualization
         if loader is not None:
-            visualize_predictions(
+            visualize_predictions_with_inference(
                 self.model,
                 loader,
                 self.device,
@@ -393,12 +394,16 @@ class BaseTrainer(ABC):
                 model_type=model_type,
                 img_size=img_size,
                 phase_name="val",
+                log_to_wandb=log_to_wandb,
+                max_wandb_images=max_wandb_images,
             )
             return
 
         # Mode 2/3: test visualization
         if vis_dir is None:
             vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+        if log_to_wandb and max_wandb_images is None:
+            max_wandb_images = 10
 
         sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
         self.logger.info(
@@ -413,7 +418,7 @@ class BaseTrainer(ABC):
                 cached = predictions_cache[name]
                 images_list, preds_list, masks_list = cached[0], cached[1], cached[2]
                 filenames_list = cached[3] if len(cached) > 3 else None
-                visualize_from_predictions(
+                visualize_precomputed_predictions(
                     images_list,
                     preds_list,
                     masks_list,
@@ -422,9 +427,11 @@ class BaseTrainer(ABC):
                     num_samples=num_vis_samples,
                     phase_name=phase_name,
                     filenames_list=filenames_list,
+                    log_to_wandb=log_to_wandb,
+                    max_wandb_images=max_wandb_images,
                 )
             else:
-                visualize_predictions(
+                visualize_predictions_with_inference(
                     self.model,
                     test_loader,
                     self.device,
@@ -434,6 +441,8 @@ class BaseTrainer(ABC):
                     model_type=model_type,
                     img_size=img_size,
                     phase_name=phase_name,
+                    log_to_wandb=log_to_wandb,
+                    max_wandb_images=max_wandb_images,
                 )
 
         self.logger.info(f"Visualizations saved to {vis_dir}")
@@ -446,7 +455,10 @@ class BaseTrainer(ABC):
             f"Generating validation visualizations for epoch {epoch + 1}..."
         )
         self._visualize_predictions(
-            loader=self.val_loader, vis_dir=vis_dir, epoch=epoch
+            loader=self.val_loader,
+            vis_dir=vis_dir,
+            epoch=epoch,
+            log_to_wandb=False,
         )
 
     def train(self):
@@ -527,33 +539,70 @@ class BaseTrainer(ABC):
         self.logger.info(
             "Val:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
         )
-        if test_metrics is not None:
-            test_items = {k: v for k, v in test_metrics.items() if isinstance(v, (float, int))}
-            self.logger.info(
-                "Test:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in test_items.items())
-            )
 
         # Log to wandb (epoch-level metrics)
         wandb_metrics = {"epoch": epoch + 1}
         wandb_metrics.update({f"train/{k}": v for k, v in train_items.items()})
         wandb_metrics.update({f"val/{k}": v for k, v in val_items.items()})
-        if test_metrics is not None:
-            wandb_metrics.update({f"test/{k}": v for k, v in test_items.items()})
         if wandb.run is not None:
             wandb.log(wandb_metrics)
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
         dice_score = val_metrics.get("Dice", val_metrics.get("dice", 0.0))
+        IoU_score = val_metrics.get("IoU", val_metrics.get("iou", 0.0))
+        hd95_score = val_metrics.get("HD95", val_metrics.get("hd95", 0.0))
+
+        prev_best_model_path = self.best_model_path
+        prev_best_iou_checkpoint = getattr(self, "best_iou_checkpoint", None)
+        prev_best_hd95_checkpoint = getattr(self, "best_hd95_checkpoint", None)
 
         # Save best model
         if dice_score > self.best_metric:
             self.best_metric = dice_score
             self.best_model_path = (
-                self.ckpt_dir / f"best_epoch_{epoch + 1}_dice{dice_score:.4f}.pth"
+                self.ckpt_dir / f"best_epoch_{epoch + 1}_dice_{dice_score:.4f}.pth"
             )
             self._save_model(self.best_model_path)
             self.logger.info(f"Saved best model: {self.best_model_path}")
+            self.wandb_run.summary["checkpoint_path"] = str(self.best_model_path)
+            self.wandb_run.summary["best_dice"] = dice_score
+            if (
+                prev_best_model_path is not None
+                and prev_best_model_path != self.best_model_path
+                and prev_best_model_path.exists()
+            ):
+                prev_best_model_path.unlink()
+                
+        if IoU_score > self.wandb_run.summary.get("best_iou", 0.0):
+            self.wandb_run.summary["best_iou"] = IoU_score
+            self.best_iou_checkpoint = (
+                self.ckpt_dir / f"best_epoch_{epoch + 1}_iou_{IoU_score:.4f}.pth"
+            )
+            self._save_model(self.best_iou_checkpoint)
+            self.wandb_run.summary["best_iou_checkpoint"] = str(self.best_iou_checkpoint)
+            self.logger.info(f"Saved best IoU model: {self.best_iou_checkpoint}")
+            if (
+                prev_best_iou_checkpoint is not None
+                and prev_best_iou_checkpoint != self.best_iou_checkpoint
+                and prev_best_iou_checkpoint.exists()
+            ):
+                prev_best_iou_checkpoint.unlink()
+                
+        if hd95_score < self.wandb_run.summary.get("best_hd95", float("inf")):
+            self.wandb_run.summary["best_hd95"] = hd95_score
+            self.best_hd95_checkpoint = (
+                self.ckpt_dir / f"best_epoch_{epoch + 1}_hd95_{hd95_score:.4f}.pth"
+            )
+            self._save_model(self.best_hd95_checkpoint)
+            self.wandb_run.summary["best_hd95_checkpoint"] = str(self.best_hd95_checkpoint)
+            self.logger.info(f"Saved best HD95 model: {self.best_hd95_checkpoint}")
+            if (
+                prev_best_hd95_checkpoint is not None
+                and prev_best_hd95_checkpoint != self.best_hd95_checkpoint
+                and prev_best_hd95_checkpoint.exists()
+            ):
+                prev_best_hd95_checkpoint.unlink()
 
         # Periodic checkpoint
         save_interval = self.cfg.get("training", {}).get("save_interval", 20)
@@ -571,8 +620,15 @@ class BaseTrainer(ABC):
         self.logger.info(f"Loading checkpoint: {path}")
         self.model.load_state_dict(torch.load(str(path)))
 
-    def _save_test_results(self, test_metrics: Dict):
-        """Save test results to file and log to wandb as final_test/."""
+    def _save_test_results(self, test_metrics: Dict, predictions_cache: dict = None):
+        """Save test results to file and log to wandb as final_test/.
+
+        Args:
+            test_metrics: Dict of metric name → scalar value.
+            predictions_cache: Optional precomputed predictions cache
+                (same structure as _save_per_sample_metrics). When provided,
+                a LaTeX table with mean ± std is also written.
+        """
         test_results_path = self.exp_dir / "test_results.txt"
         with open(test_results_path, "w") as f:
             f.write("Test Results\n")
@@ -593,6 +649,109 @@ class BaseTrainer(ABC):
             wandb.log(final_metrics)
             wandb.run.summary.update(final_metrics)
 
+        if predictions_cache is not None:
+            self._save_latex_metrics_table(predictions_cache)
+
+    def _save_per_sample_metrics(self, predictions_cache: dict) -> None:
+        """Save per-sample segmentation metrics to CSV for every test dataset.
+
+        Writes ``<exp_dir>/test_results/metrics_<dataset>.csv`` for each
+        dataset in *predictions_cache*, and a combined ``metrics_all.csv``
+        when more than one dataset is evaluated.
+
+        Args:
+            predictions_cache: Dict mapping dataset name →
+                ``(images_list, preds_list, masks_list, filenames_list)``
+                as returned by ``evaluate_model`` with
+                ``return_predictions=True``.
+        """
+        import pandas as pd
+        from utils.evaluate import Evaluator_seg
+
+        out_dir = self.exp_dir / "test_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_dfs = []
+        for ds_name, (_, preds_list, masks_list, filenames_list) in predictions_cache.items():
+            df = Evaluator_seg.build_per_sample_df(
+                preds_list,
+                masks_list,
+                filenames_list,
+                num_classes=self.cfg.data.num_classes,
+            )
+            df.insert(0, "dataset", ds_name)
+            csv_path = out_dir / f"metrics_{ds_name}.csv"
+            df.to_csv(csv_path, index=False, float_format="%.6f")
+            self.logger.info(f"Per-sample metrics saved → {csv_path}")
+            all_dfs.append(df)
+
+        if len(all_dfs) > 1:
+            combined_path = out_dir / "metrics_all.csv"
+            pd.concat(all_dfs, ignore_index=True).to_csv(
+                combined_path, index=False, float_format="%.6f"
+            )
+            self.logger.info(f"Combined per-sample metrics saved → {combined_path}")
+
+    def _save_latex_metrics_table(self, predictions_cache: dict) -> None:
+        """Save per-dataset mean ± std metrics as a LaTeX table to test_results/.
+
+        Reads the per-sample CSVs already written by _save_per_sample_metrics and
+        produces ``<exp_dir>/test_results/metrics_latex.txt``.
+
+        Each cell: ``mean \\pm std`` (×100 for ratio metrics, raw for HD95).
+        """
+        import pandas as pd
+
+        RATIO_COLS = ["Dice", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
+        ALL_COLS = ["Dice", "HD95", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
+
+        out_dir = self.exp_dir / "test_results"
+        rows = []
+
+        for ds_name in predictions_cache:
+            csv_path = out_dir / f"metrics_{ds_name}.csv"
+            if not csv_path.exists():
+                self.logger.warning(f"LaTeX table: CSV not found for {ds_name}, skipping.")
+                continue
+            df = pd.read_csv(csv_path)
+
+            cells = []
+            for col in ALL_COLS:
+                if col not in df.columns:
+                    cells.append("--")
+                    continue
+                mean_v = df[col].mean()
+                std_v = df[col].std()
+                if col in RATIO_COLS:
+                    cells.append(f"{mean_v * 100:.2f} $\\pm$ {std_v * 100:.2f}")
+                else:
+                    cells.append(f"{mean_v:.2f} $\\pm$ {std_v:.2f}")
+
+            rows.append((ds_name, cells))
+
+        header_cols = " & ".join(ALL_COLS)
+        lines = [
+            "% Auto-generated LaTeX metrics table",
+            "\\begin{table}[h]",
+            "  \\centering",
+            "  \\caption{Final test metrics (mean $\\pm$ std)}",
+            "  \\begin{tabular}{l" + "c" * len(ALL_COLS) + "}",
+            "    \\hline",
+            f"    Dataset & {header_cols} \\\\",
+            "    \\hline",
+        ]
+        for ds_name, cells in rows:
+            lines.append(f"    {ds_name} & {' & '.join(cells)} \\\\")
+        lines += [
+            "    \\hline",
+            "  \\end{tabular}",
+            "\\end{table}",
+        ]
+
+        out_path = out_dir / "metrics_latex.txt"
+        out_path.write_text("\n".join(lines) + "\n")
+        self.logger.info(f"LaTeX metrics table saved → {out_path}")
+
     def run_test_only(self, checkpoint_path: str):
         """Run test-only mode with a specific checkpoint."""
         self.logger.info("TEST-ONLY MODE")
@@ -606,12 +765,11 @@ class BaseTrainer(ABC):
         self._load_checkpoint(checkpoint_path)
 
         # Initialize wandb for test-only run
-        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
         self.wandb_run = wandb.init(
             entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
             project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
             name=f"{self.cfg.model.name}_test_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            config=self._build_wandb_config(is_sweep=is_sweep),
+            config=self._build_wandb_config(),
             tags=["test-only"],
             mode=(
                 "disabled"

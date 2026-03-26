@@ -1,0 +1,27 @@
+# WandB Sweep Configuration - GPU 1
+# decoder=sam_mask
+project: medical_foundation_models
+
+name: tinyusfm_decoder_sam_mask
+
+program: train.py
+method: grid
+metric:
+  name: final_test/BUID/Dice
+  goal: maximize
+  
+parameters:
+  training.lr:
+    values: [0.0001, 0.0005, 0.001]
+  training.batch_size:
+    values: [16, 32, 64]
+  training.train_head_only:
+    values: [true, false]
+
+command:
+  - .venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - model.decoder_type=sam_mask
+  - hardware.gpu_ids=[1]
+  - wandb.project=medical_foundation_models

@@ -1,4 +1,4 @@
-# Knowledge Distillation Configuration
+# Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student)
 defaults:
   - data: dynamic
   - teacher: sam

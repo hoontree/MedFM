@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-import numpy as np
 from hydra.utils import instantiate
 
 from .base_trainer import BaseTrainer
@@ -91,6 +90,13 @@ class TinyUSFMTrainer(BaseTrainer):
             self.model = instantiate(self.cfg.model)
 
         self.model.load_checkpoint()
+
+        # Load pretrained SAM decoder weights for the sam_mask branch
+        sam_ckpt = self.cfg.model.get("sam_decoder_checkpoint", None)
+        if sam_ckpt and self.cfg.model.get("decoder_type", "fpn") == "sam_mask":
+            self.logger.info(f"Loading SAM decoder weights from: {sam_ckpt}")
+            self.model.load_sam_decoder_weights(sam_ckpt)
+
         self.model = self.model.to(self.device)
 
         # Handle head-only training
@@ -196,32 +202,10 @@ class TinyUSFMTrainer(BaseTrainer):
         """Validate model."""
         self.model.eval()
 
-        val_loss = 0.0
-
-        val_pbar = tqdm(
-            self.val_loader,
-            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs} [Val]",
-        )
-
-        with torch.no_grad():
-            for images, masks, *_ in val_pbar:
-                images, masks = images.to(self.device), masks.to(self.device).float()
-
-                # Forward pass
-                outputs = self.model(images)
-
-                # Calculate loss
-                loss = _compute_loss(
-                    self.criterion, outputs, masks, self.cfg.data.num_classes
-                )
-
-                val_loss += loss.item() * images.size(0)
-
-        val_loss /= len(self.val_loader.dataset)
-
-        # Evaluate metrics
+        # Single forward-pass: compute metrics and loss together
         val_metrics = self.evaluator.evaluate_model(
-            self.model, self.val_loader, self.device, self.cfg.data.num_classes
+            self.model, self.val_loader, self.device, self.cfg.data.num_classes,
+            criterion=self.criterion,
         )
 
         # Update scheduler
@@ -236,9 +220,6 @@ class TinyUSFMTrainer(BaseTrainer):
             and epoch >= self.cfg.training.get("warmup_epochs", 0)
         ):
             self.scheduler.step()
-
-        # Add loss to metrics
-        val_metrics["loss"] = val_loss
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
@@ -275,30 +256,16 @@ class TinyUSFMTrainer(BaseTrainer):
             else:
                 test_metrics = metrics
 
-        # Visualize predictions
+        # Visualize predictions (all samples)
         vis_dir = self.exp_dir / "visualizations" / "test"
         self._visualize_predictions(
-            predictions_cache=predictions_cache, vis_dir=vis_dir
+            predictions_cache=predictions_cache, vis_dir=vis_dir, num_samples=10
         )
+
+        # Per-sample metrics CSV
+        self._save_per_sample_metrics(predictions_cache)
 
         return test_metrics
-
-    def _visualize_predictions(
-        self,
-        loader=None,
-        vis_dir=None,
-        epoch=None,
-        predictions_cache: Dict[
-            str, Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]
-        ] = None,
-    ) -> None:
-        """Visualize predictions. Delegates to base class implementation."""
-        super()._visualize_predictions(
-            loader=loader,
-            vis_dir=vis_dir,
-            epoch=epoch,
-            predictions_cache=predictions_cache,
-        )
 
 
 try:

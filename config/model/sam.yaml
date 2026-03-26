@@ -14,8 +14,8 @@ model:
   num_classes: ${data.num_classes}
   pixel_mean: [123.675, 116.28, 103.53]
   pixel_std: [58.395, 57.12, 57.375]
-  encoder_mode: "conv_lora"
-  decoder_mode: "lora"
+  encoder_mode: "ft"
+  decoder_mode: "ft"
   use_alignment: false
   r_e: 4
   r_d: 4

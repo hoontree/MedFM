@@ -23,8 +23,8 @@ filter_empty_masks: true # Filter out images with empty masks (Normal cases) to 
 normalization: "min_max" # Options: "imagenet", "min_max"
 
 # Color to class mapping
-# Red (255, 0, 0) -> Malignant (1)
-# Green (0, 255, 0) -> Benign (2)
+# Red (255, 0, 0) -> Malignant (2)
+# Green (0, 255, 0) -> Benign (1)
 # Black (0, 0, 0) -> Background/Normal (0)
 class_colors:
   malignant: [255, 0, 0]

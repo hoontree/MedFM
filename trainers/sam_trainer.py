@@ -314,13 +314,20 @@ class SAMTrainer(BaseTrainer):
             # Cache predictions for visualization
             predictions_cache[name] = (images_list, preds_list, masks_list, filenames_list)
 
-        # Visualize predictions using cached results
+        # Visualize predictions using cached results (all samples)
         vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
         self._visualize_predictions(
-            predictions_cache=predictions_cache, vis_dir=vis_dir
+            predictions_cache=predictions_cache, vis_dir=vis_dir, num_samples=10
         )
 
+        # Per-sample metrics CSV
+        self._save_per_sample_metrics(predictions_cache)
+
         return test_metrics
+
+    def _get_base_model(self):
+        """Return the underlying LoRA_Sam, unwrapping DataParallel if needed."""
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
     def _get_model_type(self) -> str:
         """SAM model type for visualization inference."""

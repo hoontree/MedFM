@@ -10,20 +10,13 @@ from sklearn.metrics import (
     f1_score,
     balanced_accuracy_score,
     roc_auc_score,
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    mean_absolute_percentage_error,
-    roc_curve,
-    auc,
 )
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 import logging
 import pandas as pd
-from sklearn.preprocessing import label_binarize
-from medpy.metric.binary import hd95, dc, precision, recall, jc, hd
+from medpy.metric.binary import hd95, dc, precision, recall
 from scipy.ndimage import distance_transform_edt
 from scipy.ndimage import binary_erosion, generate_binary_structure
 
@@ -448,16 +441,16 @@ class Evaluator_seg:
         num_classes: int = 1,
         threshold: float = 0.5,
         return_predictions: bool = False,
+        criterion=None,
     ) -> Dict[str, float] | tuple:
         model.eval()
         if num_classes == 1:
             return Evaluator_seg._evaluate_binary(
-                model, data_loader, device, threshold, return_predictions
+                model, data_loader, device, threshold, return_predictions, criterion=criterion
             )
         else:
-            # Need to see how _evaluate_multiclass is implemented to see if it needs labels as indices
             return Evaluator_seg._evaluate_multiclass(
-                model, data_loader, device, num_classes, return_predictions
+                model, data_loader, device, num_classes, return_predictions, criterion=criterion
             )
 
     @staticmethod
@@ -470,34 +463,21 @@ class Evaluator_seg:
         threshold: float = 0.5,
         return_predictions: bool = False,
     ) -> Dict[str, float] | tuple:
-        """Evaluate SAM-based models that require img_size parameter
-
-        Args:
-            model: SAM model to evaluate
-            data_loader: DataLoader for evaluation
-            device: Device to run on
-            num_classes: Number of classes
-            img_size: Image size for SAM
-            threshold: Threshold for binary segmentation
-            return_predictions: If True, also return (images, preds, masks, filenames) for visualization
-
-        Returns:
-            If return_predictions is False: metrics dict
-            If return_predictions is True: (metrics, images_list, preds_list, masks_list, filenames_list)
-        """
+        """Evaluate SAM-based models that require img_size parameter."""
         model.eval()
         if num_classes == 1:
-            return Evaluator_seg._evaluate_binary_sam(
-                model, data_loader, device, img_size, threshold, return_predictions
+            return Evaluator_seg._evaluate_binary(
+                model, data_loader, device, threshold, return_predictions, img_size=img_size
             )
         else:
-            return Evaluator_seg._evaluate_multiclass_sam(
-                model, data_loader, device, num_classes, img_size, return_predictions
+            return Evaluator_seg._evaluate_multiclass(
+                model, data_loader, device, num_classes, return_predictions, img_size=img_size
             )
 
     @staticmethod
     def _evaluate_binary(
-        model, data_loader, device, threshold, return_predictions=False
+        model, data_loader, device, threshold, return_predictions=False,
+        img_size=None, criterion=None,
     ):
         dice_list = []
         hd95_list = []
@@ -506,6 +486,7 @@ class Evaluator_seg:
         specificity_list = []
         pixel_acc_list = []
         bf_score_list = []
+        boundary_iou_list =  []
         all_probs = []
         all_labels = []
 
@@ -514,109 +495,27 @@ class Evaluator_seg:
         masks_list = [] if return_predictions else None
         filenames_list = [] if return_predictions else None
 
+        total_loss = 0.0
+        total_samples = 0
+
         with torch.no_grad():
             for batch in data_loader:
                 images = batch[0].to(device)
                 labels = batch[1].to(device)
                 batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
 
-                outputs = model(images)
-
-                if outputs.shape[1] == 1:
-                    probs = torch.sigmoid(outputs)
-                    preds = (probs > threshold).float()
+                if img_size is not None:
+                    raw_out = model(images, False, img_size)
+                    logits = raw_out["masks"]
                 else:
-                    raise ValueError("Only binary segmentation supported.")
+                    logits = model(images)
+                    if logits.shape[1] != 1:
+                        raise ValueError("Only binary segmentation supported.")
 
-                # Collect for ECE
-                all_probs.append(probs.cpu().numpy().flatten())
-                all_labels.append(labels.cpu().numpy().flatten())
-
-                if return_predictions:
-                    images_list.append(images.cpu())
-                    preds_list.append(preds.cpu())
-                    masks_list.append(labels.cpu())
-                    filenames_list.append(batch_fnames)
-
-                for pred, gt in zip(preds, labels):
-                    pred_np = pred.squeeze().cpu().numpy().astype(bool)
-                    gt_np = gt.squeeze().cpu().numpy().astype(bool)
-
-                    dice = dc(pred_np, gt_np)
-                    if pred_np.any() and gt_np.any():
-                        hausdorff = hd95(pred_np, gt_np)
-                    elif not pred_np.any() and not gt_np.any():
-                        hausdorff = 0
-                    else:
-                        hausdorff = 224
-                    iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
-                    sens = recall(pred_np, gt_np)
-                    spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
-                    pixel_acc = (pred_np == gt_np).sum() / gt_np.size
-                    bf_score = Evaluator_seg.compute_boundary_score(pred_np, gt_np)
-
-                    dice_list.append(dice)
-                    hd95_list.append(hausdorff)
-                    iou_list.append(iou)
-                    sensitivity_list.append(sens)
-                    specificity_list.append(spec)
-                    pixel_acc_list.append(pixel_acc)
-                    bf_score_list.append(bf_score)
-                # Cleanup batch-level tensors
-                del images, labels, outputs, probs, preds
-        all_probs = np.concatenate(all_probs)
-        all_labels = np.concatenate(all_labels)
-        ece = Evaluator_seg.compute_ece(all_probs, all_labels)
-
-        metrics = {
-            "Dice": np.mean(dice_list),
-            "Dice_std": np.std(dice_list),
-            "HD95": np.mean(hd95_list),
-            "HD95_std": np.std(hd95_list),
-            "IoU": np.mean(iou_list),
-            "IoU_std": np.std(iou_list),
-            "Sensitivity": np.mean(sensitivity_list),
-            "Sensitivity_std": np.std(sensitivity_list),
-            "Specificity": np.mean(specificity_list),
-            "Specificity_std": np.std(specificity_list),
-            "PixelAcc": np.mean(pixel_acc_list),
-            "PixelAcc_std": np.std(pixel_acc_list),
-            "BFScore": np.mean(bf_score_list),
-            "BFScore_std": np.std(bf_score_list),
-            "ECE": ece,
-        }
-        if return_predictions:
-            return metrics, images_list, preds_list, masks_list, filenames_list
-        return metrics
-
-    @staticmethod
-    def _evaluate_binary_sam(
-        model, data_loader, device, img_size, threshold, return_predictions=False
-    ):
-        dice_list = []
-        hd95_list = []
-        iou_list = []
-        sensitivity_list = []
-        specificity_list = []
-        pixel_acc_list = []
-        bf_score_list = []
-        all_probs = []
-        all_labels = []
-
-        # For returning predictions
-        images_list = [] if return_predictions else None
-        preds_list = [] if return_predictions else None
-        masks_list = [] if return_predictions else None
-        filenames_list = [] if return_predictions else None
-
-        with torch.no_grad():
-            for batch in data_loader:
-                images = batch[0].to(device)
-                labels = batch[1].to(device)
-                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
-
-                outputs = model(images, False, img_size)
-                logits = outputs["masks"]
+                if criterion is not None:
+                    loss = criterion(logits, labels.float())
+                    total_loss += loss.item() * images.size(0)
+                    total_samples += images.size(0)
 
                 probs = torch.sigmoid(logits)
                 preds = (probs > threshold).float()
@@ -625,7 +524,6 @@ class Evaluator_seg:
                 all_probs.append(probs.cpu().numpy().flatten())
                 all_labels.append(labels.cpu().numpy().flatten())
 
-                # Store for visualization if requested
                 if return_predictions:
                     images_list.append(images.cpu())
                     preds_list.append(preds.cpu())
@@ -644,6 +542,7 @@ class Evaluator_seg:
                     else:
                         hausdorff = 224
                     iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
+                    biou = Evaluator_seg.boundary_iou(pred_np, gt_np)
                     sens = recall(pred_np, gt_np)
                     spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
                     pixel_acc = (pred_np == gt_np).sum() / gt_np.size
@@ -656,9 +555,11 @@ class Evaluator_seg:
                     specificity_list.append(spec)
                     pixel_acc_list.append(pixel_acc)
                     bf_score_list.append(bf_score)
-
+                    boundary_iou_list.append(biou)
                 # Cleanup batch-level tensors
-                del images, labels, outputs, logits, probs, preds
+                if img_size is not None:
+                    del raw_out
+                del images, labels, logits, probs, preds
 
         all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)
@@ -680,17 +581,22 @@ class Evaluator_seg:
             "BFScore": np.mean(bf_score_list),
             "BFScore_std": np.std(bf_score_list),
             "ECE": ece,
+            "BoundaryIoU": np.mean(boundary_iou_list),
+            "BoundaryIoU_std": np.std(boundary_iou_list),
         }
-
+        if criterion is not None:
+            metrics["loss"] = total_loss / total_samples if total_samples > 0 else 0.0
         if return_predictions:
             return metrics, images_list, preds_list, masks_list, filenames_list
         return metrics
 
     @staticmethod
     def _evaluate_multiclass(
-        model, data_loader, device, num_classes, return_predictions=False
+        model, data_loader, device, num_classes, return_predictions=False,
+        img_size=None, criterion=None,
     ):
         dice_per_class = [[] for _ in range(num_classes)]
+        boundary_iou_per_class = [[] for _ in range(num_classes)]
         iou_per_class = [[] for _ in range(num_classes)]
         pixel_acc_list = []
         sensitivity_per_class = [[] for _ in range(num_classes)]
@@ -701,6 +607,9 @@ class Evaluator_seg:
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
         filenames_list = [] if return_predictions else None
+
+        total_loss = 0.0
+        total_samples = 0
 
         with torch.no_grad():
             for batch in data_loader:
@@ -709,14 +618,22 @@ class Evaluator_seg:
                 batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
                 gt_indices = torch.argmax(labels, dim=1)  # [B, H, W]
 
-                outputs = model(images)  # [B, num_classes, H, W]
-                preds = torch.argmax(outputs, dim=1)  # [B, H, W]
+                if img_size is not None:
+                    raw_out = model(images, True, img_size)
+                    output_masks = raw_out["masks"]
+                    preds = torch.argmax(torch.softmax(output_masks, dim=1), dim=1)
+                else:
+                    output_masks = model(images)  # [B, num_classes, H, W]
+                    preds = torch.argmax(output_masks, dim=1)  # [B, H, W]
+
+                if criterion is not None:
+                    loss = criterion(output_masks, labels.float())
+                    total_loss += loss.item() * images.size(0)
+                    total_samples += images.size(0)
 
                 if return_predictions:
                     images_list.append(images.cpu())
-                    preds_list.append(
-                        preds.unsqueeze(1).cpu()
-                    )  # Add channel dim for consistency
+                    preds_list.append(preds.unsqueeze(1).cpu())
                     masks_list.append(labels.cpu())
                     filenames_list.append(batch_fnames)
 
@@ -733,6 +650,7 @@ class Evaluator_seg:
 
                         if not (gt_class.any() or pred_class.any()):
                             dice = 1.0
+                            biou = 1.0
                             iou = 1.0
                             sensitivity = np.nan
                             specificity = np.nan
@@ -741,6 +659,7 @@ class Evaluator_seg:
                             tp = np.logical_and(pred_class, gt_class).sum()
                             dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
                             iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
+                            biou = Evaluator_seg.boundary_iou(pred_class, gt_class)
                             fn = np.logical_and(~pred_class, gt_class).sum()
                             if (tp + fn) > 0:
                                 sensitivity = tp / (tp + fn + 1e-8)
@@ -765,129 +684,7 @@ class Evaluator_seg:
                         sensitivity_per_class[class_id].append(sensitivity)
                         specificity_per_class[class_id].append(specificity)
                         hd95_per_class[class_id].append(hd)
-
-            foreground_ids = list(range(1, num_classes))
-
-            metrics = {}
-            metrics["PixelAcc"] = np.nanmean(pixel_acc_list)
-            metrics["PixelAcc_std"] = np.nanstd(pixel_acc_list)
-            metrics["Dice"] = np.nanmean(
-                [np.nanmean(dice_per_class[i]) for i in foreground_ids]
-            )
-            metrics["Dice_std"] = np.nanstd(
-                [item for i in foreground_ids for item in dice_per_class[i]]
-            )
-            metrics["IoU"] = np.nanmean(
-                [np.nanmean(iou_per_class[i]) for i in foreground_ids]
-            )
-            metrics["IoU_std"] = np.nanstd(
-                [item for i in foreground_ids for item in iou_per_class[i]]
-            )
-            metrics["Sensitivity"] = np.nanmean(
-                [np.nanmean(sensitivity_per_class[i]) for i in foreground_ids]
-            )
-            metrics["Sensitivity_std"] = np.nanstd(
-                [item for i in foreground_ids for item in sensitivity_per_class[i]]
-            )
-            metrics["Specificity"] = np.nanmean(
-                [np.nanmean(specificity_per_class[i]) for i in foreground_ids]
-            )
-            metrics["Specificity_std"] = np.nanstd(
-                [item for i in foreground_ids for item in specificity_per_class[i]]
-            )
-            metrics["HD95"] = np.nanmean(
-                [np.nanmean(hd95_per_class[i]) for i in foreground_ids]
-            )
-            metrics["HD95_std"] = np.nanstd(
-                [item for i in foreground_ids for item in hd95_per_class[i]]
-            )
-
-        if return_predictions:
-            return metrics, images_list, preds_list, masks_list, filenames_list
-        return metrics
-
-    @staticmethod
-    def _evaluate_multiclass_sam(
-        model, data_loader, device, num_classes, img_size, return_predictions=False
-    ):
-        dice_per_class = [[] for _ in range(num_classes)]
-        iou_per_class = [[] for _ in range(num_classes)]
-        pixel_acc_list = []
-        sensitivity_per_class = [[] for _ in range(num_classes)]
-        specificity_per_class = [[] for _ in range(num_classes)]
-        hd95_per_class = [[] for _ in range(num_classes)]
-
-        # For returning predictions
-        images_list = [] if return_predictions else None
-        preds_list = [] if return_predictions else None
-        masks_list = [] if return_predictions else None
-        filenames_list = [] if return_predictions else None
-
-        with torch.no_grad():
-            for batch in data_loader:
-                images = batch[0].to(device)
-                labels = batch[1].to(device)
-                batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
-                gt_indices = torch.argmax(labels, dim=1)
-
-                outputs = model(images, True, img_size)
-                output_masks = outputs["masks"]
-                preds = torch.argmax(torch.softmax(output_masks, dim=1), dim=1)
-
-                # Store for visualization if requested
-                if return_predictions:
-                    images_list.append(images.cpu())
-                    preds_list.append(
-                        preds.unsqueeze(1).cpu()
-                    )  # Add channel dim for consistency
-                    masks_list.append(labels.cpu())
-                    filenames_list.append(batch_fnames)
-
-                for pred, gt in zip(preds, gt_indices):
-                    pred_np = pred.cpu().numpy()
-                    gt_np = gt.cpu().numpy()
-
-                    pixel_acc = (pred_np == gt_np).mean()
-                    pixel_acc_list.append(pixel_acc)
-
-                    for class_id in range(num_classes):
-                        pred_class = pred_np == class_id
-                        gt_class = gt_np == class_id
-
-                        if not (gt_class.any() or pred_class.any()):
-                            dice = 1.0
-                            iou = 1.0
-                            sensitivity = np.nan
-                            specificity = np.nan
-                            hd = np.nan
-                        else:
-                            tp = np.logical_and(pred_class, gt_class).sum()
-                            dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
-                            iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
-                            fn = np.logical_and(~pred_class, gt_class).sum()
-                            if (tp + fn) > 0:
-                                sensitivity = tp / (tp + fn + 1e-8)
-                            else:
-                                sensitivity = np.nan
-                            tn = np.logical_and(~pred_class, ~gt_class).sum()
-                            fp = np.logical_and(pred_class, ~gt_class).sum()
-                            if (tn + fp) > 0:
-                                specificity = tn / (tn + fp + 1e-8)
-                            else:
-                                specificity = np.nan
-                            if gt_class.any() and pred_class.any():
-                                hd = hd95(
-                                    pred_class.astype(np.bool_),
-                                    gt_class.astype(np.bool_),
-                                )
-                            else:
-                                hd = 224
-
-                        dice_per_class[class_id].append(dice)
-                        iou_per_class[class_id].append(iou)
-                        sensitivity_per_class[class_id].append(sensitivity)
-                        specificity_per_class[class_id].append(specificity)
-                        hd95_per_class[class_id].append(hd)
+                        boundary_iou_per_class[class_id].append(biou)
 
         foreground_ids = list(range(1, num_classes))
 
@@ -924,6 +721,14 @@ class Evaluator_seg:
         metrics["HD95_std"] = np.nanstd(
             [item for i in foreground_ids for item in hd95_per_class[i]]
         )
+        metrics["BoundaryIoU"] = np.nanmean(
+            [np.nanmean(boundary_iou_per_class[i]) for i in foreground_ids]
+        )
+        metrics["BoundaryIoU_std"] = np.nanstd(
+            [item for i in foreground_ids for item in boundary_iou_per_class[i]]
+        )
+        if criterion is not None:
+            metrics["loss"] = total_loss / total_samples if total_samples > 0 else 0.0
 
         if return_predictions:
             return metrics, images_list, preds_list, masks_list, filenames_list
@@ -941,6 +746,63 @@ class Evaluator_seg:
         union = np.logical_or(pred, gt).sum()
         if union == 0:
             return 1.0 if intersection == 0 else 0.0
+        return intersection / union
+    
+    @staticmethod
+    def mask_to_boundary(mask: np.ndarray, dilation_ratio: float = 0.02) -> np.ndarray:
+        """
+        Binary mask를 boundary region으로 변환한다.
+
+        Args:
+            mask: shape (H, W), 0/1 또는 bool 배열
+            dilation_ratio: boundary 두께를 이미지 대각선 대비 비율로 지정
+                            논문 기본값은 대략 0.02
+
+        Returns:
+            boundary_mask: shape (H, W), bool 배열
+        """
+        if mask.ndim != 2:
+            raise ValueError("mask must be a 2D array")
+
+        mask = mask.astype(bool)
+        h, w = mask.shape
+
+        # 이미지 diagonal 기준으로 boundary 두께 d 계산
+        img_diag = np.sqrt(h ** 2 + w ** 2)
+        d = max(1, int(round(dilation_ratio * img_diag)))
+
+        # erosion 후 원본과의 차이를 이용해 내부 기준 boundary region 생성
+        # 논문의 (G_d ∩ G), (P_d ∩ P)에 해당하는 실용적 구현
+        eroded = binary_erosion(mask, structure=np.ones((3, 3)), iterations=d, border_value=0)
+        boundary = mask ^ eroded
+        return boundary
+
+    @staticmethod
+    def boundary_iou(gt: np.ndarray, pred: np.ndarray, dilation_ratio: float = 0.02) -> float:
+        """
+        Boundary IoU 계산.
+
+        Args:
+            gt: ground truth binary mask, shape (H, W)
+            pred: prediction binary mask, shape (H, W)
+            dilation_ratio: boundary 두께 비율
+
+        Returns:
+            Boundary IoU score (float)
+        """
+        if gt.shape != pred.shape:
+            raise ValueError("gt and pred must have the same shape")
+
+        gt_boundary = Evaluator_seg.mask_to_boundary(gt, dilation_ratio)
+        pred_boundary = Evaluator_seg.mask_to_boundary(pred, dilation_ratio)
+
+        intersection = np.logical_and(gt_boundary, pred_boundary).sum()
+        union = np.logical_or(gt_boundary, pred_boundary).sum()
+
+        # 둘 다 비어 있는 특수 케이스
+        if union == 0:
+            return 1.0
+
         return intersection / union
 
     @staticmethod
@@ -1024,6 +886,109 @@ class Evaluator_seg:
                 f'IOU: {metrics["IoU"]:.4f}, Sensitivity: {metrics["Sensitivity"]:.4f}, '
                 f'Specificity: {metrics["Specificity"]:.4f}, PixelAcc: {metrics["PixelAcc"]:.4f}'
             )
+
+    @staticmethod
+    def build_per_sample_df(
+        preds_list: List[torch.Tensor],
+        masks_list: List[torch.Tensor],
+        filenames_list: List,
+        num_classes: int = 1,
+    ) -> "pd.DataFrame":
+        """Build a per-sample metrics DataFrame from cached prediction tensors.
+
+        Args:
+            preds_list:     List of [B, 1, H, W] binary/class prediction tensors
+                            (already thresholded/argmaxed as returned by evaluate_model).
+            masks_list:     List of [B, 1, H, W] GT tensors (binary) or
+                            [B, C, H, W] one-hot tensors (multiclass).
+            filenames_list: List of per-batch filename lists (may be None entries).
+            num_classes:    Number of segmentation classes.
+
+        Returns:
+            DataFrame with columns: ``filename``, ``Dice``, ``HD95``, ``IoU``,
+            ``Sensitivity``, ``Specificity``, ``PixelAcc``, ``BFScore``.
+        """
+        records = []
+        sample_idx = 0
+
+        for batch_preds, batch_masks, batch_fnames in zip(
+            preds_list, masks_list, filenames_list
+        ):
+            B = batch_preds.shape[0]
+            for i in range(B):
+                fname = (
+                    batch_fnames[i]
+                    if (batch_fnames and i < len(batch_fnames))
+                    else f"sample_{sample_idx:05d}"
+                )
+                pred_np = batch_preds[i].squeeze().numpy()
+                if num_classes == 1:
+                    gt_np = batch_masks[i].squeeze().numpy()
+                    pb = pred_np.astype(bool)
+                    gb = gt_np.astype(bool)
+
+                    dice_v = float(dc(pb, gb))
+                    if pb.any() and gb.any():
+                        hd_v = float(hd95(pb, gb))
+                    elif not pb.any() and not gb.any():
+                        hd_v = 0.0
+                    else:
+                        hd_v = 224.0
+
+                    record = {
+                        "filename":    fname,
+                        "Dice":        dice_v,
+                        "HD95":        hd_v,
+                        "IoU":         float(Evaluator_seg.compute_jaccard(pb, gb)),
+                        "Sensitivity": float(recall(pb, gb)),
+                        "Specificity": float(Evaluator_seg.compute_specificity(pb, gb)),
+                        "PixelAcc":    float((pb == gb).sum()) / gb.size,
+                        "BFScore":     float(Evaluator_seg.compute_boundary_score(pb, gb)),
+                    }
+                else:
+                    # pred_np is class-index map [H, W]; masks are one-hot [C, H, W]
+                    pred_cls = pred_np.astype(int)
+                    gt_cls = np.argmax(batch_masks[i].numpy(), axis=0).astype(int)
+
+                    fg = range(1, num_classes)
+                    dice_vals, hd_vals, iou_vals = [], [], []
+                    sens_vals, spec_vals = [], []
+                    for c in fg:
+                        p = pred_cls == c
+                        g = gt_cls == c
+                        if not (p.any() or g.any()):
+                            continue
+                        tp = np.logical_and(p, g).sum()
+                        dice_vals.append(2 * tp / (p.sum() + g.sum() + 1e-8))
+                        iou_vals.append(Evaluator_seg.compute_jaccard(p, g))
+                        if p.any() and g.any():
+                            hd_vals.append(hd95(p.astype(bool), g.astype(bool)))
+                        else:
+                            hd_vals.append(224.0)
+                        fn = np.logical_and(~p, g).sum()
+                        sens_vals.append(tp / (tp + fn + 1e-8) if (tp + fn) > 0 else np.nan)
+                        tn = np.logical_and(~p, ~g).sum()
+                        fp = np.logical_and(p, ~g).sum()
+                        spec_vals.append(tn / (tn + fp + 1e-8) if (tn + fp) > 0 else np.nan)
+
+                    record = {
+                        "filename":    fname,
+                        "Dice":        float(np.nanmean(dice_vals)) if dice_vals else 0.0,
+                        "HD95":        float(np.nanmean(hd_vals))   if hd_vals  else 224.0,
+                        "IoU":         float(np.nanmean(iou_vals))  if iou_vals else 0.0,
+                        "Sensitivity": float(np.nanmean(sens_vals)) if sens_vals else np.nan,
+                        "Specificity": float(np.nanmean(spec_vals)) if spec_vals else np.nan,
+                        "PixelAcc":    float((pred_cls == gt_cls).mean()),
+                        "BFScore":     float(np.nanmean([
+                            Evaluator_seg.compute_boundary_score(pred_cls == c, gt_cls == c)
+                            for c in fg
+                        ])) if list(fg) else np.nan,
+                    }
+
+                records.append(record)
+                sample_idx += 1
+
+        return pd.DataFrame(records)
 
     @staticmethod
     def save_visual_results(

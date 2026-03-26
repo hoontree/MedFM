@@ -1,0 +1,24 @@
+# WandB Sweep Configuration - GPU 3
+# encoder=ft, decoder=ft, alignment=true
+project: medfm_teacher_adaptation
+
+program: train.py
+method: grid
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  training.lr:
+    values: [1e-5, 3e-5, 1e-4]
+
+
+# Hydra command pattern
+command:
+  - .venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - model.encoder_mode=ft
+  - model.decoder_mode=ft
+  - hardware.gpu_ids=[3]
+  - wandb.project=medfm_teacher_adaptation

@@ -2,9 +2,7 @@
 defaults:
   - _self_
   - data: dynamic
-  - model: sam
+  - model: tinyusfm
 
 pipeline:
   enabled: false
-  distill:
-    enabled: true

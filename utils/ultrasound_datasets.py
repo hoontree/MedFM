@@ -23,11 +23,14 @@ def _format_mask(mask, num_classes):
     """
     mask_np = np.array(mask)
     if num_classes == 1:
-        # Binary case: assume > 0 or > 127 is foreground depending on value range
-        if mask_np.max() > 1:
-            mask_np = (mask_np > 127).astype(np.float32)
-        else:
+        # Binary case:
+        # - class-index mask (e.g., 0/1/2): foreground is > 0
+        # - intensity mask (e.g., 0/255): foreground is > 127
+        max_value = mask_np.max()
+        if max_value <= 2:
             mask_np = (mask_np > 0).astype(np.float32)
+        else:
+            mask_np = (mask_np > 127).astype(np.float32)
         return torch.from_numpy(mask_np).unsqueeze(0).float()
     else:
         # Multi-class case: convert to one-hot [C, H, W]
@@ -1129,3 +1132,11 @@ class DDTI(BaseUltrasoundDataset):
 
         # Split dataset
         self.images, self.masks = self._split_dataset(images, masks)
+
+
+# Import at end to avoid circular import while BaseUltrasoundDataset is being defined.
+from utils.bus_uclm_filtered import BUS_UCLM_filtered as _BUS_UCLM_filtered
+
+
+class BUS_UCLM_filtered(_BUS_UCLM_filtered):
+    pass

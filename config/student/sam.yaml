@@ -1,5 +1,4 @@
-# Teacher model configuration for distillation
-# Override encoder_mode/decoder_mode/use_alignment via CLI or sweep params
+# Student model configuration for distillation (SAM as student)
 name: sam
 _target_: model.sam_hybrid_adapter.LoRA_Sam
 sam_type: vit_b
@@ -7,8 +6,8 @@ img_size: ${data.img_size}
 num_classes: ${data.num_classes}
 pixel_mean: [123.675, 116.28, 103.53]
 pixel_std: [58.395, 57.12, 57.375]
-encoder_mode: "ft"
-decoder_mode: "ft"
+encoder_mode: "frozen"
+decoder_mode: "lora"
 use_alignment: false
 r_e: 4
 r_d: 4

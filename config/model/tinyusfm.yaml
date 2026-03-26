@@ -14,3 +14,18 @@ model:
   num_classes: ${data.num_classes}
   img_size: ${data.img_size}
   checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights
+
+  # ------------------------------------------------------------------
+  # Decoder branch selection
+  #   "fpn"      : original Feature2Pyramid_Scale → FPNHead (default)
+  #   "sam_mask" : experimental SAM PromptEncoder + MaskDecoder branch
+  # ------------------------------------------------------------------
+  decoder_type: fpn
+
+  # transformer_dim for the SAM mask branch (256 = SAM-vit_b compatible)
+  sam_transformer_dim: 256
+
+  # Path to a full SAM checkpoint (.pth) from which mask_decoder and
+  # prompt_encoder weights will be loaded when decoder_type=sam_mask.
+  # Set to null to train the SAM decoder branch from scratch.
+  sam_decoder_checkpoint: checkpoints/sam_vit_b_01ec64.pth

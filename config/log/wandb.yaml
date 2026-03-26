@@ -2,6 +2,7 @@
 
 # Wandb logging configuration
 wandb:
-  project: medical_foundation_models
+  project: medfm_distillation
+  run_name: distill_from_pretrained_sam
   entity: hheo
   log_model: true

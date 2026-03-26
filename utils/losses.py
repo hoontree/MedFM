@@ -1,20 +1,11 @@
 import torch  
 import torch.nn as nn  
+from utils.sam_utils import DiceLoss
 
 
-class MaskDiceLoss(nn.Module):
+class MaskDiceLoss(DiceLoss):
     def __init__(self):
-        super(MaskDiceLoss, self).__init__()
-
-    def _dice_loss(self, score, target):
-        target = target.float()
-        smooth = 1e-5
-        intersect = torch.sum(score * target)
-        y_sum = torch.sum(target * target)
-        z_sum = torch.sum(score * score)
-        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
-        loss = 1 - loss
-        return loss
+        super().__init__(n_classes=1)
 
     def forward(self, pred, target, weight=None, sigmoid=False):
         if sigmoid:

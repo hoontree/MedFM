@@ -9,14 +9,14 @@ temperature: 4.0
 # Loss weights (Set to 0.0 to disable a component)
 alpha: 1.0        # Task loss (GT Dice/CE)
 beta: 1.0         # Logit KD (KL Divergence)
-gamma: 0        # Feature KD (MSE on intermediate layers)
-gamma_attn: 0.5   # Attention Map KD (MSE)
-gamma_align: 1  # Alignment Layer KD (MSE)
+gamma: 1        # Feature KD (MSE on intermediate layers)
+gamma_attn: 0   # Attention Map KD (MSE)
+gamma_align: 0  # Alignment Layer KD (MSE)
 
 # --- Advanced Distillation Losses (lambda > 0) ---
-lambda_boundary: 0.1     # Boundary KD (Sobel edge map)
-lambda_shape: 0.2        # Shape KD (Signed Distance Transform)
-lambda_uncertainty: 0.2  # Uncertainty KD (Entropy map)
+lambda_boundary: 0     # Boundary KD (Sobel edge map)
+lambda_shape: 0        # Shape KD (Signed Distance Transform)
+lambda_uncertainty: 0  # Uncertainty KD (Entropy map)
 
 
 # Task loss components
@@ -25,20 +25,14 @@ use_ce: true
 
 # --- Feature Distillation Settings (gamma > 0) ---
 layer_mapping:
-  backbone.blocks.0: sam.image_encoder.blocks.0
-  backbone.blocks.2: sam.image_encoder.blocks.2
-  backbone.blocks.4: sam.image_encoder.blocks.4
-  backbone.blocks.6: sam.image_encoder.blocks.6
-  backbone.blocks.8: sam.image_encoder.blocks.8
-  backbone.blocks.10: sam.image_encoder.blocks.10
+  backbone.blocks.7: sam.image_encoder.blocks.7
+  backbone.blocks.9: sam.image_encoder.blocks.9
+  backbone.blocks.11: sam.image_encoder.blocks.11
 
 layer_channels:
-  backbone.blocks.0: 192
-  backbone.blocks.2: 192
-  backbone.blocks.4: 192
-  backbone.blocks.6: 192
-  backbone.blocks.8: 192
-  backbone.blocks.10: 192
+  backbone.blocks.7: 192
+  backbone.blocks.9: 192
+  backbone.blocks.11: 192
 
   sam.image_encoder.blocks.0: 768
   sam.image_encoder.blocks.1: 768
@@ -54,6 +48,6 @@ layer_channels:
   sam.image_encoder.blocks.11: 768
 
 # --- GradNorm Configuration ---
-use_gradnorm: ${use_gradnorm}      # Automatically balance loss weights
+use_gradnorm: false      # Automatically balance loss weights
 gradnorm_alpha: 0.1      # Update rate for GradNorm (alpha damping)
 reference_layer: backbone.blocks.11  # Reference layer for gradient matching

@@ -77,6 +77,7 @@ def prepare_mask_for_plot(mask: np.ndarray) -> np.ndarray:
     Returns:
         2D (HW) mask array.
     """
+    # If mask has shape (1, H, W), squeeze to (H, W) for plotting.
     if mask.ndim == 3 and mask.shape[0] == 1:
         return mask[0]
     return mask
@@ -161,7 +162,7 @@ def plot_segmentation_panel(
     save_path: Union[str, Path],
     num_classes: int = 1,
     metrics: Optional[Dict[str, float]] = None,
-    overlay: bool = True,
+    overlay: bool = False,
     dpi: int = DEFAULT_DPI,
     font_size: int = DEFAULT_FONT_SIZE,
     filename: Optional[str] = None,
@@ -357,11 +358,11 @@ def _visualize_sample_arrays(
     mask = prepare_mask_for_plot(mask)
     pred = prepare_mask_for_plot(pred)
     plot_segmentation_panel(
-        img, mask, pred, save_path, num_classes, metrics=metrics, filename=filename,
+        img, mask, pred, save_path, num_classes, metrics=metrics, overlay=False, filename=filename,
     )
 
 
-def visualize_predictions(
+def visualize_predictions_with_inference(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -373,6 +374,8 @@ def visualize_predictions(
     phase_name: str = "test",
     mean: np.ndarray = IMAGENET_MEAN,
     std: np.ndarray = IMAGENET_STD,
+    log_to_wandb: bool = True,
+    max_wandb_images: Optional[int] = None,
 ) -> None:
     """Visualize model predictions with inference.
 
@@ -390,6 +393,9 @@ def visualize_predictions(
         phase_name: Phase name for WandB logging.
         mean: Denormalization mean.
         std: Denormalization std.
+        log_to_wandb: If True, upload saved images to WandB.
+        max_wandb_images: Max number of images to upload to WandB.
+            Does not affect how many files are saved to disk.
     """
     from tqdm import tqdm
 
@@ -420,14 +426,18 @@ def visualize_predictions(
                 save_path = save_dir / f"sample_{file_label}.png"
                 _visualize_sample_arrays(
                     images_np[i], masks_np[i], preds_np[i],
-                    save_path, num_classes, mean, std,
+                    save_path, num_classes, mean, std, metrics=None,
                     filename=fname,
                 )
 
-                caption = fname or f"Sample {sample_count}"
-                wb_img = _collect_wandb_image(save_path, caption)
-                if wb_img is not None:
-                    wandb_images.append(wb_img)
+                if log_to_wandb and (
+                    max_wandb_images is None
+                    or len(wandb_images) < max_wandb_images
+                ):
+                    caption = fname or f"Sample {sample_count}"
+                    wb_img = _collect_wandb_image(save_path, caption)
+                    if wb_img is not None:
+                        wandb_images.append(wb_img)
 
                 sample_count += 1
                 if num_samples is not None and sample_count >= num_samples:
@@ -436,10 +446,11 @@ def visualize_predictions(
             if num_samples is not None and sample_count >= num_samples:
                 break
 
-    log_wandb_images(wandb_images, phase_name)
+    if log_to_wandb:
+        log_wandb_images(wandb_images, phase_name)
 
 
-def visualize_from_predictions(
+def visualize_precomputed_predictions(
     images_list: List[torch.Tensor],
     preds_list: List[torch.Tensor],
     masks_list: List[torch.Tensor],
@@ -450,6 +461,8 @@ def visualize_from_predictions(
     mean: np.ndarray = IMAGENET_MEAN,
     std: np.ndarray = IMAGENET_STD,
     filenames_list: Optional[List[List[str]]] = None,
+    log_to_wandb: bool = True,
+    max_wandb_images: Optional[int] = None,
 ) -> None:
     """Visualize pre-computed predictions (no model inference).
 
@@ -464,6 +477,9 @@ def visualize_from_predictions(
         mean: Denormalization mean.
         std: Denormalization std.
         filenames_list: Optional list of filename lists, one per batch.
+        log_to_wandb: If True, upload saved images to WandB.
+        max_wandb_images: Max number of images to upload to WandB.
+            Does not affect how many files are saved to disk.
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -493,10 +509,14 @@ def visualize_from_predictions(
                 filename=fname,
             )
 
-            caption = fname or f"Sample {sample_count}"
-            wb_img = _collect_wandb_image(save_path, caption)
-            if wb_img is not None:
-                wandb_images.append(wb_img)
+            if log_to_wandb and (
+                max_wandb_images is None
+                or len(wandb_images) < max_wandb_images
+            ):
+                caption = fname or f"Sample {sample_count}"
+                wb_img = _collect_wandb_image(save_path, caption)
+                if wb_img is not None:
+                    wandb_images.append(wb_img)
 
             sample_count += 1
             if num_samples is not None and sample_count >= num_samples:
@@ -505,7 +525,8 @@ def visualize_from_predictions(
         if num_samples is not None and sample_count >= num_samples:
             break
 
-    log_wandb_images(wandb_images, phase_name)
+    if log_to_wandb:
+        log_wandb_images(wandb_images, phase_name)
 
 
 def visualize_distillation(
@@ -609,3 +630,87 @@ def visualize_distillation(
                 sample_count += 1
 
     log_wandb_images(wandb_images, "distillation")
+
+
+def visualize_distillation_precomputed(
+    images_list: List[torch.Tensor],
+    teacher_preds_list: List[torch.Tensor],
+    student_preds_list: List[torch.Tensor],
+    masks_list: List[torch.Tensor],
+    num_classes: int,
+    save_dir: Union[Path, str],
+    num_samples: Optional[int] = None,
+    phase_name: str = "distillation",
+    mean: np.ndarray = IMAGENET_MEAN,
+    std: np.ndarray = IMAGENET_STD,
+    filenames_list: Optional[List[List[str]]] = None,
+    log_to_wandb: bool = True,
+    epoch: Optional[int] = None,
+) -> None:
+    """Visualize teacher vs student predictions from pre-computed tensors (no inference).
+
+    Args:
+        images_list: List of image tensors [B, C, H, W].
+        teacher_preds_list: List of teacher prediction tensors [B, 1, H, W].
+        student_preds_list: List of student prediction tensors [B, 1, H, W].
+        masks_list: List of ground-truth mask tensors [B, C, H, W].
+        num_classes: Number of segmentation classes.
+        save_dir: Base directory for saving visualizations.
+        num_samples: Max samples to visualize (None = all).
+        phase_name: Phase name for WandB logging key.
+        mean: Denormalization mean.
+        std: Denormalization std.
+        filenames_list: Optional list of filename lists, one per batch.
+        log_to_wandb: If True, upload saved images to WandB.
+        epoch: Current epoch (None for final evaluation).
+    """
+    if epoch is not None:
+        vis_dir = Path(save_dir) / f"epoch_{epoch + 1}"
+    else:
+        vis_dir = Path(save_dir)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_count = 0
+    wandb_images = []
+
+    _fnames_iter = iter(filenames_list) if filenames_list else None
+
+    for images, teacher_preds, student_preds, masks in zip(
+        images_list, teacher_preds_list, student_preds_list, masks_list
+    ):
+        if num_classes > 1 and masks.shape[1] == num_classes:
+            masks = torch.argmax(masks, dim=1, keepdim=True).float()
+
+        batch_fnames = next(_fnames_iter) if _fnames_iter else None
+
+        images_np = images.numpy()
+        t_preds_np = teacher_preds.numpy()
+        s_preds_np = student_preds.numpy()
+        masks_np = masks.numpy()
+
+        for i in range(images_np.shape[0]):
+            fname = batch_fnames[i] if batch_fnames else None
+            img = denormalize_image(images_np[i], mean, std)
+            t_pred = prepare_mask_for_plot(t_preds_np[i])
+            s_pred = prepare_mask_for_plot(s_preds_np[i])
+            gt = prepare_mask_for_plot(masks_np[i])
+
+            file_label = fname or f"{sample_count:03d}"
+            save_path = vis_dir / f"sample_{file_label}.png"
+            plot_distillation_panel(img, gt, t_pred, s_pred, save_path, num_classes, filename=fname)
+
+            if log_to_wandb:
+                caption = fname or f"Sample {sample_count}"
+                wb_img = _collect_wandb_image(save_path, caption)
+                if wb_img is not None:
+                    wandb_images.append(wb_img)
+
+            sample_count += 1
+            if num_samples is not None and sample_count >= num_samples:
+                break
+
+        if num_samples is not None and sample_count >= num_samples:
+            break
+
+    if log_to_wandb:
+        log_wandb_images(wandb_images, phase_name)

@@ -1,0 +1,26 @@
+# WandB Sweep Configuration - GPU 0
+# encoder=frozen, decoder=lora, alignment=true
+project: medfm_teacher_adaptation
+
+program: train.py
+method: grid
+metric:
+  name: epoch_val/Dice
+  goal: maximize
+
+parameters:
+  training.lr:
+    values: [3e-5, 1e-4, 3e-4]
+  model.r_d:
+    values: [4, 8, 16]
+
+
+# Hydra command pattern
+command:
+  - .venv/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+  - model.encoder_mode=frozen
+  - model.decoder_mode=lora
+  - hardware.gpu_ids=[0]
+  - wandb.project=medfm_teacher_adaptation

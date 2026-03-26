@@ -1,0 +1,7 @@
+# Teacher model configuration for distillation (TinyUSFM as teacher)
+name: TinyUSFM
+_target_: model.tinyusfm_seg.SegmentationModel
+num_classes: ${data.num_classes}
+checkpoint: checkpoints/TinyUSFM.pth
+use_alignment: false
+img_size: ${data.img_size}

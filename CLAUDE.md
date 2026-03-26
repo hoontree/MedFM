@@ -323,12 +323,6 @@ SAM uses LoRA (Low-Rank Adaptation) for efficient fine-tuning:
 - Rank parameter (`rank: 4` typically) controls adapter capacity
 - Two variants: encoder-only or encoder+decoder adaptation
 
-### Segmentation Task Types
-
-Configured via `task.type`:
-- `organ`: Organ segmentation (binary or multi-class)
-- `tumor`: Tumor segmentation
-
 ### Dataset Configuration
 
 Datasets configured in `config/data/`:

@@ -4,7 +4,6 @@ Segformer Trainer
 This module provides a trainer for Segformer models.
 """
 
-from pathlib import Path
 from typing import Dict
 import torch
 import torch.nn as nn
@@ -12,16 +11,16 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
-import wandb
 
 from transformers import (
     SegformerForSemanticSegmentation,
     SegformerConfig,
-    SegformerImageProcessor,
 )
 from .base_trainer import BaseTrainer
 from utils.data_processing_seg import SegDatasetProcessor
+from utils.evaluate import Evaluator_seg
 from utils.sam_utils import DiceLoss
+from utils.schedule import WarmupPolyLR
 
 
 class SegformerTrainer(BaseTrainer):
@@ -34,7 +33,6 @@ class SegformerTrainer(BaseTrainer):
         # Segformer-specific attributes
         self.bce_loss = None
         self.dice_loss = None
-        self.image_processor = None
 
     def _create_model(self):
         """Create Segformer model."""
@@ -53,11 +51,6 @@ class SegformerTrainer(BaseTrainer):
 
         self.model = self.model.to(self.device)
 
-        # Setup image processor
-        self.image_processor = SegformerImageProcessor.from_pretrained(
-            "nvidia/segformer-b2-finetuned-ade-512-512"
-        )
-
         # Setup losses
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss(self.cfg.data.num_classes)
@@ -75,50 +68,28 @@ class SegformerTrainer(BaseTrainer):
     def _create_optimizer(self):
         """Create optimizer."""
         base_lr = self.cfg.training.base_lr
-        warmup = self.cfg.training.get("warmup", False)
-        warmup_period = self.cfg.training.get("warmup_period", 250)
-
-        # Adjust learning rate for warmup
-        b_lr = base_lr / warmup_period if warmup else base_lr
 
         self.optimizer = optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=b_lr,
+            lr=base_lr,
             weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
         )
 
-        self.logger.info(f"Optimizer: AdamW, Initial LR: {b_lr}")
+        self.logger.info(f"Optimizer: AdamW, Initial LR: {base_lr}")
 
     def _create_scheduler(self):
-        """Create learning rate scheduler (using manual update in train_epoch)."""
-        # Segformer uses custom polynomial decay scheduler updated in train_epoch
-        pass
-
-    def _update_learning_rate(self, iter_num: int):
-        """Update learning rate with warmup and polynomial decay."""
+        """Create WarmupPolyLR scheduler (step per training iteration)."""
         base_lr = self.cfg.training.base_lr
         warmup = self.cfg.training.get("warmup", False)
-        warmup_period = self.cfg.training.get("warmup_period", 250)
-        max_iterations = self.cfg.training.num_epochs * len(self.train_loader)
-
-        if warmup and iter_num < warmup_period:
-            # Warmup phase
-            lr = base_lr * ((iter_num + 1) / warmup_period)
-        else:
-            # Polynomial decay phase
-            if warmup:
-                shift_iter = iter_num - warmup_period
-                shift_iter = max(0, shift_iter)
-            else:
-                shift_iter = iter_num
-
-            current_iter = min(shift_iter, max_iterations)
-            lr = base_lr * (1.0 - current_iter / max_iterations) ** 0.9
-
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
-
-        return lr
+        warmup_iters = self.cfg.training.get("warmup_period", 250) if warmup else 0
+        total_iters = self.cfg.training.num_epochs * len(self.train_loader)
+        self.scheduler = WarmupPolyLR(
+            self.optimizer,
+            warmup_epochs=warmup_iters,
+            num_epochs=total_iters,
+            base_lr=base_lr,
+            power=0.9,
+        )
 
     def _calc_loss(self, outputs, label_batch):
         """Calculate loss using unified channel-based approach."""
@@ -184,7 +155,8 @@ class SegformerTrainer(BaseTrainer):
             self.optimizer.step()
 
             # Update learning rate
-            lr = self._update_learning_rate(self.global_step)
+            self.scheduler.step()
+            lr = self.scheduler.get_last_lr()[0]
 
             # Update metrics
             total_loss += loss.item()
@@ -310,9 +282,9 @@ class SegformerTrainer(BaseTrainer):
                         hausdorff = 0
                     else:
                         hausdorff = 224
-                    iou = self._compute_jaccard(pred_np, gt_np)
+                    iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
                     sens = recall(pred_np, gt_np)
-                    spec = self._compute_specificity(pred_np, gt_np)
+                    spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
                     pixel_acc = (pred_np == gt_np).sum() / gt_np.size
 
                     dice_list.append(dice)
@@ -408,7 +380,7 @@ class SegformerTrainer(BaseTrainer):
                         else:
                             tp = np.logical_and(pred_class, gt_class).sum()
                             dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
-                            iou = self._compute_jaccard(pred_class, gt_class)
+                            iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
                             fn = np.logical_and(~pred_class, gt_class).sum()
                             if (tp + fn) > 0:
                                 sensitivity = tp / (tp + fn + 1e-8)
@@ -471,22 +443,6 @@ class SegformerTrainer(BaseTrainer):
         )
 
         return metrics
-
-    @staticmethod
-    def _compute_specificity(pred: np.ndarray, gt: np.ndarray) -> float:
-        """Compute specificity metric."""
-        tn = np.logical_and(pred == 0, gt == 0).sum()
-        fp = np.logical_and(pred == 1, gt == 0).sum()
-        return tn / (tn + fp + 1e-8)
-
-    @staticmethod
-    def _compute_jaccard(pred, gt):
-        """Compute Jaccard/IoU metric."""
-        intersection = np.logical_and(pred, gt).sum()
-        union = np.logical_or(pred, gt).sum()
-        if union == 0:
-            return 1.0 if intersection == 0 else 0.0
-        return intersection / union
 
     def _get_model_type(self) -> str:
         """SegFormer model type for visualization inference."""

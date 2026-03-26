@@ -5,12 +5,12 @@ training:
   num_epochs: 1000
   lr: 0.0001           # Learning rate for student
   warmup_epochs: 5
-  batch_size: 8
+  batch_size: 16
   num_workers: 8
   limit_train_batches: null
   early_stopping:
     enabled: true
-    patience: 30
+    patience: 10
     min_delta: 1e-6
 
 # Optimizer configuration
@@ -23,10 +23,6 @@ optimizer:
 scheduler:
   _target_: utils.schedule.CosineAnnealingWarmupLR
   warmup_epochs: ${training.warmup_epochs}
-  max_epochs: ${training.num_epochs}
+  num_epochs: ${training.num_epochs}
   base_lr: ${training.lr}
   min_lr: 1e-6
-
-# Distillation dataset split configuration
-distillation:
-  enabled: true

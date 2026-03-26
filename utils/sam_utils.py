@@ -4,10 +4,7 @@ from medpy import metric
 from scipy.ndimage import zoom
 import torch.nn as nn
 import SimpleITK as sitk
-import torch.nn.functional as F
-import imageio
 from einops import repeat
-from icecream import ic
 
 
 class DiceLoss(nn.Module):
@@ -123,16 +120,6 @@ def test_single_volume(
                 else:
                     pred = out
                 prediction[ind] = pred
-        # only for debug
-        # if not os.path.exists('/output/images/pred'):
-        #     os.makedirs('/output/images/pred')
-        # if not os.path.exists('/output/images/label'):
-        #     os.makedirs('/output/images/label')
-        # assert prediction.shape[0] == label.shape[0]
-        # for i in range(label.shape[0]):
-        #     imageio.imwrite(f'/output/images/pred/pred_{i}.png', prediction[i])
-        #     imageio.imwrite(f'/output/images/label/label_{i}.png', label[i])
-        # temp = input('kkpsa')
     else:
         x, y = image.shape[-2:]
         if x != patch_size[0] or y != patch_size[1]:

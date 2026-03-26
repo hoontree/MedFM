@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - train
+  - _self_
+
+mode: test
+test_only:
+  enabled: true
+  checkpoint_path: null # Command line에서 지정 권장

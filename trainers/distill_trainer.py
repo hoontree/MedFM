@@ -6,7 +6,7 @@ import torch.optim as optim
 import wandb
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
@@ -19,10 +19,10 @@ from utils.distill_utils import (
     get_dataset_short_name,
     create_log_dir,
     save_experiment_summary,
-    visualize_distillation,
 )
+from utils.visualize import visualize_distillation, visualize_distillation_precomputed
 from utils.utils import set_seed
-from trainers.base_trainer import EarlyStopping
+from trainers.base_trainer import BaseTrainer, EarlyStopping
 from omegaconf import OmegaConf, DictConfig
 
 
@@ -37,27 +37,25 @@ class DistillTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         set_seed(cfg.hardware.seed)
 
-        # Setup directories
-        self.log_dir = create_log_dir(cfg)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.ckpt_dir = self.log_dir / "checkpoints"
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.vis_dir = self.log_dir / "visualizations"
-        self.vis_dir.mkdir(parents=True, exist_ok=True)
+        from utils.distill_utils import resolve_teacher_checkpoint
+
+        self.teacher_ckpt = resolve_teacher_checkpoint(self.cfg)
+        if self.teacher_ckpt:
+            self.cfg.teacher.checkpoint = self.teacher_ckpt
+
+        self._setup_directories()
 
         # Save experiment summary
-        save_experiment_summary(cfg, self.log_dir)
+        save_experiment_summary(cfg, self.exp_dir)
 
-        # Setup logger
-        self.logger = setup_logger(
-            str(self.log_dir / "distill.log"), logger_name="medfm.distill"
-        )
+        self._setup_logger()
 
         # In pipeline mode, also append distillation logs to the teacher's log directory
         pipeline_cfg = cfg.get("pipeline", {})
         teacher_log_dir = pipeline_cfg.get("teacher_log_dir", None)
         if teacher_log_dir:
             import logging as _logging
+
             pipeline_log_path = Path(teacher_log_dir) / "pipeline.log"
             pipeline_handler = _logging.FileHandler(
                 str(pipeline_log_path), mode="a", encoding="utf-8"
@@ -76,7 +74,7 @@ class DistillTrainer:
             f"Teacher: {self.teacher_short} -> Student: {self.student_short}"
         )
         self.logger.info(f"Dataset: {self.dataset_name}")
-        self.logger.info(f"Log directory: {self.log_dir}")
+        self.logger.info(f"Experiment directory: {self.exp_dir}")
 
         # Initialize wandb — reuse the teacher run when running inside a pipeline
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
@@ -118,10 +116,40 @@ class DistillTrainer:
         self._setup_optimizer()
 
         self.evaluator = Evaluator_seg()
+        # Best-metric tracking (Dice / IoU / BIoU / HD95)
         self.best_dice = 0.0
-        self.best_model_path = None
+        self.best_iou = 0.0
+        self.best_biou = 0.0
+        self.best_hd95 = float("inf")
+        self.best_model_path = None  # best-Dice checkpoint (used for final eval)
+        self.best_iou_path = None
+        self.best_biou_path = None
+        self.best_hd95_path = None
         self.global_step = 0
         self.final_metrics: Dict[str, float] = {}
+
+    def _setup_logger(self):
+        """Setup logger."""
+        log_file = self.exp_dir / "distill.log"
+        self.logger = setup_logger(str(log_file), logger_name="medfm.distill")
+
+    def _setup_directories(self):
+        """Setup experiment directories using the standardized create_log_dir structure."""
+        self.exp_dir = create_log_dir(self.cfg)
+        self.exp_dir.mkdir(parents=True, exist_ok=True)
+
+        self.ckpt_dir = self.exp_dir / "checkpoints"
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.vis_dir = self.exp_dir / "visualizations"
+        self.vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # log_dir is the same as exp_dir for distillation runs
+        self.log_dir = self.exp_dir
+
+        # Save config (after potential teacher cfg sync so it reflects merged state)
+        config_file = self.exp_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            OmegaConf.save(self.cfg, f)
 
     def _wandb_log(self, data: dict) -> None:
         """Log metrics to wandb, applying pipeline prefix when sharing a run."""
@@ -144,7 +172,52 @@ class DistillTrainer:
             SegDatasetProcessor.build_data_loaders(self.cfg)
         )
 
+    @staticmethod
+    def _is_sam_model(model) -> bool:
+        """Return True if *model* is a SAM-based model (LoRA_Sam)."""
+        # Import lazily to avoid circular imports
+        try:
+            from model.sam_hybrid_adapter import LoRA_Sam
+            return isinstance(model, LoRA_Sam)
+        except ImportError:
+            return False
+
+    def _call_teacher(self, images):
+        """Call teacher model with the appropriate forward signature.
+
+        - SAM-based teacher:     forward(images, multimask_output, image_size)
+        - TinyUSFM/other:        forward(images)
+        """
+        if self._is_sam_model(self.teacher):
+            img_size = self.cfg.teacher.get("img_size", self.cfg.data.img_size)
+            return self.teacher(images, False, img_size)
+        else:
+            return self.teacher(images)
+
+    def _call_student(self, images):
+        """Call student model and normalise its output to a dict.
+
+        - TinyUSFM student: forward(images, return_features=True) -> (masks, features)
+        - SAM student:      forward(images, multimask_output, image_size) -> dict
+        """
+        if self._is_sam_model(self.student):
+            img_size = self.cfg.student.get("img_size", self.cfg.data.img_size)
+            raw = self.student(images, False, img_size)
+            # SAM already returns a dict with 'masks' (and optionally 'image_embeddings')
+            if isinstance(raw, dict):
+                return raw
+            # Shouldn't happen, but handle gracefully
+            return {"masks": raw}
+        else:
+            raw = self.student(images, return_features=True)
+            if isinstance(raw, (list, tuple)):
+                return {"masks": raw[0], "features": raw[1]}
+            return {"masks": raw}
+
     def _setup_models(self):
+        if self.teacher_ckpt:
+            self.logger.info(f"Using teacher checkpoint: {self.teacher_ckpt}")
+
         self.teacher = instantiate(self.cfg.teacher)
         self.teacher = self.teacher.to(self.device)
         self.teacher.eval()
@@ -154,10 +227,13 @@ class DistillTrainer:
         OmegaConf.set_struct(self.cfg.student, False)
         OmegaConf.set_struct(self.cfg.method, False)
 
-        if self.teacher.use_alignment:
+        teacher_uses_alignment = getattr(self.teacher, "use_alignment", False)
+
+        if teacher_uses_alignment:
             t_align_channels = getattr(self.teacher, "alignment_hidden_channels", 256)
             self.logger.info(
-                f"Teacher uses alignment layer with {t_align_channels} channels. Enabling student alignment."
+                f"Teacher uses alignment layer with {t_align_channels} channels. "
+                "Enabling student alignment."
             )
             self.cfg.student.use_alignment = True
             self.cfg.student.alignment_out_channels = t_align_channels
@@ -175,11 +251,11 @@ class DistillTrainer:
                 self.cfg.method.gamma_align = 1.0
         else:
             self.logger.info(
-                "Teacher does not use alignment layer. Disabling student alignment layer."
+                "Teacher does not use alignment layer. Disabling student alignment layer and align_loss."
             )
             self.cfg.student.use_alignment = False
-            # If no alignment, student_channels should be the output of the neck (48 for TinyUSFM)
-            # Default to 48 if not specified.
+            self.cfg.method.gamma_align = 0.0
+
             if "student_channels" not in self.cfg.student:
                 self.cfg.student.student_channels = 48
 
@@ -190,6 +266,27 @@ class DistillTrainer:
         # Create distiller
         self.distiller = create_distiller(self.cfg).to(self.device)
         self.distiller.prepare(self.student, self.teacher)
+
+        # Log parameter counts
+        self._log_model_info()
+
+    def _log_model_info(self):
+        """Log teacher/student parameter counts to logger and wandb summary."""
+        t_total = sum(p.numel() for p in self.teacher.parameters())
+        s_total = sum(p.numel() for p in self.student.parameters())
+        s_trainable = sum(
+            p.numel() for p in self.student.parameters() if p.requires_grad
+        )
+        self.logger.info(f"Teacher total parameters: {t_total:,}")
+        self.logger.info(f"Student total parameters: {s_total:,}")
+        self.logger.info(f"Student trainable parameters: {s_trainable:,}")
+        self._wandb_summary_update(
+            {
+                "model/teacher_total_params": t_total,
+                "model/student_total_params": s_total,
+                "model/student_trainable_params": s_trainable,
+            }
+        )
 
     def _setup_optimizer(self):
         param_groups = [
@@ -217,7 +314,9 @@ class DistillTrainer:
         self.distiller.train()
 
         running_losses = {}
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}")
+        pbar = tqdm(
+            self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
+        )
         limit_batches = self.cfg.training.get("limit_train_batches")
 
         for i, (images, masks, *_) in enumerate(pbar):
@@ -229,13 +328,9 @@ class DistillTrainer:
             self.distiller.on_step_begin()
 
             with torch.no_grad():
-                teacher_outputs = self.teacher(
-                    images, False, self.cfg.teacher.img_size
-                )
+                teacher_outputs = self._call_teacher(images)
 
-            student_raw = self.student(images, return_features=True)
-            
-            student_outputs = {"masks": student_raw[0], "features": student_raw[1]}
+            student_outputs = self._call_student(images)
 
             loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
             loss = loss_dict["loss"]
@@ -278,49 +373,169 @@ class DistillTrainer:
     def test(self, phase="test"):
         self.student.eval()
         all_metrics = {}
+        predictions_cache = {}
         if isinstance(self.test_loader, dict):
             for ds_name, loader in self.test_loader.items():
-                metrics = self.evaluator.evaluate_model(
-                    self.student, loader, self.device, self.cfg.data.num_classes
+                result = self.evaluator.evaluate_model(
+                    self.student, loader, self.device, self.cfg.data.num_classes,
+                    return_predictions=True,
                 )
+                metrics, images_list, preds_list, masks_list, fnames_list = result
                 self.logger.info(f"--- {phase} ({ds_name}) ---")
                 self.evaluator.print_metrics(metrics, phase=f"{phase}_{ds_name}")
                 for k, v in self._numeric_items(metrics).items():
                     all_metrics[f"{ds_name}/{k}"] = v
+                predictions_cache[ds_name] = (images_list, preds_list, masks_list, fnames_list)
         else:
-            metrics = self.evaluator.evaluate_model(
-                self.student, self.test_loader, self.device, self.cfg.data.num_classes
+            result = self.evaluator.evaluate_model(
+                self.student, self.test_loader, self.device, self.cfg.data.num_classes,
+                return_predictions=True,
             )
+            metrics, images_list, preds_list, masks_list, fnames_list = result
             self.logger.info(f"--- {phase} ---")
             self.evaluator.print_metrics(metrics, phase=phase)
             all_metrics.update(self._numeric_items(metrics))
+            predictions_cache["test"] = (images_list, preds_list, masks_list, fnames_list)
+
+        if phase == "final_test":
+            self._save_per_sample_output(predictions_cache)
+            return all_metrics, predictions_cache
+
         return all_metrics
 
-    def _save_checkpoint(self, epoch, val_dice):
-        if val_dice > self.best_dice:
-            # Delete previous best
+    def _save_per_sample_output(self, predictions_cache: dict) -> None:
+        """Save per-sample student visualisations and metrics CSV.
+
+        Creates:
+          - ``<exp_dir>/visualizations/per_sample/<dataset>/`` with one PNG per sample
+          - ``<exp_dir>/test_results/metrics_<dataset>.csv`` with per-sample metrics
+          - ``<exp_dir>/test_results/metrics_all.csv`` (combined, when > 1 dataset)
+        """
+        import pandas as pd
+        from utils.visualize import visualize_precomputed_predictions
+        from utils.evaluate import Evaluator_seg
+
+        out_dir = self.exp_dir / "test_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_dfs = []
+        for ds_name, (images_list, preds_list, masks_list, fnames_list) in predictions_cache.items():
+            vis_dir = self.vis_dir / "per_sample" / ds_name
+            visualize_precomputed_predictions(
+                images_list,
+                preds_list,
+                masks_list,
+                num_classes=self.cfg.data.num_classes,
+                save_dir=vis_dir,
+                filenames_list=fnames_list,
+            )
+
+            df = Evaluator_seg.build_per_sample_df(
+                preds_list,
+                masks_list,
+                fnames_list,
+                num_classes=self.cfg.data.num_classes,
+            )
+            df.insert(0, "dataset", ds_name)
+            csv_path = out_dir / f"metrics_{ds_name}.csv"
+            df.to_csv(csv_path, index=False, float_format="%.6f")
+            self.logger.info(f"Per-sample metrics saved → {csv_path}")
+            all_dfs.append(df)
+
+        if len(all_dfs) > 1:
+            combined_path = out_dir / "metrics_all.csv"
+            pd.concat(all_dfs, ignore_index=True).to_csv(
+                combined_path, index=False, float_format="%.6f"
+            )
+            self.logger.info(f"Combined per-sample metrics saved → {combined_path}")
+
+    def _save_distill_model(self, path: Path, epoch: int, metrics: dict):
+        """Save student + distiller state dict to path."""
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": self.student.state_dict(),
+                "distiller_state_dict": self.distiller.state_dict(),
+                **{k: v for k, v in metrics.items() if isinstance(v, (float, int))},
+            },
+            path,
+        )
+
+    def _save_checkpoint(self, epoch: int, val_metrics: dict):
+        """Save best checkpoints for Dice, IoU, and HD95."""
+        dice = val_metrics.get("Dice", val_metrics.get("dice", 0.0))
+        biou = val_metrics.get("BIoU", val_metrics.get("biou", 0.0))
+        iou = val_metrics.get("IoU", val_metrics.get("iou", 0.0))
+        hd95 = val_metrics.get("HD95", val_metrics.get("hd95", float("inf")))
+
+        # --- Best Dice (primary – used for final evaluation) ---
+        if dice > self.best_dice:
             if self.best_model_path and self.best_model_path.exists():
                 try:
                     self.best_model_path.unlink()
                 except Exception as e:
-                    self.logger.warning(f"Could not delete old best model: {e}")
-
-            self.best_dice = val_dice
+                    self.logger.warning(f"Could not delete old best-Dice model: {e}")
+            self.best_dice = dice
             self.best_model_path = (
-                self.ckpt_dir / f"best_epoch_{epoch+1}_dice{self.best_dice:.4f}.pth"
+                self.ckpt_dir / f"best_epoch_{epoch+1}_dice{dice:.4f}.pth"
             )
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": self.student.state_dict(),
-                    "distiller_state_dict": self.distiller.state_dict(),
-                    "dice": self.best_dice,
-                },
-                self.best_model_path,
+            self._save_distill_model(self.best_model_path, epoch, val_metrics)
+            self.logger.info(f"Saved best-Dice model: {self.best_model_path}")
+            self._wandb_summary_update(
+                {"best_dice": dice, "checkpoint_path": str(self.best_model_path)}
             )
-            self.logger.info(f"Saved best model to {self.best_model_path}")
-            return True
-        return False
+
+        # --- Best IoU ---
+        if iou > self.best_iou:
+            if self.best_iou_path and self.best_iou_path.exists():
+                try:
+                    self.best_iou_path.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Could not delete old best-IoU model: {e}")
+            self.best_iou = iou
+            self.best_iou_path = (
+                self.ckpt_dir / f"best_epoch_{epoch+1}_iou{iou:.4f}.pth"
+            )
+            self._save_distill_model(self.best_iou_path, epoch, val_metrics)
+            self.logger.info(f"Saved best-IoU model: {self.best_iou_path}")
+            self._wandb_summary_update(
+                {"best_iou": iou, "best_iou_checkpoint": str(self.best_iou_path)}
+            )
+        
+        # --- Best BIoU ---
+        biou = val_metrics.get("BIoU", val_metrics.get("biou", 0.0))
+        if biou > self.best_biou:
+            if self.best_biou_path and self.best_biou_path.exists():
+                try:
+                    self.best_biou_path.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Could not delete old best-BIoU model: {e}")
+            self.best_biou = biou
+            self.best_biou_path = (
+                self.ckpt_dir / f"best_epoch_{epoch+1}_biou{biou:.4f}.pth"
+            )
+            self._save_distill_model(self.best_biou_path, epoch, val_metrics)
+            self.logger.info(f"Saved best-BIoU model: {self.best_biou_path}")
+            self._wandb_summary_update(
+                {"best_biou": biou, "best_biou_checkpoint": str(self.best_biou_path)}
+            )
+
+        # --- Best HD95 (lower is better) ---
+        if hd95 < self.best_hd95:
+            if self.best_hd95_path and self.best_hd95_path.exists():
+                try:
+                    self.best_hd95_path.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Could not delete old best-HD95 model: {e}")
+            self.best_hd95 = hd95
+            self.best_hd95_path = (
+                self.ckpt_dir / f"best_epoch_{epoch+1}_hd95{hd95:.4f}.pth"
+            )
+            self._save_distill_model(self.best_hd95_path, epoch, val_metrics)
+            self.logger.info(f"Saved best-HD95 model: {self.best_hd95_path}")
+            self._wandb_summary_update(
+                {"best_hd95": hd95, "best_hd95_checkpoint": str(self.best_hd95_path)}
+            )
 
     @staticmethod
     def _numeric_items(d: dict) -> dict:
@@ -332,13 +547,11 @@ class DistillTrainer:
         num_epochs = self.cfg.training.num_epochs
         self.logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
         self.logger.info(
-            "Train:\n    "
-            + ", ".join(f"{k}: {v:.4f}" for k, v in train_losses.items())
+            "Train:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in train_losses.items())
         )
         val_items = self._numeric_items(val_metrics)
         self.logger.info(
-            "Val:\n    "
-            + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
+            "Val:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
         )
 
         # wandb
@@ -385,14 +598,14 @@ class DistillTrainer:
                     vis_loader,
                     self.device,
                     self.cfg.data.num_classes,
-                    self.cfg.teacher.img_size,
+                    self.cfg.data.img_size,
                     self.vis_dir,
                     num_samples=self.cfg.visualization.num_samples,
                     epoch=epoch,
                 )
 
-            # Checkpointing
-            self._save_checkpoint(epoch, val_metrics["Dice"])
+            # Checkpointing (Dice / IoU / HD95)
+            self._save_checkpoint(epoch, val_metrics)
 
             # Early stopping
             if early_stopping is not None:
@@ -410,7 +623,7 @@ class DistillTrainer:
             "best_model_path": (
                 str(self.best_model_path) if self.best_model_path else None
             ),
-            "log_dir": str(self.log_dir),
+            "exp_dir": str(self.exp_dir),
             "final_metrics": dict(self.final_metrics),
         }
 
@@ -433,20 +646,36 @@ class DistillTrainer:
             self.student.to(self.device)
             self.student.eval()
 
-            test_metrics = self.test(phase="final_test")
+            test_metrics, student_cache = self.test(phase="final_test")
             # Prefix with final_test/ for wandb summary
             self.final_metrics = {f"final_test/{k}": v for k, v in test_metrics.items()}
             self._wandb_summary_update(self.final_metrics)
+            self._wandb_log(self.final_metrics)
+            BaseTrainer._save_latex_metrics_table(self, student_cache)
 
-            visualize_distillation(
-                self.teacher,
-                self.student,
-                self._first_test_loader,
-                self.device,
-                self.cfg.data.num_classes,
-                self.cfg.teacher.img_size,
-                self.vis_dir,
+            # Collect teacher predictions for the first test dataset (no repeated inference)
+            first_ds = next(iter(student_cache))
+            student_images_list, student_preds_list, masks_list, fnames_list = student_cache[first_ds]
+            first_loader = (
+                self._first_test_loader
+                if not isinstance(self.test_loader, dict)
+                else list(self.test_loader.values())[0]
+            )
+            teacher_result = self.evaluator.evaluate_model(
+                self.teacher, first_loader, self.device, self.cfg.data.num_classes,
+                return_predictions=True,
+            )
+            _, teacher_images_list, teacher_preds_list, _, _ = teacher_result
+
+            visualize_distillation_precomputed(
+                student_images_list,
+                teacher_preds_list,
+                student_preds_list,
+                masks_list,
+                num_classes=self.cfg.data.num_classes,
+                save_dir=self.vis_dir,
                 num_samples=self.cfg.visualization.num_samples,
+                filenames_list=fnames_list,
                 epoch=None,
             )
         else:
@@ -458,8 +687,11 @@ class DistillTrainer:
     def _make_limited_loader(loader, limit_batches, batch_size):
         """Create a small DataLoader subset for dry-run testing."""
         from torch.utils.data import Subset, DataLoader
+
         n = min(len(loader.dataset), limit_batches * batch_size)
-        return DataLoader(Subset(loader.dataset, list(range(n))), batch_size=batch_size, num_workers=0)
+        return DataLoader(
+            Subset(loader.dataset, list(range(n))), batch_size=batch_size, num_workers=0
+        )
 
     def dry_run(self):
         """Perform a quick end-to-end test of the training pipeline."""
@@ -498,7 +730,9 @@ class DistillTrainer:
             self.logger.info("Testing evaluation step...")
             self.evaluator.evaluate_model(
                 self.student,
-                self._make_limited_loader(self._first_test_loader, limit_batches, batch_size),
+                self._make_limited_loader(
+                    self._first_test_loader, limit_batches, batch_size
+                ),
                 self.device,
                 self.cfg.data.num_classes,
             )

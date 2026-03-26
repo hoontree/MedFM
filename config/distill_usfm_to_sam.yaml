@@ -1,8 +1,8 @@
 # Knowledge Distillation Configuration
 defaults:
   - data: dynamic
-  - teacher: sam
-  - student: tinyusfm
+  - teacher: tinyusfm
+  - student: sam
   - method: unified
   - training: distillation
   - log: wandb

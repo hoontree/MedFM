@@ -1,0 +1,33 @@
+# Inference / evaluation-only configuration.
+#
+# Usage:
+#   # TinyUSFM on BUID test set
+#   python infer.py model=tinyusfm data.test='[BUID]' \
+#       infer.checkpoint=/path/to/best_epoch_N_dice_X.pth
+#
+#   # SAM on BUID + BUS_UCLM
+#   python infer.py model=sam data.test='[BUID,BUS_UCLM]' \
+#       infer.checkpoint=/path/to/lora.pth
+#
+#   # Custom output directory
+#   python infer.py model=sam data.test='[BUID]' \
+#       infer.checkpoint=... infer.output_dir=results/my_eval
+
+defaults:
+  - _self_
+  - data: dynamic    # provides img_size: 224; test: [BUID, BUS_UCLM] by default
+  - model: tinyusfm  # override with model=sam
+
+hardware:
+  gpu_ids: [0]
+  seed: 42
+
+infer:
+  checkpoint: null         # REQUIRED: path to checkpoint file
+  output_dir: logs/infer/${now:%Y-%m-%d_%H-%M-%S}
+  threshold: 0.5           # Decision threshold (binary segmentation only)
+
+# Override DataLoader settings for inference
+training:
+  batch_size: 16
+  num_workers: 4

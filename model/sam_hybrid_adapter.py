@@ -217,13 +217,27 @@ class LoRA_Sam(nn.Module):
         # Alignment layer configuration
         self.alignment_num_blocks = alignment_num_blocks
 
+        # checkpoint가 finetuned ckpt이면 pretrained_ckpt=None을 넘겨 pretrained 로딩을
+        # 건너뛴다. SAM 공식 pretrained ckpt이거나 checkpoint가 없으면 그대로 전달한다.
+        _is_finetuned = checkpoint is not None and "sam_vit_" not in str(checkpoint)
+        pretrained_ckpt = None if _is_finetuned else checkpoint
+
         # 1. Build base SAM model first
-        sam_model = sam_model_registry[sam_type](
-            image_size=img_size,
-            num_classes=num_classes,
-            pixel_mean=pixel_mean,
-            pixel_std=pixel_std,
-        )
+        kwargs = {
+            "image_size": img_size,
+            "num_classes": num_classes,
+            "pixel_mean": pixel_mean,
+            "pixel_std": pixel_std,
+        }
+        if pretrained_ckpt is not None:
+            kwargs["checkpoint"] = pretrained_ckpt
+            
+        sam_model = sam_model_registry[sam_type](**kwargs)
+        
+        if pretrained_ckpt is not None:
+            LOGGER.info("[LoRA_Sam] Loaded SAM pretrained weights from %s", pretrained_ckpt)
+        elif not _is_finetuned:
+            LOGGER.info("[LoRA_Sam] Loaded SAM with default pretrained weights")
 
         # Setup lora layers for encoder
         self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))
@@ -259,8 +273,8 @@ class LoRA_Sam(nn.Module):
         # Log trainable parameters
         self._log_trainable_params()
 
-        # Finally load LoRA/finetuned checkpoints if provided
-        if checkpoint is not None and "sam_vit_" not in str(checkpoint):
+        # Load finetuned/LoRA checkpoint (exactly once, pretrained already skipped above)
+        if _is_finetuned:
             self.load_checkpoint(checkpoint)
             LOGGER.info(
                 "[LoRA_Sam] Loaded fine-tuned/LoRA checkpoint from %s", checkpoint
@@ -590,8 +604,17 @@ class LoRA_Sam(nn.Module):
         for key, value in state_dict.items():
             if "prompt_encoder" in key:
                 merged_dict[key] = value
-            if "mask_decoder" in key and "transformer" not in key:
-                merged_dict[key] = value
+            if "mask_decoder" in key:
+                if self.decoder_mode == "ft":
+                    merged_dict[key] = value
+                elif "transformer" not in key:
+                    merged_dict[key] = value
+
+        # Save full image encoder if in full fine-tune mode
+        if self.encoder_mode == "ft":
+            for key, value in state_dict.items():
+                if "image_encoder" in key:
+                    merged_dict[key] = value
 
         torch.save(merged_dict, filename)
 
@@ -694,10 +717,14 @@ class LoRA_Sam(nn.Module):
             if k in state_dict:
                 sam_dict[k] = state_dict[k]
 
-        mask_decoder_keys = [
-            k for k in sam_keys if "mask_decoder" in k and "transformer" not in k
-        ]
+        mask_decoder_keys = [k for k in sam_keys if "mask_decoder" in k]
         for k in mask_decoder_keys:
+            if k in state_dict:
+                sam_dict[k] = state_dict[k]
+
+        # Load image encoder if present (for 'ft' mode)
+        image_encoder_keys = [k for k in sam_keys if "image_encoder" in k]
+        for k in image_encoder_keys:
             if k in state_dict:
                 sam_dict[k] = state_dict[k]
 
