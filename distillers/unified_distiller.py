@@ -1,10 +1,11 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from scipy.ndimage import distance_transform_edt
 from typing import Dict, Any, List, Optional
 from distillers.base_distiller import BaseDistiller
+
+logger = logging.getLogger(__name__)
 
 
 from utils.sam_utils import DiceLoss
@@ -32,38 +33,17 @@ class UnifiedDistiller(BaseDistiller):
     1. Task Loss (GT Dice/CE) - alpha
     2. Logit Distillation (KL Div) - beta
     3. Feature Distillation (MSE on intermediate layers) - gamma
-    4. Attention Map Distillation (MSE) - gamma_attn
-    5. Alignment Layer Distillation (MSE on specific SAM output) - gamma_align
     """
 
     LOSS_WEIGHT_MAP = {
         "task_loss": "alpha",
         "distill_loss": "beta",
         "feature_loss": "gamma",
-        "attn_loss": "gamma_attn",
-        "align_loss": "gamma_align",
-        "boundary_loss": "lambda_boundary",
-        "shape_loss": "lambda_shape",
-        "uncertainty_loss": "lambda_uncertainty",
     }
 
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg)
         self.num_classes = cfg.data.num_classes
-
-        # Hyperparameters
-        self.gamma = cfg.method.get("gamma", 0.0)
-        self.gamma_align = cfg.method.get(
-            "gamma_align", 0.0
-        )  # alignment layer distillation (0 when teacher has no alignment)
-        self.gamma_attn = cfg.method.get(
-            "gamma_attn", 1.0
-        )  # attention map distillation
-
-        # Advanced KD Coefficients
-        self.lambda_boundary = cfg.method.get("lambda_boundary", 0.0)
-        self.lambda_shape = cfg.method.get("lambda_shape", 0.0)
-        self.lambda_uncertainty = cfg.method.get("lambda_uncertainty", 0.0)
 
         # GradNorm settings
         self.use_gradnorm = cfg.method.get("use_gradnorm", False)
@@ -76,15 +56,6 @@ class UnifiedDistiller(BaseDistiller):
                 "alpha": nn.Parameter(torch.tensor(float(self.alpha))),
                 "beta": nn.Parameter(torch.tensor(float(self.beta))),
                 "gamma": nn.Parameter(torch.tensor(float(self.gamma))),
-                "gamma_attn": nn.Parameter(torch.tensor(float(self.gamma_attn))),
-                "gamma_align": nn.Parameter(torch.tensor(float(self.gamma_align))),
-                "lambda_boundary": nn.Parameter(
-                    torch.tensor(float(self.lambda_boundary))
-                ),
-                "lambda_shape": nn.Parameter(torch.tensor(float(self.lambda_shape))),
-                "lambda_uncertainty": nn.Parameter(
-                    torch.tensor(float(self.lambda_uncertainty))
-                ),
             }
         )
         for p in self.loss_weights.values():
@@ -92,25 +63,15 @@ class UnifiedDistiller(BaseDistiller):
                 False  # Weights are updated via GradNorm, not optimizer directly
             )
 
-        # Fixed Sobel filters for Boundary KD
-        self.register_buffer(
-            "sobel_x",
-            torch.tensor(
-                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
-            ).view(1, 1, 3, 3),
-        )
-        self.register_buffer(
-            "sobel_y",
-            torch.tensor(
-                [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
-            ).view(1, 1, 3, 3),
-        )
-
         # Task Loss components
         self.use_dice = cfg.method.get("use_dice", True)
         self.use_ce = cfg.method.get("use_ce", True)
 
-        self.task_criterion = nn.BCEWithLogitsLoss()
+        if self.num_classes == 1:
+            self.register_buffer("pos_weight", torch.tensor([5.0]))
+            self.task_criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        else:
+            self.task_criterion = nn.CrossEntropyLoss()
 
         self.dice_loss = DiceLoss(self.num_classes)
         self.kl_div = nn.KLDivLoss(reduction="batchmean")
@@ -127,36 +88,15 @@ class UnifiedDistiller(BaseDistiller):
             if s_ch != t_ch:
                 self.adapters[s_layer.replace(".", "_")] = FeatureAdapter(s_ch, t_ch)
 
-        # Single feature align projection (for general features vs image_embeddings)
-        self.align_proj = None
-        if self.gamma_align > 0:
-            # Use student_channels from student config if available, fallback to method config
-            s_channels = getattr(cfg.student, "student_channels", 256)
-            t_channels = cfg.method.get("teacher_alignment_channels", 256)
-
-            if s_channels != t_channels:
-                print(
-                    f"[UnifiedDistiller] Creating align_proj: {s_channels} -> {t_channels}"
-                )
-                self.align_proj = nn.Conv2d(s_channels, t_channels, kernel_size=1)
-            else:
-                print(
-                    f"[UnifiedDistiller] Skipping align_proj as dimensions match ({s_channels} == {t_channels})"
-                )
-
         # Extractor placeholders
         self.teacher_extractor: Optional[FeatureExtractor] = None
         self.student_extractor: Optional[FeatureExtractor] = None
-        self.teacher_attn_hooks = []
-        self.student_attn_hooks = []
-        self.teacher_attn_maps = []
-        self.student_attn_maps = []
 
         # GradNorm reference parameters
         self.theta_ref = None
 
     def prepare(self, student: nn.Module, teacher: nn.Module):
-        """Setup hooks for feature and attention extraction."""
+        """Setup hooks for feature extraction."""
         # 1. Intermediate Feature Extraction
         t_layers = list(self.layer_mapping.values())
         s_layers = list(self.layer_mapping.keys())
@@ -166,17 +106,13 @@ class UnifiedDistiller(BaseDistiller):
         if s_layers:
             self.student_extractor = FeatureExtractor(student, s_layers)
 
-        # 2. Attention Map Extraction (for SAM-like models)
-        if self.gamma_attn > 0:
-            self._setup_attn_hooks(student, teacher)
-
-        # 3. GradNorm reference parameters
+        # 2. GradNorm reference parameters
         if self.use_gradnorm:
             for name, module in student.named_modules():
                 if name == self.theta_ref_name:
                     # Use all parameters in the module as reference
                     self.theta_ref = list(module.parameters())
-                    print(
+                    logger.info(
                         f"[UnifiedDistiller] GradNorm reference module: {name} ({len(self.theta_ref)} parameters)"
                     )
                     break
@@ -186,100 +122,21 @@ class UnifiedDistiller(BaseDistiller):
                     p for n, p in student.named_parameters() if self.theta_ref_name in n
                 ]
                 if self.theta_ref:
-                    print(
+                    logger.info(
                         f"[UnifiedDistiller] GradNorm reference parameters found by name pattern: {self.theta_ref_name} ({len(self.theta_ref)} parameters)"
                     )
                 else:
-                    print(
-                        f"Warning: GradNorm reference layer '{self.theta_ref_name}' not found in student. GradNorm will be disabled."
+                    logger.warning(
+                        f"GradNorm reference layer '{self.theta_ref_name}' not found in student. GradNorm will be disabled."
                     )
                     self.use_gradnorm = False
 
-    def _get_sobel_edge(self, p):
-        """Compute edge map using Sobel filters."""
-        B, C, H, W = p.shape
-        p_flat = p.view(B * C, 1, H, W)
-        edge_x = F.conv2d(p_flat, self.sobel_x, padding=1)
-        edge_y = F.conv2d(p_flat, self.sobel_y, padding=1)
-        edge = torch.sqrt(edge_x**2 + edge_y**2 + 1e-6)
-        return edge.view(B, C, H, W)
-
-    def _get_entropy(self, p):
-        """Compute entropy map."""
-        if self.num_classes == 1:
-            # Binary entropy (p: probability [B, 1, H, W])
-            entropy = -p * torch.log(p + 1e-6) - (1 - p) * torch.log(1 - p + 1e-6)
-            return entropy
-        else:
-            # Multi-class entropy (p: probability [B, C, H, W])
-            return -torch.sum(p * torch.log(p + 1e-6), dim=1, keepdim=True)
-
-    def _get_sdt(self, p):
-        """Compute Signed Distance Transform (SDT) map.
-        Note: This is non-differentiable if computed with EDT,
-        but we can use the teacher's SDT as a target.
-        """
-        device = p.device
-        mask = (p > 0.5).cpu().numpy()
-        sdt_maps = []
-        for i in range(mask.shape[0]):  # Batch
-            batch_sdt = []
-            for j in range(mask.shape[1]):  # Channel
-                m = mask[i, j]
-                pos_dist = distance_transform_edt(m)
-                neg_dist = distance_transform_edt(1 - m)
-                sdt = pos_dist - neg_dist
-                batch_sdt.append(sdt)
-            sdt_maps.append(np.stack(batch_sdt))
-
-        sdt_tensor = torch.from_numpy(np.stack(sdt_maps)).float().to(device)
-        return sdt_tensor
-
-    def _setup_attn_hooks(self, student, teacher):
-        """Setup hooks to capture attention maps."""
-
-        def get_attn_hook(target_list):
-            def hook(module, input, output):
-                if hasattr(module, "last_attn"):
-                    target_list.append(module.last_attn)
-
-            return hook
-
-        # Teacher attention hooks (SAM image encoder)
-        t_model = teacher.module if hasattr(teacher, "module") else teacher
-        image_encoder = getattr(t_model, "image_encoder", None)
-        if hasattr(t_model, "sam") and hasattr(t_model.sam, "image_encoder"):
-            image_encoder = t_model.sam.image_encoder
-
-        if image_encoder and hasattr(image_encoder, "blocks"):
-            for blk in image_encoder.blocks:
-                if hasattr(blk, "attn"):
-                    self.teacher_attn_hooks.append(
-                        blk.attn.register_forward_hook(
-                            get_attn_hook(self.teacher_attn_maps)
-                        )
-                    )
-
-        # Student attention hooks
-        s_model = student.module if hasattr(student, "module") else student
-        backbone = getattr(s_model, "backbone", s_model)
-        if hasattr(backbone, "blocks"):
-            for blk in backbone.blocks:
-                if hasattr(blk, "attn"):
-                    self.student_attn_hooks.append(
-                        blk.attn.register_forward_hook(
-                            get_attn_hook(self.student_attn_maps)
-                        )
-                    )
-
     def on_step_begin(self):
-        """Clear extracted features and attention maps."""
+        """Clear extracted features."""
         if self.teacher_extractor:
             self.teacher_extractor.clear()
         if self.student_extractor:
             self.student_extractor.clear()
-        self.teacher_attn_maps.clear()
-        self.student_attn_maps.clear()
 
     def _zero(self, device):
         """Return a zero scalar tensor on the given device."""
@@ -293,9 +150,14 @@ class UnifiedDistiller(BaseDistiller):
         target_mask = targets.float()
         losses = []
         if self.use_ce:
-            losses.append(self.task_criterion(student_logits, target_mask))
+            if self.num_classes == 1:
+                losses.append(self.task_criterion(student_logits, target_mask))
+            else:
+                target_idx = targets.argmax(dim=1).long()
+                losses.append(self.task_criterion(student_logits, target_idx))
         if self.use_dice:
-            losses.append(self.dice_loss(student_logits, target_mask))
+            use_softmax = self.num_classes > 1
+            losses.append(self.dice_loss(student_logits, target_mask, softmax=use_softmax, sigmoid=not use_softmax))
         return (
             sum(losses) / len(losses) if losses else self._zero(student_logits.device)
         )
@@ -321,9 +183,12 @@ class UnifiedDistiller(BaseDistiller):
             t_soft = F.softmax(teacher_logits / self.temperature, dim=1)
 
         distill_loss = self.kl_div(s_soft, t_soft) * (self.temperature**2)
-        distill_loss = distill_loss / (
-            student_logits.shape[-2] * student_logits.shape[-1]
-        )
+        
+        # PyTorch KLDivLoss with batchmean divides by batch_size, but sums over spatial dimensions.
+        # We need to average over spatial dimensions to match typical segmentation task loss scale.
+        if student_logits.dim() == 4:
+            distill_loss = distill_loss / (student_logits.shape[2] * student_logits.shape[3])
+
         return distill_loss
 
     def _compute_feature_loss(self, device):
@@ -348,8 +213,21 @@ class UnifiedDistiller(BaseDistiller):
                 # Convert student feature from sequence to spatial if needed
                 if s_f.dim() == 3:  # [B, N, C] format
                     B, N, C = s_f.shape
-                    s_f = s_f[:, 1:, :]  # Remove CLS token
-                    H = W = int((N - 1) ** 0.5)
+                    # CLS token 여부에 따라 분기: N이 perfect square이면 CLS 없음
+                    H_sq = int(N ** 0.5)
+                    if H_sq * H_sq == N:
+                        H = W = H_sq
+                    else:
+                        # CLS token이 있는 경우 제거 후 square 여부 재확인
+                        N_no_cls = N - 1
+                        H_sq = int(N_no_cls ** 0.5)
+                        if H_sq * H_sq == N_no_cls:
+                            s_f = s_f[:, 1:, :]  # Remove CLS token
+                            H = W = H_sq
+                            N = N_no_cls
+                        else:
+                            # reshape 불가 — 이 layer는 skip
+                            continue
                     s_f = s_f.transpose(1, 2).reshape(B, C, H, W)
 
                 # Convert teacher feature from SAM format if needed
@@ -375,94 +253,6 @@ class UnifiedDistiller(BaseDistiller):
                 count += 1
 
         return feature_loss / count if count > 0 else feature_loss
-
-    def _compute_attn_loss(self, device):
-        """Attention Distillation (MSE) - gamma_attn"""
-        if (
-            self.gamma_attn <= 0
-            or not self.teacher_attn_maps
-            or not self.student_attn_maps
-        ):
-            return self._zero(device)
-
-        num_blocks = min(len(self.teacher_attn_maps), len(self.student_attn_maps))
-        attn_loss = self._zero(device)
-        for i in range(num_blocks):
-            t_a = self.teacher_attn_maps[i]
-            s_a = self.student_attn_maps[i]
-
-            if t_a.dim() == 4 and s_a.dim() == 3:
-                B, H, N, _ = t_a.shape
-                t_a = t_a.view(B * H, N, N)
-            elif s_a.dim() == 4 and t_a.dim() == 3:
-                B, H, N, _ = s_a.shape
-                s_a = s_a.view(B * H, N, N)
-
-            if t_a.shape != s_a.shape:
-                t_a = F.interpolate(
-                    t_a.unsqueeze(1),
-                    size=s_a.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(1)
-
-            attn_loss += self.mse_loss(s_a, t_a)
-
-        return attn_loss / num_blocks if num_blocks > 0 else attn_loss
-
-    def _compute_align_loss(self, student_outputs, teacher_outputs, device):
-        """Alignment Layer Distillation (MSE) - gamma_align"""
-        if self.gamma_align <= 0:
-            return self._zero(device)
-
-        s_f = student_outputs.get("features")
-        t_f = teacher_outputs.get("image_embeddings")
-
-        if s_f is not None and t_f is not None:
-            if self.align_proj:
-                s_f = self.align_proj(s_f)
-            if s_f.shape != t_f.shape:
-                s_f = F.interpolate(
-                    s_f, size=t_f.shape[-2:], mode="bilinear", align_corners=False
-                )
-            return self.mse_loss(s_f, t_f)
-        return self._zero(device)
-
-    def _compute_advanced_kd_losses(self, student_logits, teacher_logits):
-        """Compute Boundary, Shape, and Uncertainty KD losses."""
-        device = student_logits.device
-        res = {
-            "boundary": self._zero(device),
-            "shape": self._zero(device),
-            "uncertainty": self._zero(device),
-        }
-
-        if self.num_classes == 1:
-            s_p = torch.sigmoid(student_logits)
-            t_p = torch.sigmoid(teacher_logits)
-        else:
-            s_p = torch.softmax(student_logits, dim=1)
-            t_p = torch.softmax(teacher_logits, dim=1)
-
-        # Boundary KD
-        if self.loss_weights["lambda_boundary"] > 0:
-            s_edge = self._get_sobel_edge(s_p)
-            t_edge = self._get_sobel_edge(t_p)
-            res["boundary"] = F.l1_loss(s_edge, t_edge)
-
-        # Shape KD
-        if self.loss_weights["lambda_shape"] > 0:
-            with torch.no_grad():
-                t_sdt = self._get_sdt(t_p)
-            res["shape"] = F.smooth_l1_loss(student_logits, t_sdt)
-
-        # Uncertainty KD
-        if self.loss_weights["lambda_uncertainty"] > 0:
-            s_unc = self._get_entropy(s_p)
-            t_unc = self._get_entropy(t_p)
-            res["uncertainty"] = F.l1_loss(s_unc, t_unc)
-
-        return res
 
     def forward(
         self,
@@ -496,30 +286,11 @@ class UnifiedDistiller(BaseDistiller):
         # 3. Feature Distillation
         losses["feature_loss"] = self._compute_feature_loss(device)
 
-        # 4. Attention Distillation
-        # losses["attn_loss"] = self._compute_attn_loss(device)
-
-        # 5. Alignment Layer Distillation
-        # losses["align_loss"] = self._compute_align_loss(
-        #     student_outputs, teacher_outputs, device
-        # )
-
-        # 6-8. Advanced KD Losses
-        # adv_losses = self._compute_advanced_kd_losses(student_logits, teacher_logits)
-        # losses["boundary_loss"] = adv_losses["boundary"]
-        # losses["shape_loss"] = adv_losses["shape"]
-        # losses["uncertainty_loss"] = adv_losses["uncertainty"]
-
         # Total Loss (Weighted)
         total_loss = (
             self.loss_weights["alpha"] * losses["task_loss"]
             + self.loss_weights["beta"] * losses["distill_loss"]
             + self.loss_weights["gamma"] * losses["feature_loss"]
-            # + self.loss_weights["gamma_attn"] * losses["attn_loss"]
-            # + self.loss_weights["gamma_align"] * losses["align_loss"]
-            # + self.loss_weights["lambda_boundary"] * losses["boundary_loss"]
-            # + self.loss_weights["lambda_shape"] * losses["shape_loss"]
-            # + self.loss_weights["lambda_uncertainty"] * losses["uncertainty_loss"]
         )
 
         losses["loss"] = total_loss
@@ -551,7 +322,7 @@ class UnifiedDistiller(BaseDistiller):
                 key == "loss"
                 or not isinstance(loss_val, torch.Tensor)
                 or loss_val.numel() == 0
-                or loss_val.item() == 0
+                or abs(loss_val.item()) < 1e-8
             ):
                 continue
 
@@ -621,10 +392,6 @@ class UnifiedDistiller(BaseDistiller):
 
     def __del__(self):
         """Cleanup hooks."""
-        for hook in self.teacher_attn_hooks:
-            hook.remove()
-        for hook in self.student_attn_hooks:
-            hook.remove()
         if self.teacher_extractor:
             self.teacher_extractor.remove()
         if self.student_extractor:

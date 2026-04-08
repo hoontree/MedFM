@@ -243,8 +243,6 @@ def get_experiment_tags(cfg: DictConfig) -> list:
         "alpha": "a",
         "beta": "b",
         "gamma": "g",
-        "gamma_attn": "ga",
-        "gamma_align": "galign",
         "temperature": "T",
     }
     for key, tag in coeff_map.items():
@@ -257,18 +255,14 @@ def get_experiment_tags(cfg: DictConfig) -> list:
 def create_log_dir(cfg: DictConfig) -> Path:
     """Create hierarchical log directory structure with hyperparameter tags.
 
-    Structure: logs/distill/{peft_mode}/{timestamp}_{tags}/
-    where peft_mode mirrors the teacher's training directory (e_{enc}_d_{dec}).
+    Structure: logs/distill/{teacher}_to_{student}/{timestamp}_{tags}/
     """
-    encoder_mode = cfg.teacher.get("encoder_mode", "frozen")
-    decoder_mode = cfg.teacher.get("decoder_mode", "frozen")
-    peft_mode = f"e_{encoder_mode}_d_{decoder_mode}"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tags = get_experiment_tags(cfg)
     tag_suffix = "_" + "_".join(tags) if tags else ""
 
-    return Path(cfg.output.dir) / "distill" / peft_mode / f"{timestamp}{tag_suffix}"
+    return Path(cfg.output.dir) / "distill" / f"{get_teacher_short_name(cfg)}_to_{get_student_short_name(cfg)}" / f"{timestamp}{tag_suffix}"
 
 
 def save_experiment_summary(cfg: DictConfig, log_dir: Path):

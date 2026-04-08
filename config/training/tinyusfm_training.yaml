@@ -6,7 +6,7 @@ training:
   batch_size: 8
   num_epochs: 1000
   warmup_epochs: 5
-  train_head_only: true           # Train only decoder parts
+  train_head_only: false           # Train only decoder parts
   num_workers: 8
   save_interval: 20               # Save checkpoint every N epochs
   limit_train_batches: null       # For debugging purposes, limit number of batches per epoch
@@ -55,5 +55,16 @@ visualization:
 
 # WandB configuration
 wandb:
-  project: medical_foundation_models
+  project: TinyUSFM_Seg
   entity: hheo
+  log_config:
+    model:
+      name: TinyUSFM
+      decoder_type: ${model.decoder_type}
+    training:
+      lr: ${training.lr}
+      batch_size: ${training.batch_size}
+      train_head_only: ${training.train_head_only}
+    data:
+      multiclass: ${data.multiclass}
+  mode: online

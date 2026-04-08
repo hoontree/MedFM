@@ -69,17 +69,19 @@ def denormalize_image(
 
 
 def prepare_mask_for_plot(mask: np.ndarray) -> np.ndarray:
-    """Squeeze a single-channel mask from CHW to HW for plotting.
+    """Convert a mask array to a 2D (HW) index map for plotting.
 
     Args:
-        mask: Mask array, possibly with a leading channel dim of 1.
+        mask: Mask array in (1, H, W), (C, H, W) one-hot, or (H, W) format.
 
     Returns:
-        2D (HW) mask array.
+        2D (HW) mask array with integer class indices.
     """
-    # If mask has shape (1, H, W), squeeze to (H, W) for plotting.
     if mask.ndim == 3 and mask.shape[0] == 1:
         return mask[0]
+    if mask.ndim == 3 and mask.shape[0] > 1:
+        # One-hot or multi-channel logits → argmax to index map
+        return mask.argmax(axis=0).astype(np.float32)
     return mask
 
 
@@ -302,7 +304,8 @@ def _infer_predictions(
         masks_vis = masks
 
     if model_type == "sam":
-        outputs = model(images, False, img_size)
+        multimask_output = num_classes > 1
+        outputs = model(images, multimask_output, img_size)
         logits = outputs.get("masks", outputs.get("low_res_logits"))
         if logits is None:
             logits = list(outputs.values())[0]
@@ -578,18 +581,22 @@ def visualize_distillation(
             filenames = _extract_filenames(batch)
 
             # Teacher inference
-            if hasattr(teacher_model, "image_encoder") or hasattr(
-                teacher_model, "sam"
-            ):
-                teacher_outputs = teacher_model(images, False, teacher_img_size)
+            if hasattr(teacher_model, "image_encoder") or hasattr(teacher_model, "sam"):
+                multimask = num_classes > 1
+                teacher_outputs = teacher_model(images, multimask, teacher_img_size)
             else:
                 teacher_outputs = {"masks": teacher_model(images)}
 
             # Student inference
-            student_raw = student_model(images)
-            student_logits = (
-                student_raw[0] if isinstance(student_raw, tuple) else student_raw
-            )
+            if hasattr(student_model, "image_encoder") or hasattr(student_model, "sam"):
+                multimask = num_classes > 1
+                student_raw = student_model(images, multimask, teacher_img_size)
+                student_logits = student_raw["masks"] if isinstance(student_raw, dict) else student_raw[0]
+            else:
+                student_raw = student_model(images)
+                student_logits = (
+                    student_raw[0] if isinstance(student_raw, tuple) else student_raw
+                )
             teacher_logits = teacher_outputs["masks"]
 
             # Convert logits to predictions
@@ -597,12 +604,8 @@ def visualize_distillation(
                 teacher_preds = (torch.sigmoid(teacher_logits) > 0.5).float()
                 student_preds = (torch.sigmoid(student_logits) > 0.5).float()
             else:
-                teacher_preds = torch.argmax(
-                    torch.softmax(teacher_logits, dim=1), dim=1, keepdim=True
-                )
-                student_preds = torch.argmax(
-                    torch.softmax(student_logits, dim=1), dim=1, keepdim=True
-                )
+                teacher_preds = torch.argmax(teacher_logits, dim=1, keepdim=True).float()
+                student_preds = torch.argmax(student_logits, dim=1, keepdim=True).float()
 
             for i in range(images.size(0)):
                 if sample_count >= num_samples:

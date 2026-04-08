@@ -6,7 +6,7 @@ img_size: ${data.img_size}
 num_classes: ${data.num_classes}
 pixel_mean: [123.675, 116.28, 103.53]
 pixel_std: [58.395, 57.12, 57.375]
-encoder_mode: "frozen"
+encoder_mode: "lora"
 decoder_mode: "lora"
 use_alignment: false
 r_e: 4

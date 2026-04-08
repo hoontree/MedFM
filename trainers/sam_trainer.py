@@ -35,8 +35,9 @@ class SAMTrainer(BaseTrainer):
         self.step_log_interval = 10
 
         self.num_epochs = self.cfg.training.get("num_epochs", 100)
-        self.base_lr = self.cfg.training.get("lr", 1e-4)
+        self.base_lr = float(self.cfg.training.get("lr", 1e-4))
         self.dice_loss_weight = self.cfg.training.get("dice_loss_weight", 0.8)
+        self.moe_loss_weight = float(self.cfg.get("training", {}).get("moe_loss_weight", 0.0))
         self.gradient_clip_max_norm = float(
             self.cfg.optimizer.get("gradient_clip", {}).get("max_norm", 1.0)
         )
@@ -58,24 +59,15 @@ class SAMTrainer(BaseTrainer):
         self.step_log_interval = 10
         self._log_model_configuration()
 
-    def _create_dataloaders(self):
-        """Create data loaders."""
-        self.train_loader, self.val_loader, self.test_loader = (
-            SegDatasetProcessor.build_data_loaders(self.cfg)
-        )
-        self._log_data_sizes()
-
     def _create_optimizer(self):
         """Create optimizer."""
-        base_lr = float(self.cfg.training.get("lr", 1e-4))
-
         self.optimizer = optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=base_lr,
+            lr=self.base_lr,
             weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
         )
 
-        self.logger.info(f"Optimizer: AdamW, Base LR: {base_lr}")
+        self.logger.info(f"Optimizer: AdamW, Base LR: {self.base_lr}")
 
     def _create_scheduler(self):
         """Create learning rate scheduler with warmup and polynomial decay."""
@@ -83,14 +75,12 @@ class SAMTrainer(BaseTrainer):
         warmup_steps = warmup_cfg["steps"]
         warmup_enabled = warmup_cfg["enabled"]
 
-        self.num_epochs = self.cfg.training.get("num_epochs", 100)
         total_iters = self.num_epochs * len(self.train_loader)
         power = float(self.cfg.get("scheduler", {}).get("power", 0.9))
 
         # Minimum learning rate ratio (prevents LR from reaching 0)
-        base_lr = float(self.cfg.training.get("lr", 1e-4))
         min_lr = float(self.cfg.get("scheduler", {}).get("min_lr", 1e-6))
-        min_lr_ratio = min_lr / base_lr
+        min_lr_ratio = min_lr / self.base_lr
 
         def lr_lambda(current_step: int) -> float:
             """Calculate learning rate multiplier for given step."""
@@ -112,7 +102,8 @@ class SAMTrainer(BaseTrainer):
             self.optimizer, lr_lambda=lr_lambda
         )
         self.logger.info(
-            f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, max_iterations={total_iters}, power={power}, min_lr={min_lr}"
+            f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, "
+            f"max_iterations={total_iters}, power={power}, min_lr={min_lr}"
         )
 
     def _get_current_lr(self) -> float:
@@ -147,31 +138,48 @@ class SAMTrainer(BaseTrainer):
 
     def _setup_loss_functions(self):
         """Setup loss functions based on number of classes."""
-        # Setup loss functions
-        self.ce_loss = CrossEntropyLoss()
+        num_classes = self.cfg.data.num_classes
 
-        pos_weight = torch.tensor([5.0], device=self.device)
-        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        if num_classes == 1:
+            pos_weight = torch.tensor([5.0], device=self.device)
+            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            self.ce_loss = CrossEntropyLoss()
 
-        self.dice_loss = DiceLoss(self.cfg.data.num_classes)
+        self.dice_loss = DiceLoss(num_classes)
 
     def _calc_loss(self, outputs, label_batch, low_res_label_batch):
         """Calculate loss using unified channel-based approach."""
         dice_weight = self.dice_loss_weight
-        moe_loss_weight = float(
-            self.cfg.get("training", {}).get("moe_loss_weight", 0.0)
-        )
+        moe_loss_weight = self.moe_loss_weight
+        num_classes = self.cfg.data.num_classes
 
-        # Both binary and multi-class now use low_res_logits and low_res_label_batch (float [B, C, H, W])
         logits = outputs["low_res_logits"]
         target = low_res_label_batch
 
-        # Ensure target and logits have the same resolution
+        # Ensure target and logits have the same resolution.
+        # Expected: target is downsampled to match low-res logits.
+        # Upsampling (target smaller than logits) should never happen in normal use.
         if logits.shape[-2:] != target.shape[-2:]:
+            if target.shape[-2] < logits.shape[-2] or target.shape[-1] < logits.shape[-1]:
+                import warnings
+                warnings.warn(
+                    f"_calc_loss: target {tuple(target.shape[-2:])} is smaller than "
+                    f"logits {tuple(logits.shape[-2:])} — upsampling target, which may "
+                    "silently degrade training. Check data pipeline resolution.",
+                    stacklevel=2,
+                )
             target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
 
-        loss_ce = self.bce_loss(logits, target)
-        loss_dice = self.dice_loss(logits, target)
+        if num_classes == 1:
+            loss_ce = self.bce_loss(logits, target)
+            loss_dice = self.dice_loss(logits, target)
+        else:
+            # target is one-hot [B, C, H, W] float; CE expects class index [B, H, W] long
+            target_idx = target.argmax(dim=1).long()
+            loss_ce = self.ce_loss(logits, target_idx)
+            loss_dice = self.dice_loss(logits, target, softmax=True, sigmoid=False)
+
         loss_moe = outputs.get("moe_loss", torch.tensor(0.0, device=logits.device))
         if not torch.is_tensor(loss_moe):
             loss_moe = torch.tensor(float(loss_moe), device=logits.device)
@@ -202,8 +210,9 @@ class SAMTrainer(BaseTrainer):
             label_batch = label_batch.to(self.device)
             low_res_label_batch = low_res_label_batch.to(self.device)
 
-            # Forward pass
-            outputs = self.model(image_batch, False, self.img_size)
+            # Forward pass: use multimask output when num_classes > 1
+            multimask_output = self.cfg.data.num_classes > 1
+            outputs = self.model(image_batch, multimask_output, self.img_size)
 
             # Calculate loss
             loss, loss_ce, loss_dice, loss_moe = self._calc_loss(
@@ -320,10 +329,7 @@ class SAMTrainer(BaseTrainer):
             predictions_cache=predictions_cache, vis_dir=vis_dir, num_samples=10
         )
 
-        # Per-sample metrics CSV
-        self._save_per_sample_metrics(predictions_cache)
-
-        return test_metrics
+        return test_metrics, predictions_cache
 
     def _get_base_model(self):
         """Return the underlying LoRA_Sam, unwrapping DataParallel if needed."""

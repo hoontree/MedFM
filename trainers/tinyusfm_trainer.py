@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from hydra.utils import instantiate
+import wandb
 
 from .base_trainer import BaseTrainer
 from utils.data_processing_seg import SegDatasetProcessor
@@ -21,14 +22,32 @@ from utils.schedule import build_scheduler, get_lr_decay_param_groups
 
 def _build_criterion(num_classes: int) -> nn.Module:
     """Build loss function based on number of classes."""
-    return nn.BCEWithLogitsLoss()
+    if num_classes == 1:
+        return nn.BCEWithLogitsLoss()
+    return nn.CrossEntropyLoss()
+
+
+def _masks_to_index(masks: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """Convert masks to the index format expected by CrossEntropyLoss.
+
+    Handles two common mask formats:
+      - one-hot  [B, C, H, W]  (float) → argmax over channel dim → [B, H, W] long
+      - index    [B, 1, H, W] or [B, H, W]  (int/long)           → squeeze → [B, H, W] long
+    """
+    if masks.dim() == 4 and masks.shape[1] == num_classes:
+        # one-hot encoded
+        return masks.argmax(dim=1).long()
+    # index map: squeeze channel dim if present
+    return masks.squeeze(1).long()
 
 
 def _compute_loss(
     criterion: nn.Module, outputs: torch.Tensor, masks: torch.Tensor, num_classes: int
 ) -> torch.Tensor:
     """Compute loss with proper mask formatting."""
-    return criterion(outputs, masks)
+    if num_classes == 1:
+        return criterion(outputs, masks.float())
+    return criterion(outputs, _masks_to_index(masks, num_classes))
 
 
 def _build_optimizer(model: nn.Module, cfg) -> optim.Optimizer:
@@ -87,9 +106,7 @@ class TinyUSFMTrainer(BaseTrainer):
     def _create_model(self):
         """Create or use provided TinyUSFM model."""
         if self.model is None:
-            self.model = instantiate(self.cfg.model)
-
-        self.model.load_checkpoint()
+            self.model = instantiate(self.cfg.model)  # load_checkpoint called inside __init__
 
         # Load pretrained SAM decoder weights for the sam_mask branch
         sam_ckpt = self.cfg.model.get("sam_decoder_checkpoint", None)
@@ -111,18 +128,14 @@ class TinyUSFMTrainer(BaseTrainer):
 
         self.criterion = _build_criterion(self.cfg.data.num_classes)
 
-    def _create_dataloaders(self):
-        """Create data loaders."""
-        self.train_loader, self.val_loader, self.test_loader = (
-            SegDatasetProcessor.build_data_loaders(self.cfg)
-        )
-        self._log_data_sizes()
-
     def _create_optimizer(self):
         """Create optimizer."""
         self.optimizer = _build_optimizer(self.model, self.cfg)
         lr = self.cfg.training.get("lr", 0.0001)
         self.logger.info(f"Optimizer: AdamW, LR: {lr}")
+
+    def _get_wandb_run_name(self) -> str:
+        return f"TinyUSFM_{self.exp_dir_name}"
 
     def _create_scheduler(self):
         """Create learning rate scheduler."""
@@ -145,15 +158,11 @@ class TinyUSFMTrainer(BaseTrainer):
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
-        # Handle warmup
-        warmup_epochs = self.cfg.training.get("warmup_epochs", 0)
-        if epoch < warmup_epochs:
-            lr = self.cfg.training.lr * (epoch + 1) / warmup_epochs
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
-
         self.model.train()
-        running_loss = 0.0
+
+        total_loss = 0.0
+        num_batches = len(self.train_loader)
+        step_log_interval = 10
 
         train_pbar = tqdm(
             self.train_loader,
@@ -185,18 +194,32 @@ class TinyUSFMTrainer(BaseTrainer):
 
             self.optimizer.step()
 
-            running_loss += loss.item() * images.size(0)
+            total_loss += loss.item()
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             # Update progress bar
-            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.6f}"})
 
-        # Calculate epoch loss
-        epoch_loss = running_loss / len(self.train_loader.dataset)
+            # Step-level wandb logging
+            if self.global_step % step_log_interval == 0:
+                self._log_step_metrics(
+                    {"loss": loss.item(), "lr": current_lr},
+                    self.global_step,
+                )
+
+            self.global_step += 1
+
+        # Advance epoch-level scheduler (ReduceLROnPlateau is handled in validate())
+        use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
+            "use_reduce_on_plateau", False
+        )
+        if not use_reduce_on_plateau and self.scheduler is not None:
+            self.scheduler.step()
+
+        epoch_loss = total_loss / num_batches
         current_lr = self.optimizer.param_groups[0]["lr"]
 
-        metrics = {"loss": epoch_loss, "lr": current_lr}
-
-        return metrics
+        return {"loss": epoch_loss, "lr": current_lr}
 
     def validate(self, epoch: int) -> Dict[str, float]:
         """Validate model."""
@@ -208,18 +231,12 @@ class TinyUSFMTrainer(BaseTrainer):
             criterion=self.criterion,
         )
 
-        # Update scheduler
+        # ReduceLROnPlateau needs the val metric; other schedulers are stepped in train_epoch()
         use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
             "use_reduce_on_plateau", False
         )
         if use_reduce_on_plateau and self.scheduler is not None:
             self.scheduler.step(val_metrics["Dice"])
-        elif (
-            not use_reduce_on_plateau
-            and self.scheduler is not None
-            and epoch >= self.cfg.training.get("warmup_epochs", 0)
-        ):
-            self.scheduler.step()
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
@@ -257,15 +274,12 @@ class TinyUSFMTrainer(BaseTrainer):
                 test_metrics = metrics
 
         # Visualize predictions (all samples)
-        vis_dir = self.exp_dir / "visualizations" / "test"
+        vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
         self._visualize_predictions(
             predictions_cache=predictions_cache, vis_dir=vis_dir, num_samples=10
         )
 
-        # Per-sample metrics CSV
-        self._save_per_sample_metrics(predictions_cache)
-
-        return test_metrics
+        return test_metrics, predictions_cache
 
 
 try:
@@ -286,14 +300,10 @@ class TinyUSFMLightningModule(L.LightningModule if L is not None else object):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def _compute_loss(self, outputs: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        """Compute loss for current batch."""
-        return _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
-
     def training_step(self, batch: Tuple, batch_idx: int) -> torch.Tensor:
         images, masks, *_ = batch
         outputs = self.model(images)
-        loss = self._compute_loss(outputs, masks)
+        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
         self.log(
             "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
@@ -307,7 +317,7 @@ class TinyUSFMLightningModule(L.LightningModule if L is not None else object):
     def validation_step(self, batch: Tuple, batch_idx: int) -> torch.Tensor:
         images, masks, *_ = batch
         outputs = self.model(images)
-        loss = self._compute_loss(outputs, masks)
+        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
         self.log(
             "val_loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True
         )
@@ -317,14 +327,19 @@ class TinyUSFMLightningModule(L.LightningModule if L is not None else object):
         self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0
     ) -> torch.Tensor:
         images, masks, *extra = batch
-        filenames = list(extra[-1]) if extra and isinstance(extra[-1], (list, tuple)) and extra[-1] and isinstance(extra[-1][0], str) else None
+        last = extra[-1] if extra else None
+        filenames = (
+            list(last)
+            if isinstance(last, (list, tuple)) and last and isinstance(last[0], str)
+            else None
+        )
         outputs = self.model(images)
-        loss = self._compute_loss(outputs, masks)
+        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
 
         preds = (
-            torch.sigmoid(outputs)
+            (torch.sigmoid(outputs) > 0.5).float()
             if self.cfg.model.num_classes == 1
-            else torch.softmax(outputs, dim=1)
+            else torch.argmax(outputs, dim=1, keepdim=True).float()
         )
 
         vis_dir = Path(self.trainer.logger.log_dir) / "visualizations"

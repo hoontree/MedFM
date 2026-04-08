@@ -1,0 +1,23 @@
+name: "BUS_UCLM_filtered"
+type: "SegBase"
+path:
+  root: "/home/hheo/data/Ultrasound/seg/breast/BUS-UCLM"
+  split:
+    train: "train"
+    val: "valid"
+    test: "test"
+num_classes: 1  # Binary: 1, Multiclass: 3 (background=0, benign=1, malignant=2)
+multiclass: false  # Set true + num_classes=3 for multiclass training
+auto_img_size_by_sam_type: true
+sam_img_size_map:
+  vit_b: 224
+  vit_l: 1024
+  vit_h: 1024
+extensions: [".png"]
+partition_dir: "partitions"
+seed: 42
+usage: train
+filter_empty_masks: true
+filtered_index_dir: ".filtered_indices"  # Cache directory under partition_dir
+rebuild_filtered_index: false            # Set true to force rebuild cache
+normalization: "min_max"

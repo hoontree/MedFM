@@ -10,7 +10,6 @@ TinyUSFM is a multi-model medical image segmentation training framework focusing
 - **SAM (Segment Anything Model)**: Teacher model with LoRA fine-tuning (vit_b, vit_l, vit_h variants)
 - **TinyUSFM**: Lightweight student model for efficient inference
 - **SegFormer**: Alternative segmentation model
-- **SAM3**: Meta's latest SAM with vision-language capabilities (integrated via adapter/orchestrator)
 
 ## Essential Commands
 
@@ -18,82 +17,46 @@ TinyUSFM is a multi-model medical image segmentation training framework focusing
 ```bash
 # Install dependencies (uses uv package manager)
 uv sync
-
-# Activate virtual environment
-source .venv/bin/activate
 ```
 
 ### Training
 
 ```bash
 # Train SAM model (default)
-python main.py
+uv run main.py
 
 # Train specific model
-python main.py model=sam         # SAM with default config
-python main.py model=tinyusfm    # TinyUSFM model
-python main.py model=segformer   # SegFormer model
-python main.py model=sam3        # SAM3 model (simple mode)
-
+uv run main.py model=sam         # SAM with default config
+uv run main.py model=tinyusfm    # TinyUSFM model
+uv run main.py model=segformer   # SegFormer model
 # Override hyperparameters
-python main.py model=sam training.batch_size=32 training.base_lr=0.001
+uv run main.py model=sam training.batch_size=32 training.base_lr=0.001
 
 # Specify GPU
-python main.py hardware.gpu_ids=[0,1]
+uv run main.py hardware.gpu_ids=[0,1]
 
 # List available models
-python main.py list_models=true
+uv run main.py list_models=true
 ```
 
 ### Testing
 
 ```bash
 # Test mode
-python main.py mode=test model=sam checkpoint=/path/to/checkpoint.pth
+uv run main.py mode=test model=sam checkpoint=/path/to/checkpoint.pth
 
 # Test-only mode (configured in config)
-python main.py test_only.enabled=true test_only.checkpoint_path=/path/to/checkpoint.pth
+uv run main.py test_only.enabled=true test_only.checkpoint_path=/path/to/checkpoint.pth
 ```
-
-### SAM3 Training
-
-SAM3 supports two training modes:
-
-```bash
-# Simple mode - uses SAM3TrainerAdapter (BaseTrainer interface)
-python main.py model=sam3
-
-# Native mode - uses SAM3Orchestrator (full SAM3 DDP/AMP capabilities)
-python main.py model=sam3 sam3.use_native_trainer=true
-
-# With custom parameters
-python main.py model=sam3 \
-    sam3.resolution=1024 \
-    sam3.enable_segmentation=true \
-    sam3.amp_enabled=true \
-    training.batch_size=2
-
-# Direct orchestrator usage (advanced)
-python -m trainers.sam3_adapter --config path/to/config.yaml
-```
-
-**SAM3 Key Configuration (`config/model/sam3.yaml`):**
-- `sam3.use_native_trainer`: Use native SAM3 Trainer (default: false)
-- `sam3.checkpoint_path`: Path to SAM3 checkpoint (null for HuggingFace download)
-- `sam3.bpe_path`: BPE vocabulary path for text encoder
-- `sam3.enable_segmentation`: Enable segmentation masks (default: true)
-- `sam3.resolution`: Input resolution (default: 1008)
-- `sam3.amp_enabled`: Enable AMP (default: true)
-- `sam3.amp_dtype`: AMP dtype - bfloat16 or float16
 
 ### Knowledge Distillation
 
 ```bash
 # Basic distillation (SAM → TinyUSFM)
-python distill.py
+uv run distill.py
 
 # Override distillation parameters
-python distill.py \
+uv run distill.py \
     teacher.lora_checkpoint=/path/to/sam_lora.pth \
     distillation.temperature=6.0 \
     distillation.alpha=0.5 \
@@ -101,18 +64,18 @@ python distill.py \
     distillation.gamma=1.0
 
 # Run batch distillation experiments
-python run_distill_experiments.py
-python run_distill_experiments.py --debug  # Quick debug run
+uv run run_distill_experiments.py
+uv run run_distill_experiments.py --debug  # Quick debug run
 ```
 
 ### Teacher→Distill Pipeline (Single Command)
 
 ```bash
 # Train teacher, then automatically run distillation with the same data/hardware/split context
-./.venv/bin/python train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora model.use_alignment=true
+uv run train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora model.use_alignment=true
 
 # Example with explicit encoder/decoder modes
-./.venv/bin/python train.py \
+uv run train.py \
   pipeline.enabled=true \
   model.encoder_mode=conv_lora \
   model.decoder_mode=lora
@@ -122,40 +85,6 @@ Pipeline behavior:
 - Distillation uses the teacher best checkpoint from the same run.
 - Sweep metric is `final_test/BUID/dice`.
 
-### Evaluation
-
-```bash
-# Calculate metrics from predictions
-python calculate_metrics.py \
-    --pred_dir /path/to/predictions \
-    --gt_dir /path/to/ground_truth \
-    --output metrics.csv
-
-# With Notion upload
-python calculate_metrics.py \
-    --pred_dir /path/to/predictions \
-    --gt_dir /path/to/ground_truth \
-    --output metrics.csv \
-    --upload-notion \
-    --notion-model-name "SAM-LoRA"
-```
-
-### Visualization
-
-```bash
-# Visualize analysis (t-SNE, feature maps)
-python visualize_analysis.py
-```
-
-### Testing
-```bash
-# Run tests (pytest available in dev dependencies)
-pytest
-
-# Install dev dependencies if needed
-uv sync --extra dev
-```
-
 ## Architecture
 
 ### Configuration System (Hydra)
@@ -164,7 +93,7 @@ The project uses Hydra for hierarchical configuration management:
 
 - **config/train.yaml**: Main training configuration entry point
 - **config/distill.yaml**: Knowledge distillation configuration
-- **config/model/**: Model-specific configs (sam.yaml, TinyUSFM.yaml, segformer.yaml, sam3.yaml)
+- **config/model/**: Model-specific configs (sam.yaml, TinyUSFM.yaml, segformer.yaml)
 - **config/data/**: Dataset configurations (BUSBRA.yaml, BUSI.yaml, etc.)
 - **config/model/encoder/**: Encoder variants (vit_b.yaml, vit_l.yaml, vit_h.yaml)
 
@@ -186,9 +115,6 @@ The framework uses a factory pattern with model-specific trainers:
   - `sam_trainer.py`: SAM with LoRA fine-tuning (image encoder or full model)
   - `tinyusfm_trainer.py`: TinyUSFM lightweight model
   - `segformer_trainer.py`: SegFormer transformer-based segmentation
-  - `sam3_adapter.py`: SAM3 integration module with two components:
-    - `SAM3TrainerAdapter`: Inherits BaseTrainer for unified interface
-    - `SAM3Orchestrator`: Wraps native SAM3 Trainer for full DDP/AMP support
 
 **Key trainer methods to implement:**
 - `create_model()`: Instantiate model architecture
@@ -209,25 +135,17 @@ Models are in `model/` directory:
   - `tinyusfm_seg.py`: TinyUSFM segmentation model
   - `usfm_seg.py`: USFM segmentation variant
 
-- **SAM3**: `model/sam3/` - Meta's SAM3 implementation
-  - `model/`: Core model architecture (`sam3_image.py`, `vl_combiner.py`)
-  - `train/`: Native training infrastructure with DDP support
-    - `trainer.py`: Full-featured Trainer with AMP, gradient accumulation
-    - `configs/`: Hydra configs for various tasks
-    - `loss/`: Loss functions (`sam3_loss.py`)
-  - `eval/`: Evaluation utilities and postprocessors
-  - `agent/`: Agent-based features for interactive segmentation
 
 ### Knowledge Distillation
 
-Located in `distill.py`:
+Located in `distill.py`, implemented in `distillers/unified_distiller.py`:
 
 - **Teacher**: Fine-tuned SAM with LoRA (frozen during distillation)
 - **Student**: TinyUSFM (trained)
-- **Loss components**:
+- **Loss components** (`UnifiedDistiller`):
   - Task loss (α): Ground truth segmentation loss (BCE + Dice)
   - Distillation loss (β): KL divergence between teacher/student logits with temperature scaling
-  - Feature loss (γ): Optional MSE between intermediate features
+  - Feature loss (γ): Optional MSE between intermediate feature maps (requires `layer_mapping` config)
 
 **Key configuration parameters:**
 - `temperature`: Softness of probability distributions (typically 4-8)
@@ -235,11 +153,37 @@ Located in `distill.py`:
 - `beta`: Weight for distillation loss (0-1, typically alpha + beta = 1)
 - `gamma`: Weight for feature distillation (0 = disabled)
 
+**Note:** `UnifiedDistiller` supports optional GradNorm automatic loss balancing (`use_gradnorm=true`). The `LOSS_WEIGHT_MAP` covers only the three active losses (task/distill/feature).
+
 ### Data Processing
 
 - **utils/data_processing_seg.py**: Main data processing for segmentation
   - `SegDatasetProcessor`: Handles dataset loading, augmentation, train/val/test splits
   - Supports multiple medical imaging datasets (BUSBRA, BUSI, BUS_UCLM, etc.)
+
+#### Dataset Split Strategy (`config/data/dynamic.yaml`)
+
+Train datasets (BUSBRA, BUSI, B) are split 70/15/15 into train/val/internal-test.
+External validation datasets (BUID, BUS_UCLM, BUS_UCLM_filtered) are loaded with `usage="external"` (all samples).
+
+`build_data_loaders()` returns:
+- `train_loader`: 70% of train datasets
+- `val_loader`: 15% val split — used for checkpoint selection
+- `test_loaders`: dict with both internal and external sets:
+  ```
+  {
+    "BUSBRA_test": internal 15%,
+    "BUSI_test":   internal 15%,
+    "B_test":      internal 15%,
+    "BUID":        external (all),
+    "BUS_UCLM":    external (all),
+    "BUS_UCLM_filtered": external (all),
+  }
+  ```
+
+`load_dataset_from_config(cfg, name, split, force_external=False)`:
+- `force_external=True` → sets `usage="external"` (used for external validation sets)
+- `force_external=False` (default) → keeps config's `usage` value (used for internal train/val/test splits)
 
 ### Utilities
 
@@ -295,33 +239,25 @@ logs/distillation/{dataset}/{timestamp}/
 
 ## Important Implementation Details
 
-### SAM3 Integration
+### SAM Adaptation (`model/sam_hybrid_adapter.py`)
 
-SAM3 was integrated from the official Meta repository with a dual-mode architecture:
+`LoRA_Sam` provides a unified SAM wrapper with flexible encoder/decoder adaptation modes, configured via `encoder_mode` / `decoder_mode` in the model config.
 
-**Simple Mode (SAM3TrainerAdapter):**
-- Inherits from `BaseTrainer` for consistent interface with other models
-- Suitable for single-GPU training, quick experiments, debugging
-- Uses unified data loaders (`SegDatasetProcessor`)
-- Registered in `ModelBuilder` as 'sam3'
+**Encoder modes:** `lora`, `conv_lora`, `ft`, `frozen`
+**Decoder modes:** `lora`, `ft`, `frozen`
 
-**Native Mode (SAM3Orchestrator):**
-- Preserves all SAM3 native capabilities (multi-GPU DDP, AMP, gradient accumulation)
-- Converts unified config to SAM3's Hydra-based format
-- Supports SLURM/Submitit for cluster training
-- Activated via `sam3.use_native_trainer=true`
+Key combinations:
+- `encoder_mode=lora, decoder_mode=lora` — LoRA on both (default efficient fine-tuning)
+- `encoder_mode=conv_lora` — Conv-LoRA with MoE experts on encoder qkv layers
+- `encoder_mode=frozen, decoder_mode=ft` — freeze encoder, fine-tune decoder only
+- `use_alignment=true` — inserts `AlignmentLayer` (256ch residual blocks) between encoder and decoder
 
-**Key Files:**
-- `trainers/sam3_adapter.py`: Integration module (SAM3TrainerAdapter + SAM3Orchestrator)
-- `config/model/sam3.yaml`: SAM3-specific configuration
-- `model/sam3/`: Original SAM3 codebase from Meta
-
-### LoRA Fine-tuning
-
-SAM uses LoRA (Low-Rank Adaptation) for efficient fine-tuning:
-- Only LoRA parameters are trained, base SAM weights are frozen
-- Rank parameter (`rank: 4` typically) controls adapter capacity
-- Two variants: encoder-only or encoder+decoder adaptation
+**Key parameters:**
+- `r_e` / `r_d`: LoRA rank for encoder / decoder (default 4)
+- `conv_lora_expert_num`: number of MoE experts for Conv-LoRA (default 4)
+- `use_alignment`: enable alignment layer (default false)
+- `alignment_num_blocks`: depth of alignment layer (default 4)
+- `checkpoint`: SAM pretrained path (e.g. `checkpoints/sam_vit_b_*.pth`) or fine-tuned checkpoint
 
 ### Dataset Configuration
 
@@ -329,13 +265,6 @@ Datasets configured in `config/data/`:
 - Must specify: `train_dataset`, `val_dataset`, `test_dataset`
 - Each dataset config includes: path, image size, num_classes
 - Supports combined datasets (e.g., BUSBRA+BUSI)
-
-### Early Stopping
-
-Configured per model:
-- `early_stopping.enabled`: Enable/disable
-- `early_stopping.patience`: Epochs to wait before stopping
-- `early_stopping.min_delta`: Minimum improvement threshold
 
 ## Development Workflow
 
@@ -352,8 +281,10 @@ Configured per model:
 
 3. **Modifying distillation**:
    - Core logic in `distill.py`
-   - Loss function: `KnowledgeDistillationLoss` class
-   - Feature adaptation: `FeatureAdapter` class for dimension matching
+   - Loss implementation: `UnifiedDistiller` in `distillers/unified_distiller.py`
+   - Active losses: task (α), logit distillation (β), feature distillation (γ)
+   - Feature adaptation: `FeatureAdapter` class for channel dimension matching
+   - Metric keys from `Evaluator_seg` are always capitalized: `"Dice"`, `"IoU"`, `"HD95"`, `"BIoU"`
 
 ## Notes for Claude Code
 

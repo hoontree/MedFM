@@ -5,7 +5,6 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from omegaconf import OmegaConf, ListConfig
-import copy
 
 from utils.ultrasound_datasets import (
     BUID,
@@ -13,7 +12,6 @@ from utils.ultrasound_datasets import (
     BUS_UCLM_filtered,
     BUSI,
     BUSBRA,
-    UltrasoundSegmentationDataset,
     B,
 )
 # Dataset class registry
@@ -23,7 +21,6 @@ DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
     "BUS_UCLM_filtered": BUS_UCLM_filtered,
     "BUSI": BUSI,
     "BUSBRA": BUSBRA,
-    "UltrasoundSegmentationDataset": UltrasoundSegmentationDataset,
     "B": B,
 }
 
@@ -74,8 +71,13 @@ class SegDatasetProcessor:
         sam_cfg.img_size = target_size
 
     @staticmethod
-    def load_dataset_from_config(cfg, name, split):
-        """Helper to load dataset config and instantiate."""
+    def load_dataset_from_config(cfg, name, split, force_external=False):
+        """Helper to load dataset config and instantiate.
+
+        Args:
+            force_external: If True, set usage="external" (for external validation sets).
+                            If False, keep the config's default usage (for internal splits).
+        """
         config_path = Path(f"config/data/{name}.yaml")
         if not config_path.exists():
             raise ValueError(f"Config for {name} not found at {config_path}")
@@ -83,11 +85,11 @@ class SegDatasetProcessor:
         data_cfg = OmegaConf.load(config_path)
 
         # Override global settings
-        for attr in ["img_size", "num_classes", "normalization"]:
+        for attr in ["img_size", "num_classes", "normalization", "multiclass"]:
             if hasattr(cfg.data, attr):
                 setattr(data_cfg, attr, getattr(cfg.data, attr))
 
-        if split == "test":
+        if force_external:
             data_cfg.usage = "external"
 
         dataset_class = get_dataset_class(data_cfg.name)
@@ -126,6 +128,16 @@ class SegDatasetProcessor:
 
         # 2. Test sets (Always return a dictionary for separate evaluation)
         test_datasets = {}
+
+        # 2a. Internal test sets: held-out 15% from each train dataset (usage stays "train")
+        for name in train_list:
+            print(f"Loading internal test: {name} → {name}_test")
+            ds = SegDatasetProcessor.load_dataset_from_config(
+                cfg, name, "test", force_external=False
+            )
+            test_datasets[f"{name}_test"] = ds
+
+        # 2b. External validation sets (usage="external")
         test_list = getattr(cfg.data, "test", [])
         if isinstance(test_list, str):
             test_list = [test_list]
@@ -221,14 +233,9 @@ class SegDatasetProcessor:
 
     @staticmethod
     def _add_test_dataset_with_unfiltered(cfg, name, test_datasets_dict):
-        """Load test dataset and optionally add its unfiltered version."""
-        print(f"Loading Test dataset: {name}")
-        ds = SegDatasetProcessor.load_dataset_from_config(cfg, name, split="test")
+        """Load external test dataset and add to dict."""
+        print(f"Loading external test: {name}")
+        ds = SegDatasetProcessor.load_dataset_from_config(
+            cfg, name, split="test", force_external=True
+        )
         test_datasets_dict[name] = ds
-
-        if getattr(ds, "filter_empty_masks", False):
-            ds_un = copy.copy(ds)
-            ds_un.image_files = list(ds.image_files_unfiltered)
-            ds_un.mask_files = list(ds.mask_files_unfiltered)
-            test_datasets_dict[f"{name}_unfiltered"] = ds_un
-            print(f"  -> Added {name}_unfiltered ({len(ds_un)} samples)")

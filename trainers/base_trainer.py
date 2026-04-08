@@ -21,6 +21,7 @@ import wandb
 from utils.logger import setup_logger
 from utils.evaluate import Evaluator_seg
 from utils.utils import set_seed
+from utils.data_processing_seg import SegDatasetProcessor
 from utils.distill_utils import get_experiment_tags
 
 _UNSET = object()  # sentinel for "use config default"
@@ -106,8 +107,12 @@ class BaseTrainer(ABC):
         self.log_dir = None
 
         # Training state
-        self.best_metric = 0.0
+        self.best_metric = 0.0      # best Dice
+        self.best_iou = 0.0
+        self.best_hd95 = float("inf")
         self.best_model_path = None
+        self.best_iou_checkpoint = None
+        self.best_hd95_checkpoint = None
         self.current_epoch = 0
         self.global_step = 0
 
@@ -138,8 +143,6 @@ class BaseTrainer(ABC):
 
         # Create model
         self._create_model()
-        
-        self._log_model_info()
 
         # Setup training components (only for training mode)
         if mode == "train":
@@ -152,27 +155,37 @@ class BaseTrainer(ABC):
         self.logger.info(f"Experiment directory: {self.exp_dir}")
 
     def _setup_directories(self):
-        """Setup experiment directories."""
+        """
+        Setup experiment directories.
+        Structure:
+            logs/
+                train/
+                    {model_name}/
+                        {peft_mode}/ (for SAM)
+                        {timestamp}_{tags}/
+                            or
+                            {timestamp}_{tags}/ (for non-SAM)
+        """
         # Get model name
         model_name = self.cfg.model.name
         
         # Create base directory
-        logs_root = Path(self.cfg.get("output", {}).get("dir", "logs"))
+        logs_root = Path(self.cfg.get("output", {}).get("dir", "logs")) / "train"
 
         # Create experiment tags
         exp_tags = get_experiment_tags(self.cfg)
 
         # Create timestamp-based experiment directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
+        self.exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
 
         # Final experiment directory
         if model_name == "sam":
             peft_mode = f"e_{self.cfg.model.encoder_mode}_d_{self.cfg.model.decoder_mode}"
-            self.exp_dir = logs_root / model_name / peft_mode / exp_dir_name
+            self.exp_dir = logs_root / model_name / peft_mode / self.exp_dir_name
 
         else:
-            self.exp_dir = logs_root / model_name / exp_dir_name
+            self.exp_dir = logs_root / model_name / self.exp_dir_name
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         # Checkpoint directory
@@ -199,41 +212,53 @@ class BaseTrainer(ABC):
         if wandb_config.get("disabled", False):
             wandb_mode = "disabled"
 
-        # In a sweep, wandb handles the run name. For regular runs, we use a custom name.
+        # In a sweep, wandb handles the run name. For regular runs, use a custom name.
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-        run_name = (
-            None
-            if is_sweep
-            else f"{self.cfg.model.get('encoder_mode', 'default')}_encoder_{self.cfg.model.get('decoder_mode', 'default')}_decoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        wandb_run_config = self._build_wandb_config()
+        run_name = None if is_sweep else self._get_wandb_run_name()
 
         self.wandb_run = wandb.init(
             entity=wandb_config.get("entity", "hheo"),
             project=wandb_config.get("project", "medical_foundation_models"),
             name=run_name,
-            config=wandb_run_config,
+            config=self._build_wandb_config(),
             dir=str(self.exp_dir),
             mode=wandb_mode,
         )
 
+    def _get_wandb_run_name(self) -> str:
+        """Return the W&B run name for non-sweep runs. Subclasses can override."""
+        return (
+            f"{self.cfg.model.get('encoder_mode', 'default')}_encoder"
+            f"_{self.cfg.model.get('decoder_mode', 'default')}_decoder"
+            f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+
     def _build_wandb_config(self) -> Dict[str, Any]:
-        """Build W&B config payload with model and training configs only."""
-        wandb_run_config = {}
-        
-        # Add model config
+        """Build W&B config payload.
+
+        If ``wandb.log_config`` is defined in the config, it is used as-is
+        (subconfigs can reference other keys via Hydra interpolation).
+        Otherwise, falls back to extracting model and training sections.
+        """
+        wandb_cfg = self.cfg.get("wandb", {})
+
+        # Explicit log_config block takes precedence
+        if "log_config" in wandb_cfg:
+            result = OmegaConf.to_container(wandb_cfg.log_config, resolve=True)
+            if isinstance(result, dict):
+                return result
+
+        # Fallback: extract model and training sections
+        run_config: Dict[str, Any] = {}
         if "model" in self.cfg:
             model_cfg = OmegaConf.to_container(self.cfg.model, resolve=True)
             if isinstance(model_cfg, dict):
-                wandb_run_config["model"] = model_cfg
-        
-        # Add training config
+                run_config["model"] = model_cfg
         if "training" in self.cfg:
             training_cfg = OmegaConf.to_container(self.cfg.training, resolve=True)
             if isinstance(training_cfg, dict):
-                wandb_run_config["training"] = training_cfg
-        
-        return wandb_run_config
+                run_config["training"] = training_cfg
+        return run_config
 
     def _setup_early_stopping(self):
         """Setup early stopping."""
@@ -254,10 +279,12 @@ class BaseTrainer(ABC):
         """Create and initialize model. Must be implemented by subclasses."""
         raise NotImplementedError
 
-    @abstractmethod
     def _create_dataloaders(self):
-        """Create train/val/test data loaders. Must be implemented by subclasses."""
-        raise NotImplementedError
+        """Create data loaders."""
+        self.train_loader, self.val_loader, self.test_loader = (
+            SegDatasetProcessor.build_data_loaders(self.cfg)
+        )
+        self._log_data_sizes()
 
     @abstractmethod
     def _create_optimizer(self):
@@ -351,9 +378,9 @@ class BaseTrainer(ABC):
         self,
         loader=None,
         vis_dir=None,
-        epoch=None,
         predictions_cache: Dict = None,
         num_samples=_UNSET,
+        epoch: int = None,
         log_to_wandb: bool = True,
         max_wandb_images: Optional[int] = None,
     ):
@@ -499,10 +526,18 @@ class BaseTrainer(ABC):
         # Test with best model
         if self.best_model_path is not None:
             self.logger.info("Testing with best model")
-
             self._load_checkpoint(self.best_model_path)
-            test_metrics = self.test()
-            self._save_test_results(test_metrics)
+            result = self.test()
+            if isinstance(result, tuple):
+                test_metrics, predictions_cache = result
+            else:
+                test_metrics, predictions_cache = result, None
+            self._save_test_results(test_metrics, predictions_cache=predictions_cache)
+        else:
+            self.logger.warning(
+                "No best model checkpoint found (training may have ended at epoch 0 "
+                "or all checkpoints failed). Skipping final test evaluation."
+            )
 
         # Capture run ID for pipeline integration before potentially finishing
         self.wandb_run_id = (
@@ -549,15 +584,15 @@ class BaseTrainer(ABC):
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
-        dice_score = val_metrics.get("Dice", val_metrics.get("dice", 0.0))
-        IoU_score = val_metrics.get("IoU", val_metrics.get("iou", 0.0))
-        hd95_score = val_metrics.get("HD95", val_metrics.get("hd95", 0.0))
+        dice_score = val_metrics.get("Dice", 0.0)
+        IoU_score = val_metrics.get("IoU", 0.0)
+        hd95_score = val_metrics.get("HD95", 0.0)
 
         prev_best_model_path = self.best_model_path
         prev_best_iou_checkpoint = getattr(self, "best_iou_checkpoint", None)
         prev_best_hd95_checkpoint = getattr(self, "best_hd95_checkpoint", None)
 
-        # Save best model
+        # Save best model (Dice)
         if dice_score > self.best_metric:
             self.best_metric = dice_score
             self.best_model_path = (
@@ -565,38 +600,45 @@ class BaseTrainer(ABC):
             )
             self._save_model(self.best_model_path)
             self.logger.info(f"Saved best model: {self.best_model_path}")
-            self.wandb_run.summary["checkpoint_path"] = str(self.best_model_path)
-            self.wandb_run.summary["best_dice"] = dice_score
+            if wandb.run is not None:
+                wandb.run.summary["checkpoint_path"] = str(self.best_model_path)
+                wandb.run.summary["best_dice"] = dice_score
             if (
                 prev_best_model_path is not None
                 and prev_best_model_path != self.best_model_path
                 and prev_best_model_path.exists()
             ):
                 prev_best_model_path.unlink()
-                
-        if IoU_score > self.wandb_run.summary.get("best_iou", 0.0):
-            self.wandb_run.summary["best_iou"] = IoU_score
+
+        # Save best model (IoU) — tracked independently of wandb
+        if IoU_score > self.best_iou:
+            self.best_iou = IoU_score
             self.best_iou_checkpoint = (
                 self.ckpt_dir / f"best_epoch_{epoch + 1}_iou_{IoU_score:.4f}.pth"
             )
             self._save_model(self.best_iou_checkpoint)
-            self.wandb_run.summary["best_iou_checkpoint"] = str(self.best_iou_checkpoint)
             self.logger.info(f"Saved best IoU model: {self.best_iou_checkpoint}")
+            if wandb.run is not None:
+                wandb.run.summary["best_iou"] = IoU_score
+                wandb.run.summary["best_iou_checkpoint"] = str(self.best_iou_checkpoint)
             if (
                 prev_best_iou_checkpoint is not None
                 and prev_best_iou_checkpoint != self.best_iou_checkpoint
                 and prev_best_iou_checkpoint.exists()
             ):
                 prev_best_iou_checkpoint.unlink()
-                
-        if hd95_score < self.wandb_run.summary.get("best_hd95", float("inf")):
-            self.wandb_run.summary["best_hd95"] = hd95_score
+
+        # Save best model (HD95) — tracked independently of wandb
+        if hd95_score < self.best_hd95:
+            self.best_hd95 = hd95_score
             self.best_hd95_checkpoint = (
                 self.ckpt_dir / f"best_epoch_{epoch + 1}_hd95_{hd95_score:.4f}.pth"
             )
             self._save_model(self.best_hd95_checkpoint)
-            self.wandb_run.summary["best_hd95_checkpoint"] = str(self.best_hd95_checkpoint)
             self.logger.info(f"Saved best HD95 model: {self.best_hd95_checkpoint}")
+            if wandb.run is not None:
+                wandb.run.summary["best_hd95"] = hd95_score
+                wandb.run.summary["best_hd95_checkpoint"] = str(self.best_hd95_checkpoint)
             if (
                 prev_best_hd95_checkpoint is not None
                 and prev_best_hd95_checkpoint != self.best_hd95_checkpoint
@@ -618,16 +660,16 @@ class BaseTrainer(ABC):
     def _load_checkpoint(self, path: Path):
         """Load model from checkpoint. Can be overridden by subclasses for custom loading."""
         self.logger.info(f"Loading checkpoint: {path}")
-        self.model.load_state_dict(torch.load(str(path)))
+        self.model.load_state_dict(torch.load(str(path), map_location=self.device))
 
     def _save_test_results(self, test_metrics: Dict, predictions_cache: dict = None):
         """Save test results to file and log to wandb as final_test/.
 
         Args:
-            test_metrics: Dict of metric name → scalar value.
-            predictions_cache: Optional precomputed predictions cache
-                (same structure as _save_per_sample_metrics). When provided,
-                a LaTeX table with mean ± std is also written.
+            test_metrics: Dict of metric name → scalar value. Keys may be prefixed
+                with dataset name (e.g. ``BUID/Dice``) for multi-dataset runs.
+            predictions_cache: Optional precomputed predictions cache. When provided,
+                per-sample CSV files are written via _save_per_sample_metrics.
         """
         test_results_path = self.exp_dir / "test_results.txt"
         with open(test_results_path, "w") as f:
@@ -649,8 +691,11 @@ class BaseTrainer(ABC):
             wandb.log(final_metrics)
             wandb.run.summary.update(final_metrics)
 
+        # Save LaTeX table from test_metrics (authoritative values from evaluate_model)
+        self._save_latex_metrics_table_from_metrics(test_metrics)
+
         if predictions_cache is not None:
-            self._save_latex_metrics_table(predictions_cache)
+            self._save_per_sample_metrics(predictions_cache)
 
     def _save_per_sample_metrics(self, predictions_cache: dict) -> None:
         """Save per-sample segmentation metrics to CSV for every test dataset.
@@ -692,50 +737,92 @@ class BaseTrainer(ABC):
             )
             self.logger.info(f"Combined per-sample metrics saved → {combined_path}")
 
-    def _save_latex_metrics_table(self, predictions_cache: dict) -> None:
-        """Save per-dataset mean ± std metrics as a LaTeX table to test_results/.
+    def _save_latex_metrics_table_from_metrics(self, test_metrics: Dict) -> None:
+        """Save a LaTeX table from the authoritative test_metrics dict.
 
-        Reads the per-sample CSVs already written by _save_per_sample_metrics and
-        produces ``<exp_dir>/test_results/metrics_latex.txt``.
+        Uses the mean/std values already computed by evaluate_model (same values
+        as test_results.txt and wandb), avoiding re-aggregation from CSV.
+
+        test_metrics keys follow two formats:
+          - Multi-dataset: ``<dataset>/<Metric>`` and ``<dataset>/<Metric>_std``
+          - Single-dataset: ``<Metric>`` and ``<Metric>_std``
 
         Each cell: ``mean \\pm std`` (×100 for ratio metrics, raw for HD95).
         """
-        import pandas as pd
+        import re
 
-        RATIO_COLS = ["Dice", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
-        ALL_COLS = ["Dice", "HD95", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
+        RATIO_COLS = {"Dice", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"}
+        BASE_COLS = ["Dice", "HD95", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
 
-        out_dir = self.exp_dir / "test_results"
-        rows = []
+        # Determine if keys are prefixed with dataset name
+        has_prefix = any("/" in k for k in test_metrics)
 
-        for ds_name in predictions_cache:
-            csv_path = out_dir / f"metrics_{ds_name}.csv"
-            if not csv_path.exists():
-                self.logger.warning(f"LaTeX table: CSV not found for {ds_name}, skipping.")
+        # Group metrics by dataset
+        datasets: Dict[str, Dict[str, float]] = {}
+        for key, value in test_metrics.items():
+            if not isinstance(value, (int, float)):
                 continue
-            df = pd.read_csv(csv_path)
+            if has_prefix:
+                ds_name, metric = key.split("/", 1)
+            else:
+                ds_name, metric = "test", key
+            datasets.setdefault(ds_name, {})[metric] = value
 
+        if not datasets:
+            return
+
+        # Collect all column names (union across datasets, preserving order)
+        def _col_order(ds_metrics):
+            # Detect per-class ids from keys like Dice_class_1
+            class_ids = sorted({
+                int(m.group(1))
+                for k in ds_metrics
+                for m in [re.search(r"_class_(\d+)(?:_std)?$", k)]
+                if m
+            })
+            cols = [c for c in BASE_COLS if c in ds_metrics or f"{c}_std" in ds_metrics]
+            for c in class_ids:
+                for base in ["Dice", "HD95", "IoU"]:
+                    col = f"{base}_class_{c}"
+                    if col in ds_metrics or f"{col}_std" in ds_metrics:
+                        cols.append(col)
+            return cols
+
+        # Use column list from first dataset
+        first_ds_metrics = next(iter(datasets.values()))
+        final_cols = _col_order(first_ds_metrics)
+
+        if not final_cols:
+            return
+
+        rows = []
+        for ds_name, ds_metrics in datasets.items():
             cells = []
-            for col in ALL_COLS:
-                if col not in df.columns:
+            for col in final_cols:
+                mean_v = ds_metrics.get(col)
+                std_v = ds_metrics.get(f"{col}_std")
+                if mean_v is None:
                     cells.append("--")
                     continue
-                mean_v = df[col].mean()
-                std_v = df[col].std()
-                if col in RATIO_COLS:
-                    cells.append(f"{mean_v * 100:.2f} $\\pm$ {std_v * 100:.2f}")
+                base_metric = col.split("_class_")[0]
+                if base_metric in RATIO_COLS:
+                    std_str = f" $\\pm$ {std_v * 100:.2f}" if std_v is not None else ""
+                    cells.append(f"{mean_v * 100:.2f}{std_str}")
                 else:
-                    cells.append(f"{mean_v:.2f} $\\pm$ {std_v:.2f}")
-
+                    std_str = f" $\\pm$ {std_v:.2f}" if std_v is not None else ""
+                    cells.append(f"{mean_v:.2f}{std_str}")
             rows.append((ds_name, cells))
 
-        header_cols = " & ".join(ALL_COLS)
+        out_dir = self.exp_dir / "test_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        header_cols = " & ".join(final_cols)
         lines = [
             "% Auto-generated LaTeX metrics table",
             "\\begin{table}[h]",
             "  \\centering",
             "  \\caption{Final test metrics (mean $\\pm$ std)}",
-            "  \\begin{tabular}{l" + "c" * len(ALL_COLS) + "}",
+            "  \\begin{tabular}{l" + "c" * len(final_cols) + "}",
             "    \\hline",
             f"    Dataset & {header_cols} \\\\",
             "    \\hline",

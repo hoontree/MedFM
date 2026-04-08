@@ -6,10 +6,14 @@ name: "dynamic"
 type: "Dynamic"
 train: [BUSBRA, BUSI, B]
 val: []   # If empty, defaults to same as train (using val split)
-test: [BUID, BUS_UCLM]  # Each dataset in this list will be evaluated separately
+test: [BUID, BUS_UCLM, BUS_UCLM_filtered]  # Each dataset in this list will be evaluated separately
 
-# Canonical location for num_classes and img_size
-num_classes: 1
+# Canonical location for num_classes, img_size, and multiclass mode.
+# These are propagated to every individual dataset at load time.
+# To enable multiclass training, override both from CLI:
+#   data.multiclass=true data.num_classes=3
+num_classes: 3
+multiclass: true
 img_size: 224
 auto_img_size_by_sam_type: true
 sam_img_size_map:

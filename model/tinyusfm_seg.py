@@ -26,7 +26,7 @@ class Attention(BaseAttn):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = self.identity(attn)
         if return_latent:
-            return
+            return attn
         attn = attn.softmax(dim=-1)
         self.last_attn = attn  # Store for visualization
         attn = self.attn_drop(attn)
@@ -293,7 +293,7 @@ class FPNHead(nn.Module):
         feature_strides=[4, 8, 16, 32],
         channels=128,
         dropout_ratio=0.1,
-        num_classes=2,
+        num_classes=1,
         align_corners=False,
     ):
         super().__init__()
@@ -329,7 +329,9 @@ class FPNHead(nn.Module):
             )
 
         # Final classifier
-        self.conv_seg = nn.Conv2d(channels, num_classes, kernel_size=1)
+        # binary: 1 output channel (sigmoid); multiclass: num_classes channels (softmax)
+        out_ch = 1 if num_classes == 1 else num_classes
+        self.conv_seg = nn.Conv2d(channels, out_ch, kernel_size=1)
 
         if dropout_ratio > 0:
             self.dropout = nn.Dropout2d(dropout_ratio)
@@ -622,13 +624,15 @@ class SegmentationModel(nn.Module):
         try:
             checkpoint = torch.load(load_path, map_location="cpu")
             # TinyUSFM specific mapping: model. -> backbone.
-            new_state_dict = {
-                k.replace("model.", "backbone."): v
-                for k, v in checkpoint.items()
-                if k.startswith("model.")
-            }
+            # Also pass through keys that are already in the correct format (e.g. backbone.xxx)
+            new_state_dict = {}
+            for k, v in checkpoint.items():
+                if k.startswith("model."):
+                    new_state_dict[k.replace("model.", "backbone.")] = v
+                else:
+                    new_state_dict[k] = v
             load_info = self.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded checkpoint from {self.checkpoint_path}")
+            print(f"Loaded checkpoint from {load_path}")
             print(f"Missing keys: {len(load_info.missing_keys)}")
             print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
         except Exception as e:

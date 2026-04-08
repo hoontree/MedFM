@@ -5,7 +5,7 @@ training:
   num_epochs: 1000
   lr: 0.0001           # Learning rate for student
   warmup_epochs: 5
-  batch_size: 16
+  batch_size: 64
   num_workers: 8
   limit_train_batches: null
   early_stopping:
@@ -26,3 +26,20 @@ scheduler:
   num_epochs: ${training.num_epochs}
   base_lr: ${training.lr}
   min_lr: 1e-6
+
+wandb:
+  project: distill
+  run_name: distill_from_pretrained_sam
+  entity: hheo
+  log_model: true
+  log_config:
+    teacher:
+      name: ${teacher.name}
+    student:
+      name: ${student.name}
+    training:
+      lr: ${training.lr}
+      batch_size: ${training.batch_size}
+      num_epochs: ${training.num_epochs}
+    data:
+      multiclass: ${data.multiclass}

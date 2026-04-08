@@ -5,7 +5,6 @@ defaults:
   - student: tinyusfm
   - method: unified
   - training: distillation
-  - log: wandb
   - _self_
 
 trainer:

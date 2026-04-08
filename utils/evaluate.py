@@ -213,7 +213,7 @@ class Evaluator_seg:
             elif not pred_np.any() and not gt_np.any():
                 hausdorff = 0
             else:
-                hausdorff = 224
+                hausdorff = float(max(gt_np.shape))
             iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
             sens = recall(pred_np, gt_np)
             spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
@@ -249,6 +249,7 @@ class Evaluator_seg:
         sensitivity_per_class = [[] for _ in range(num_classes)]
         specificity_per_class = [[] for _ in range(num_classes)]
         hd95_per_class = [[] for _ in range(num_classes)]
+        bfscore_per_class = [[] for _ in range(num_classes)]
 
         # Convert to class predictions
         preds_class = torch.argmax(preds, dim=1)  # [B, H, W]
@@ -264,39 +265,30 @@ class Evaluator_seg:
                 pred_class = pred_np == class_id
                 gt_class = gt_np == class_id
 
-                if not (gt_class.any() or pred_class.any()):
-                    dice = 1.0
-                    iou = 1.0
-                    sensitivity = np.nan
-                    specificity = np.nan
-                    hd = np.nan
+                # Only evaluate samples where gt contains this class
+                if not gt_class.any():
+                    continue
+
+                tp = np.logical_and(pred_class, gt_class).sum()
+                dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
+                iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
+                fn = np.logical_and(~pred_class, gt_class).sum()
+                sensitivity = tp / (tp + fn + 1e-8)
+                tn = np.logical_and(~pred_class, ~gt_class).sum()
+                fp = np.logical_and(pred_class, ~gt_class).sum()
+                specificity = tn / (tn + fp + 1e-8)
+                if pred_class.any():
+                    hd = hd95(pred_class.astype(np.bool_), gt_class.astype(np.bool_))
                 else:
-                    tp = np.logical_and(pred_class, gt_class).sum()
-                    dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
-                    iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
-                    fn = np.logical_and(~pred_class, gt_class).sum()
-                    if (tp + fn) > 0:
-                        sensitivity = tp / (tp + fn + 1e-8)
-                    else:
-                        sensitivity = np.nan
-                    tn = np.logical_and(~pred_class, ~gt_class).sum()
-                    fp = np.logical_and(pred_class, ~gt_class).sum()
-                    if (tn + fp) > 0:
-                        specificity = tn / (tn + fp + 1e-8)
-                    else:
-                        specificity = np.nan
-                    if gt_class.any() and pred_class.any():
-                        hd = hd95(
-                            pred_class.astype(np.bool_), gt_class.astype(np.bool_)
-                        )
-                    else:
-                        hd = 224
+                    hd = float(max(gt_np.shape))
+                bfscore = Evaluator_seg.compute_boundary_score(pred_class, gt_class)
 
                 dice_per_class[class_id].append(dice)
                 iou_per_class[class_id].append(iou)
                 sensitivity_per_class[class_id].append(sensitivity)
                 specificity_per_class[class_id].append(specificity)
                 hd95_per_class[class_id].append(hd)
+                bfscore_per_class[class_id].append(bfscore)
 
         return {
             "dice_per_class": dice_per_class,
@@ -305,6 +297,7 @@ class Evaluator_seg:
             "sensitivity_per_class": sensitivity_per_class,
             "specificity_per_class": specificity_per_class,
             "hd95_per_class": hd95_per_class,
+            "bfscore_per_class": bfscore_per_class,
         }
 
     @staticmethod
@@ -382,6 +375,7 @@ class Evaluator_seg:
         all_sensitivity_per_class = [[] for _ in range(num_classes)]
         all_specificity_per_class = [[] for _ in range(num_classes)]
         all_hd95_per_class = [[] for _ in range(num_classes)]
+        all_bfscore_per_class = [[] for _ in range(num_classes)]
 
         for batch in batch_metrics:
             all_pixel_acc.extend(batch["pixel_acc"])
@@ -395,6 +389,7 @@ class Evaluator_seg:
                     batch["specificity_per_class"][class_id]
                 )
                 all_hd95_per_class[class_id].extend(batch["hd95_per_class"][class_id])
+                all_bfscore_per_class[class_id].extend(batch["bfscore_per_class"][class_id])
 
         foreground_ids = list(range(1, num_classes))
 
@@ -430,6 +425,12 @@ class Evaluator_seg:
             ),
             "HD95_std": np.nanstd(
                 [item for i in foreground_ids for item in all_hd95_per_class[i]]
+            ),
+            "BFScore": np.nanmean(
+                [np.nanmean(all_bfscore_per_class[i]) for i in foreground_ids]
+            ),
+            "BFScore_std": np.nanstd(
+                [item for i in foreground_ids for item in all_bfscore_per_class[i]]
             ),
         }
 
@@ -540,7 +541,7 @@ class Evaluator_seg:
                     elif not pred_np.any() and not gt_np.any():
                         hausdorff = 0
                     else:
-                        hausdorff = 224
+                        hausdorff = float(max(gt_np.shape))
                     iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
                     biou = Evaluator_seg.boundary_iou(pred_np, gt_np)
                     sens = recall(pred_np, gt_np)
@@ -602,6 +603,7 @@ class Evaluator_seg:
         sensitivity_per_class = [[] for _ in range(num_classes)]
         specificity_per_class = [[] for _ in range(num_classes)]
         hd95_per_class = [[] for _ in range(num_classes)]
+        bfscore_per_class = [[] for _ in range(num_classes)]
 
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
@@ -614,20 +616,24 @@ class Evaluator_seg:
         with torch.no_grad():
             for batch in data_loader:
                 images = batch[0].to(device)
-                labels = batch[1].to(device)  # [B, C, H, W]
+                labels = batch[1].to(device)
                 batch_fnames = list(batch[-1]) if isinstance(batch[-1], (list, tuple)) and batch[-1] and isinstance(batch[-1][0], str) else None
-                gt_indices = torch.argmax(labels, dim=1)  # [B, H, W]
+                # labels can be one-hot [B, num_classes, H, W] or index map [B, 1, H, W] / [B, H, W]
+                if labels.dim() == 4 and labels.shape[1] == num_classes:
+                    gt_indices = torch.argmax(labels, dim=1)  # [B, H, W]
+                else:
+                    gt_indices = labels.squeeze(1).long()  # [B, H, W]
 
                 if img_size is not None:
                     raw_out = model(images, True, img_size)
                     output_masks = raw_out["masks"]
-                    preds = torch.argmax(torch.softmax(output_masks, dim=1), dim=1)
+                    preds = torch.argmax(output_masks, dim=1)
                 else:
                     output_masks = model(images)  # [B, num_classes, H, W]
                     preds = torch.argmax(output_masks, dim=1)  # [B, H, W]
 
                 if criterion is not None:
-                    loss = criterion(output_masks, labels.float())
+                    loss = criterion(output_masks, gt_indices.long())
                     total_loss += loss.item() * images.size(0)
                     total_samples += images.size(0)
 
@@ -648,36 +654,27 @@ class Evaluator_seg:
                         pred_class = pred_np == class_id
                         gt_class = gt_np == class_id
 
-                        if not (gt_class.any() or pred_class.any()):
-                            dice = 1.0
-                            biou = 1.0
-                            iou = 1.0
-                            sensitivity = np.nan
-                            specificity = np.nan
-                            hd = np.nan
+                        # Only evaluate samples where gt contains this class
+                        if not gt_class.any():
+                            continue
+
+                        tp = np.logical_and(pred_class, gt_class).sum()
+                        dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
+                        iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
+                        biou = Evaluator_seg.boundary_iou(pred_class, gt_class)
+                        fn = np.logical_and(~pred_class, gt_class).sum()
+                        sensitivity = tp / (tp + fn + 1e-8)
+                        tn = np.logical_and(~pred_class, ~gt_class).sum()
+                        fp = np.logical_and(pred_class, ~gt_class).sum()
+                        specificity = tn / (tn + fp + 1e-8)
+                        if pred_class.any():
+                            hd = hd95(
+                                pred_class.astype(np.bool_),
+                                gt_class.astype(np.bool_),
+                            )
                         else:
-                            tp = np.logical_and(pred_class, gt_class).sum()
-                            dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
-                            iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
-                            biou = Evaluator_seg.boundary_iou(pred_class, gt_class)
-                            fn = np.logical_and(~pred_class, gt_class).sum()
-                            if (tp + fn) > 0:
-                                sensitivity = tp / (tp + fn + 1e-8)
-                            else:
-                                sensitivity = np.nan
-                            tn = np.logical_and(~pred_class, ~gt_class).sum()
-                            fp = np.logical_and(pred_class, ~gt_class).sum()
-                            if (tn + fp) > 0:
-                                specificity = tn / (tn + fp + 1e-8)
-                            else:
-                                specificity = np.nan
-                            if gt_class.any() and pred_class.any():
-                                hd = hd95(
-                                    pred_class.astype(np.bool_),
-                                    gt_class.astype(np.bool_),
-                                )
-                            else:
-                                hd = 224
+                            hd = float(max(gt_np.shape))
+                        bfscore = Evaluator_seg.compute_boundary_score(pred_class, gt_class)
 
                         dice_per_class[class_id].append(dice)
                         iou_per_class[class_id].append(iou)
@@ -685,6 +682,7 @@ class Evaluator_seg:
                         specificity_per_class[class_id].append(specificity)
                         hd95_per_class[class_id].append(hd)
                         boundary_iou_per_class[class_id].append(biou)
+                        bfscore_per_class[class_id].append(bfscore)
 
         foreground_ids = list(range(1, num_classes))
 
@@ -727,6 +725,30 @@ class Evaluator_seg:
         metrics["BoundaryIoU_std"] = np.nanstd(
             [item for i in foreground_ids for item in boundary_iou_per_class[i]]
         )
+        metrics["BFScore"] = np.nanmean(
+            [np.nanmean(bfscore_per_class[i]) for i in foreground_ids]
+        )
+        metrics["BFScore_std"] = np.nanstd(
+            [item for i in foreground_ids for item in bfscore_per_class[i]]
+        )
+
+        # Per-class metrics for each foreground class
+        for i in foreground_ids:
+            metrics[f"Dice_class_{i}"] = np.nanmean(dice_per_class[i])
+            metrics[f"Dice_class_{i}_std"] = np.nanstd(dice_per_class[i])
+            metrics[f"IoU_class_{i}"] = np.nanmean(iou_per_class[i])
+            metrics[f"IoU_class_{i}_std"] = np.nanstd(iou_per_class[i])
+            metrics[f"HD95_class_{i}"] = np.nanmean(hd95_per_class[i])
+            metrics[f"HD95_class_{i}_std"] = np.nanstd(hd95_per_class[i])
+            metrics[f"Sensitivity_class_{i}"] = np.nanmean(sensitivity_per_class[i])
+            metrics[f"Sensitivity_class_{i}_std"] = np.nanstd(sensitivity_per_class[i])
+            metrics[f"Specificity_class_{i}"] = np.nanmean(specificity_per_class[i])
+            metrics[f"Specificity_class_{i}_std"] = np.nanstd(specificity_per_class[i])
+            metrics[f"BoundaryIoU_class_{i}"] = np.nanmean(boundary_iou_per_class[i])
+            metrics[f"BoundaryIoU_class_{i}_std"] = np.nanstd(boundary_iou_per_class[i])
+            metrics[f"BFScore_class_{i}"] = np.nanmean(bfscore_per_class[i])
+            metrics[f"BFScore_class_{i}_std"] = np.nanstd(bfscore_per_class[i])
+
         if criterion is not None:
             metrics["loss"] = total_loss / total_samples if total_samples > 0 else 0.0
 
@@ -868,6 +890,14 @@ class Evaluator_seg:
 
     @staticmethod
     def print_metrics(metrics: Dict[str, float], phase: str = "Validation") -> None:
+        # Detect per-class keys (e.g. Dice_class_1)
+        class_ids = sorted({
+            int(k.split("_class_")[1].split("_")[0])
+            for k in metrics
+            if "_class_" in k and not k.endswith("_std")
+            and k.split("_class_")[1].split("_")[0].isdigit()
+        })
+
         if phase.lower().startswith("test"):
             logger.info(
                 f'{phase} Metrics - Dice: {metrics["Dice"]:.4f}±{metrics["Dice_std"]:.4f}, '
@@ -879,6 +909,13 @@ class Evaluator_seg:
                 f'Specificity: {metrics["Specificity"]:.4f}±{metrics["Specificity_std"]:.4f}, '
                 f'PixelAcc: {metrics["PixelAcc"]:.4f}±{metrics["PixelAcc_std"]:.4f}'
             )
+            for c in class_ids:
+                logger.info(
+                    f'  Class {c} - '
+                    f'Dice: {metrics.get(f"Dice_class_{c}", float("nan")):.4f}±{metrics.get(f"Dice_class_{c}_std", float("nan")):.4f}, '
+                    f'HD95: {metrics.get(f"HD95_class_{c}", float("nan")):.2f}±{metrics.get(f"HD95_class_{c}_std", float("nan")):.2f}, '
+                    f'IoU: {metrics.get(f"IoU_class_{c}", float("nan")):.4f}±{metrics.get(f"IoU_class_{c}_std", float("nan")):.4f}'
+                )
         else:
             logger.info(
                 f'{phase} Metrics - Dice: {metrics["Dice"]:.4f}, '
@@ -886,6 +923,13 @@ class Evaluator_seg:
                 f'IOU: {metrics["IoU"]:.4f}, Sensitivity: {metrics["Sensitivity"]:.4f}, '
                 f'Specificity: {metrics["Specificity"]:.4f}, PixelAcc: {metrics["PixelAcc"]:.4f}'
             )
+            for c in class_ids:
+                logger.info(
+                    f'  Class {c} - '
+                    f'Dice: {metrics.get(f"Dice_class_{c}", float("nan")):.4f}, '
+                    f'HD95: {metrics.get(f"HD95_class_{c}", float("nan")):.2f}, '
+                    f'IoU: {metrics.get(f"IoU_class_{c}", float("nan")):.4f}'
+                )
 
     @staticmethod
     def build_per_sample_df(
@@ -952,24 +996,38 @@ class Evaluator_seg:
 
                     fg = range(1, num_classes)
                     dice_vals, hd_vals, iou_vals = [], [], []
-                    sens_vals, spec_vals = [], []
+                    sens_vals, spec_vals, bf_vals = [], [], []
+                    per_class = {}
                     for c in fg:
                         p = pred_cls == c
                         g = gt_cls == c
                         if not (p.any() or g.any()):
+                            per_class[c] = {
+                                "Dice": np.nan, "HD95": np.nan, "IoU": np.nan,
+                                "Sensitivity": np.nan, "Specificity": np.nan, "BFScore": np.nan,
+                            }
                             continue
                         tp = np.logical_and(p, g).sum()
-                        dice_vals.append(2 * tp / (p.sum() + g.sum() + 1e-8))
-                        iou_vals.append(Evaluator_seg.compute_jaccard(p, g))
-                        if p.any() and g.any():
-                            hd_vals.append(hd95(p.astype(bool), g.astype(bool)))
-                        else:
-                            hd_vals.append(224.0)
+                        dice_c = float(2 * tp / (p.sum() + g.sum() + 1e-8))
+                        iou_c = float(Evaluator_seg.compute_jaccard(p, g))
+                        hd_c = float(hd95(p.astype(bool), g.astype(bool))) if (p.any() and g.any()) else 224.0
                         fn = np.logical_and(~p, g).sum()
-                        sens_vals.append(tp / (tp + fn + 1e-8) if (tp + fn) > 0 else np.nan)
+                        sens_c = float(tp / (tp + fn + 1e-8)) if (tp + fn) > 0 else np.nan
                         tn = np.logical_and(~p, ~g).sum()
                         fp = np.logical_and(p, ~g).sum()
-                        spec_vals.append(tn / (tn + fp + 1e-8) if (tn + fp) > 0 else np.nan)
+                        spec_c = float(tn / (tn + fp + 1e-8)) if (tn + fp) > 0 else np.nan
+                        bf_c = float(Evaluator_seg.compute_boundary_score(p, g))
+
+                        dice_vals.append(dice_c)
+                        iou_vals.append(iou_c)
+                        hd_vals.append(hd_c)
+                        sens_vals.append(sens_c)
+                        spec_vals.append(spec_c)
+                        bf_vals.append(bf_c)
+                        per_class[c] = {
+                            "Dice": dice_c, "HD95": hd_c, "IoU": iou_c,
+                            "Sensitivity": sens_c, "Specificity": spec_c, "BFScore": bf_c,
+                        }
 
                     record = {
                         "filename":    fname,
@@ -979,11 +1037,11 @@ class Evaluator_seg:
                         "Sensitivity": float(np.nanmean(sens_vals)) if sens_vals else np.nan,
                         "Specificity": float(np.nanmean(spec_vals)) if spec_vals else np.nan,
                         "PixelAcc":    float((pred_cls == gt_cls).mean()),
-                        "BFScore":     float(np.nanmean([
-                            Evaluator_seg.compute_boundary_score(pred_cls == c, gt_cls == c)
-                            for c in fg
-                        ])) if list(fg) else np.nan,
+                        "BFScore":     float(np.nanmean(bf_vals)) if bf_vals else np.nan,
                     }
+                    for c, cm in per_class.items():
+                        for metric_name, val in cm.items():
+                            record[f"{metric_name}_class_{c}"] = val
 
                 records.append(record)
                 sample_idx += 1

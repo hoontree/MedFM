@@ -4,7 +4,7 @@ training:
   num_epochs: 1000
   lr: 0.0001
   warmup_epochs: 2
-  batch_size: 64
+  batch_size: 32
   num_workers: 4
   limit_train_batches: null
   dice_weight: 0.8
@@ -45,6 +45,19 @@ visualization:
 
 # Wandb configuration
 wandb:
-  project: medical_foundation_models
+  project: sam_train
   entity: hheo
   log_model: true
+  log_config:
+    model:
+      name: ${model.name}
+      encoder_mode: ${model.encoder_mode}
+      decoder_mode: ${model.decoder_mode}
+    training:
+      lr: ${training.lr}
+      batch_size: ${training.batch_size}
+      num_epochs: ${training.num_epochs}
+      dice_weight: ${training.dice_weight}
+    data:
+      multiclass: ${data.multiclass}
+      num_classes: ${data.num_classes}

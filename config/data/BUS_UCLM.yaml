@@ -9,7 +9,8 @@ path:
     vis:
       samples: 16
       interval: 10
-num_classes: 1
+num_classes: 1  # Binary: 1, Multiclass: 3 (background=0, benign=1, malignant=2)
+multiclass: false  # Set true + num_classes=3 for multiclass training
 auto_img_size_by_sam_type: true
 sam_img_size_map:
   vit_b: 224
@@ -19,7 +20,7 @@ extensions: [".png"]
 partition_dir: "partitions"  # train/test split directory
 seed: 42
 usage: train # train or external
-filter_empty_masks: true # Filter out images with empty masks (Normal cases) to balance training
+filter_empty_masks: false # Keep all images including Normal cases (empty masks)
 normalization: "min_max" # Options: "imagenet", "min_max"
 
 # Color to class mapping
