@@ -1,0 +1,48 @@
+# Channel-wise Knowledge Distillation (CWD) preset
+# Reference: Shu et al., "Channel-wise Knowledge Distillation for Dense
+# Prediction", ICCV 2021. Re-implemented from scratch — submodule code is
+# pinned to PyTorch 0.4.1 and is not imported here.
+#
+# Application points (binary medical segmentation, TinyUSFM → SAM):
+#   - delta: CWD on the final logit map (replaces vanilla per-pixel KL)
+#   - zeta : CWD on intermediate features (replaces MSE feature loss)
+#
+# Recipes:
+#   - logit-only:   beta=0, gamma=0, delta=1, zeta=0
+#   - feature-only: beta=0, gamma=0, delta=0, zeta=1
+#   - combined:     beta=0, gamma=0, delta=1, zeta=1   (paper's "single+whole")
+
+_target_: distillers.UnifiedDistiller
+
+name: cwd
+temperature: 4.0
+cwd_temperature: 4.0
+
+# Disable vanilla KL/MSE — CWD takes their place
+alpha: 1.0
+beta: 0.0
+gamma: 0.0
+delta: 1.0   # logit-CWD
+zeta: 1.0    # feature-CWD
+
+# Task loss components
+use_dice: true
+use_ce: true
+
+# Feature pairs for zeta>0 (channels matched via FeatureAdapter)
+layer_mapping:
+  backbone.blocks.7: sam.image_encoder.blocks.7
+  backbone.blocks.9: sam.image_encoder.blocks.9
+  backbone.blocks.11: sam.image_encoder.blocks.11
+
+layer_channels:
+  backbone.blocks.7: 192
+  backbone.blocks.9: 192
+  backbone.blocks.11: 192
+  sam.image_encoder.blocks.7: 768
+  sam.image_encoder.blocks.9: 768
+  sam.image_encoder.blocks.11: 768
+
+# Uncertainty-weighted KD off in CWD baseline
+use_uncertainty_weighted_kd: false
+kd_lambda: 0.0

@@ -8,7 +8,13 @@ from distillers.base_distiller import BaseDistiller
 logger = logging.getLogger(__name__)
 
 
-from utils.criterion import TaskLoss, LogitDistillLoss, FeatureDistillLoss, UncertaintyWeightedKDLoss
+from utils.criterion import (
+    TaskLoss,
+    LogitDistillLoss,
+    FeatureDistillLoss,
+    UncertaintyWeightedKDLoss,
+    ChannelWiseDistillLoss,
+)
 from utils.feature_extractor import FeatureExtractor
 
 
@@ -53,6 +59,15 @@ class UnifiedDistiller(BaseDistiller):
             temperature=self.temperature,
         )
         self.feature_loss_fn = FeatureDistillLoss()
+
+        # Channel-wise distillation (CWD, ICCV 2021) — works on dense
+        # spatial saliency per channel. Two independent application points:
+        #   - logit-CWD  (delta): on the final logit map
+        #   - feature-CWD (zeta): on intermediate features (replaces MSE feat)
+        self.cwd_temperature = cfg.method.get("cwd_temperature", self.temperature)
+        self.delta = float(cfg.method.get("delta", 0.0))  # logit-CWD weight
+        self.zeta = float(cfg.method.get("zeta", 0.0))    # feature-CWD weight
+        self.cwd_loss_fn = ChannelWiseDistillLoss(temperature=self.cwd_temperature)
 
         # Uncertainty-weighted KD (optional)
         self.use_uncertainty_kd = cfg.method.get("use_uncertainty_weighted_kd", False)
@@ -127,6 +142,44 @@ class UnifiedDistiller(BaseDistiller):
         }
         return loss, diagnostics
 
+    def _collect_feature_pairs(self):
+        """Walk layer_mapping and yield (student_feat, teacher_feat) tensors
+        already reshaped to [B, C, H, W] and channel-adapted."""
+        s_feats = self.student_extractor.get_features()
+        t_feats = self.teacher_extractor.get_features()
+
+        for s_layer, t_layer in self.layer_mapping.items():
+            s_f = s_feats.get(s_layer)
+            t_f = t_feats.get(t_layer)
+            if s_f is None or t_f is None:
+                continue
+
+            # Student: [B, N, C] → [B, C, H, W] (handle optional CLS token)
+            if s_f.dim() == 3:
+                B, N, C = s_f.shape
+                H_sq = int(N ** 0.5)
+                if H_sq * H_sq == N:
+                    H = W = H_sq
+                else:
+                    N_no_cls = N - 1
+                    H_sq = int(N_no_cls ** 0.5)
+                    if H_sq * H_sq == N_no_cls:
+                        s_f = s_f[:, 1:, :]
+                        H = W = H_sq
+                    else:
+                        continue
+                s_f = s_f.transpose(1, 2).reshape(B, s_f.shape[-1], H, W)
+
+            # Teacher: SAM-style [B, H, W, C] → [B, C, H, W]
+            if t_f.dim() == 4 and t_f.shape[1] < t_f.shape[3]:
+                t_f = t_f.permute(0, 3, 1, 2)
+
+            adapter_key = s_layer.replace(".", "_")
+            if adapter_key in self.adapters:
+                s_f = self.adapters[adapter_key](s_f)
+
+            yield s_f, t_f
+
     def _compute_feature_loss(self, device):
         """Feature Distillation (MSE on intermediate layers) - gamma"""
         if (
@@ -136,51 +189,35 @@ class UnifiedDistiller(BaseDistiller):
         ):
             return self._zero(device)
 
-        s_feats = self.student_extractor.get_features()
-        t_feats = self.teacher_extractor.get_features()
-
         feature_loss = self._zero(device)
         count = 0
-        for s_layer, t_layer in self.layer_mapping.items():
-            s_f = s_feats.get(s_layer)
-            t_f = t_feats.get(t_layer)
-
-            if s_f is not None and t_f is not None:
-                # Convert student feature from sequence to spatial if needed
-                if s_f.dim() == 3:  # [B, N, C] format
-                    B, N, C = s_f.shape
-                    # CLS token 여부에 따라 분기: N이 perfect square이면 CLS 없음
-                    H_sq = int(N ** 0.5)
-                    if H_sq * H_sq == N:
-                        H = W = H_sq
-                    else:
-                        # CLS token이 있는 경우 제거 후 square 여부 재확인
-                        N_no_cls = N - 1
-                        H_sq = int(N_no_cls ** 0.5)
-                        if H_sq * H_sq == N_no_cls:
-                            s_f = s_f[:, 1:, :]  # Remove CLS token
-                            H = W = H_sq
-                            N = N_no_cls
-                        else:
-                            # reshape 불가 — 이 layer는 skip
-                            continue
-                    s_f = s_f.transpose(1, 2).reshape(B, C, H, W)
-
-                # Convert teacher feature from SAM format if needed
-                if (
-                    t_f.dim() == 4 and t_f.shape[1] < t_f.shape[3]
-                ):  # Likely [B, H, W, C]
-                    t_f = t_f.permute(0, 3, 1, 2)
-
-                # Adapt student if needed
-                adapter_key = s_layer.replace(".", "_")
-                if adapter_key in self.adapters:
-                    s_f = self.adapters[adapter_key](s_f)
-
-                feature_loss += self.feature_loss_fn(s_f, t_f)
-                count += 1
+        for s_f, t_f in self._collect_feature_pairs():
+            feature_loss = feature_loss + self.feature_loss_fn(s_f, t_f)
+            count += 1
 
         return feature_loss / count if count > 0 else feature_loss
+
+    def _compute_logit_cwd_loss(self, student_logits, teacher_logits):
+        """Channel-wise distillation on the final logit map - delta"""
+        if self.delta <= 0:
+            return self._zero(student_logits.device)
+        return self.cwd_loss_fn(student_logits, teacher_logits)
+
+    def _compute_feature_cwd_loss(self, device):
+        """Channel-wise distillation on intermediate features - zeta"""
+        if (
+            self.zeta <= 0
+            or self.teacher_extractor is None
+            or self.student_extractor is None
+        ):
+            return self._zero(device)
+
+        cwd_loss = self._zero(device)
+        count = 0
+        for s_f, t_f in self._collect_feature_pairs():
+            cwd_loss = cwd_loss + self.cwd_loss_fn(s_f, t_f)
+            count += 1
+        return cwd_loss / count if count > 0 else cwd_loss
 
     def forward(
         self,
@@ -214,11 +251,19 @@ class UnifiedDistiller(BaseDistiller):
         # 3. Feature Distillation
         losses["feature_loss"] = self._compute_feature_loss(device)
 
+        # 4. Channel-wise distillation (CWD) on logits and/or features
+        losses["logit_cwd_loss"] = self._compute_logit_cwd_loss(
+            student_logits, teacher_logits
+        )
+        losses["feature_cwd_loss"] = self._compute_feature_cwd_loss(device)
+
         # Total Loss (Weighted sum with fixed coefficients from cfg)
         total_loss = (
             self.alpha * losses["task_loss"]
             + self.beta * losses["distill_loss"]
             + self.gamma * losses["feature_loss"]
+            + self.delta * losses["logit_cwd_loss"]
+            + self.zeta * losses["feature_cwd_loss"]
         )
 
         # 4. Uncertainty-weighted KD (optional, disabled by default)
@@ -232,7 +277,13 @@ class UnifiedDistiller(BaseDistiller):
         losses["loss"] = total_loss
 
         # Log per-component raw and weighted values
-        weights = {"task_loss": self.alpha, "distill_loss": self.beta, "feature_loss": self.gamma}
+        weights = {
+            "task_loss": self.alpha,
+            "distill_loss": self.beta,
+            "feature_loss": self.gamma,
+            "logit_cwd_loss": self.delta,
+            "feature_cwd_loss": self.zeta,
+        }
         for key, weight_val in weights.items():
             if key in losses:
                 raw_val = losses[key].item()

@@ -202,6 +202,67 @@ class FeatureDistillLoss(nn.Module):
                 align_corners=False,
             )
         return self.mse(student_feat, teacher_feat)
+
+
+class ChannelWiseDistillLoss(nn.Module):
+    """
+    Channel-wise Knowledge Distillation (CWD) for dense prediction.
+    Reference: Shu et al., ICCV 2021 (re-implemented from scratch — submodule
+    code targets PyTorch 0.4.1 and is not imported).
+
+    Each channel's spatial activations are softmax-normalized into a probability
+    map, then KL divergence is computed channel-by-channel between teacher and
+    student. The result is averaged over channels and batch.
+
+    Works with any (B, C, H, W) pair where C matches between student and
+    teacher. For binary segmentation (C=1) it still yields a meaningful spatial
+    saliency-alignment signal, unlike per-pixel KL which collapses to a near-
+    trivial 2-class distribution.
+
+    Args:
+        temperature:    softmax temperature τ (default 4.0).
+        match_spatial: bilinearly resize teacher to student spatial size if
+                       they differ (default True).
+    """
+
+    def __init__(self, temperature: float = 4.0, match_spatial: bool = True):
+        super().__init__()
+        self.temperature = temperature
+        self.match_spatial = match_spatial
+
+    def forward(
+        self, student_feat: torch.Tensor, teacher_feat: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            student_feat: [B, C, H, W]   logits or feature map
+            teacher_feat: [B, C, H', W'] same C; H'×W' may differ
+        Returns:
+            Scalar CWD loss.
+        """
+        if self.match_spatial and student_feat.shape[-2:] != teacher_feat.shape[-2:]:
+            teacher_feat = F.interpolate(
+                teacher_feat,
+                size=student_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        assert student_feat.shape[1] == teacher_feat.shape[1], (
+            f"CWD requires matching channel count, "
+            f"got student C={student_feat.shape[1]} vs teacher C={teacher_feat.shape[1]}"
+        )
+
+        T = self.temperature
+        B, C, H, W = student_feat.shape
+
+        # Per-channel spatial softmax: each channel becomes a probability map
+        s_log = F.log_softmax(student_feat.reshape(B, C, -1) / T, dim=-1)
+        t_prob = F.softmax(teacher_feat.reshape(B, C, -1) / T, dim=-1)
+
+        # KL(t || s) accumulated over spatial positions, mean over (B, C), τ²-rescaled
+        kl = (t_prob * (t_prob.clamp(min=1e-8).log() - s_log)).sum(dim=-1)  # [B, C]
+        return kl.mean() * (T ** 2)
     
 # ---------------------------------------------------------------------------
 # Uncertainty-Weighted Knowledge Distillation

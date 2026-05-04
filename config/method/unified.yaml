@@ -9,6 +9,11 @@ temperature: 4.0
 alpha: 1.0   # Task loss (GT Dice/CE)
 beta: 1.0    # Logit KD (KL Divergence)
 gamma: 0     # Feature KD (MSE on intermediate layers)
+delta: 0.0   # Channel-wise distillation on logits  (CWD, ICCV 2021)
+zeta: 0.0    # Channel-wise distillation on features (CWD on intermediate layers)
+
+# CWD temperature (defaults to `temperature` if unset). Paper recommends τ=4.
+cwd_temperature: 4.0
 
 # Task loss components
 use_dice: true
