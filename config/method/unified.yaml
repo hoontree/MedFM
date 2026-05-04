@@ -1,23 +1,14 @@
 # Unified Distillation Configuration
-# Supports: Task Loss, Logit KD, Feature KD, Attention KD, Alignment KD
 
 _target_: distillers.UnifiedDistiller
 
 name: unified
 temperature: 4.0
 
-# Loss weights (Set to 0.0 to disable a component)
-alpha: 1.0        # Task loss (GT Dice/CE)
-beta: 1.0         # Logit KD (KL Divergence)
-gamma: 0        # Feature KD (MSE on intermediate layers)
-gamma_attn: 0   # Attention Map KD (MSE)
-gamma_align: 0  # Alignment Layer KD (MSE)
-
-# --- Advanced Distillation Losses (lambda > 0) ---
-lambda_boundary: 0     # Boundary KD (Sobel edge map)
-lambda_shape: 0        # Shape KD (Signed Distance Transform)
-lambda_uncertainty: 0  # Uncertainty KD (Entropy map)
-
+# Loss weights (set to 0.0 to disable a component)
+alpha: 1.0   # Task loss (GT Dice/CE)
+beta: 1.0    # Logit KD (KL Divergence)
+gamma: 0     # Feature KD (MSE on intermediate layers)
 
 # Task loss components
 use_dice: true
@@ -33,21 +24,14 @@ layer_channels:
   backbone.blocks.7: 192
   backbone.blocks.9: 192
   backbone.blocks.11: 192
-
-  sam.image_encoder.blocks.0: 768
-  sam.image_encoder.blocks.1: 768
-  sam.image_encoder.blocks.2: 768
-  sam.image_encoder.blocks.3: 768
-  sam.image_encoder.blocks.4: 768
-  sam.image_encoder.blocks.5: 768
-  sam.image_encoder.blocks.6: 768
   sam.image_encoder.blocks.7: 768
-  sam.image_encoder.blocks.8: 768
   sam.image_encoder.blocks.9: 768
-  sam.image_encoder.blocks.10: 768
   sam.image_encoder.blocks.11: 768
 
-# --- GradNorm Configuration ---
-use_gradnorm: false      # Automatically balance loss weights
-gradnorm_alpha: 0.1      # Update rate for GradNorm (alpha damping)
-reference_layer: backbone.blocks.11  # Reference layer for gradient matching
+# --- Uncertainty-Weighted KD (disabled by default) ---
+use_uncertainty_weighted_kd: true
+kd_lambda: 1.0                   # weight for uncertainty KD term in total loss
+kd_tau: 4.0                      # temperature (defaults to same as `temperature`)
+uncertainty_weight_type: linear  # "linear" or "exp"
+uncertainty_beta: 1.0            # decay rate for exp mode
+uncertainty_eps: 1.0e-8          # log-stability epsilon for entropy

@@ -11,6 +11,7 @@ ENV/
 
 # Logs and results
 logs/
+experiment_results/
 results/
 wandb/
 *.log
@@ -52,3 +53,6 @@ scripts/
 tests/
 wandb/
 notebooks/
+
+# External distillation reference repos (not direct dependencies)
+submodules/

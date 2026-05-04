@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TinyUSFM is a multi-model medical image segmentation training framework focusing on knowledge distillation from SAM (Segment Anything Model) to lightweight models. The project supports training, testing, and distillation workflows for medical imaging segmentation tasks.
+TinyUSFM is a multi-model medical image segmentation training framework focusing on knowledge distillation for medical imaging segmentation tasks. Currently, TinyUSFM outperforms SAM across all evaluation metrics, so experiments are being conducted in the **TinyUSFM → SAM** distillation direction (TinyUSFM as teacher, SAM as student).
 
 **Key Models:**
-- **SAM (Segment Anything Model)**: Teacher model with LoRA fine-tuning (vit_b, vit_l, vit_h variants)
-- **TinyUSFM**: Lightweight student model for efficient inference
+- **TinyUSFM**: Lightweight model — currently used as **teacher** (outperforms SAM on all metrics)
+- **SAM (Segment Anything Model)**: Now used as **student**, with LoRA fine-tuning (vit_b, vit_l, vit_h variants)
 - **SegFormer**: Alternative segmentation model
 
 ## Essential Commands
@@ -52,7 +52,7 @@ uv run main.py test_only.enabled=true test_only.checkpoint_path=/path/to/checkpo
 ### Knowledge Distillation
 
 ```bash
-# Basic distillation (SAM → TinyUSFM)
+# Basic distillation (TinyUSFM → SAM, current experimental direction)
 uv run distill.py
 
 # Override distillation parameters
@@ -140,8 +140,8 @@ Models are in `model/` directory:
 
 Located in `distill.py`, implemented in `distillers/unified_distiller.py`:
 
-- **Teacher**: Fine-tuned SAM with LoRA (frozen during distillation)
-- **Student**: TinyUSFM (trained)
+- **Teacher**: TinyUSFM (frozen during distillation — outperforms SAM on all metrics)
+- **Student**: SAM with LoRA (trained)
 - **Loss components** (`UnifiedDistiller`):
   - Task loss (α): Ground truth segmentation loss (BCE + Dice)
   - Distillation loss (β): KL divergence between teacher/student logits with temperature scaling

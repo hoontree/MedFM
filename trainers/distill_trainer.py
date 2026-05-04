@@ -135,7 +135,7 @@ class DistillTrainer(BaseTrainer):
             exp_name = (
                 None
                 if is_sweep
-                else f"{self.teacher_short}_{self.student_short}_{self.cfg.method.name}_{self.dataset_name}"
+                else f"{self.teacher_short}_{self.student_short}_{self.cfg.method.name}"
             )
             self.wandb_run = wandb.init(
                 project=self.cfg.wandb.project,
@@ -174,6 +174,14 @@ class DistillTrainer(BaseTrainer):
             SegDatasetProcessor.build_data_loaders(self.cfg)
         )
 
+    @property
+    def _is_online(self) -> bool:
+        """Return True when online distillation is active.
+
+        Triggered automatically when method.name == 'online'
+        """
+        return self.cfg.get("method", {}).get("name") == "online"
+
     def _create_model(self):
         """Create teacher, student, and distiller."""
         if self.teacher_ckpt:
@@ -181,9 +189,16 @@ class DistillTrainer(BaseTrainer):
 
         self.teacher = instantiate(self.cfg.teacher)
         self.teacher = self.teacher.to(self.device)
-        self.teacher.eval()
-        for param in self.teacher.parameters():
-            param.requires_grad = False
+
+        if self._is_online:
+            self.teacher.train()
+            self.logger.info(
+                "[Online Distillation] Teacher is trainable (jointly updated with student)."
+            )
+        else:
+            self.teacher.eval()
+            for param in self.teacher.parameters():
+                param.requires_grad = False
 
         OmegaConf.set_struct(self.cfg.student, False)
         OmegaConf.set_struct(self.cfg.method, False)
@@ -232,6 +247,21 @@ class DistillTrainer(BaseTrainer):
         param_groups = [
             {"params": self.student.parameters(), "lr": self.cfg.training.lr}
         ]
+        if self._is_online:
+            teacher_trainable = [
+                p for p in self.teacher.parameters() if p.requires_grad
+            ]
+            if teacher_trainable:
+                teacher_lr = self.cfg.training.get(
+                    "teacher_lr", self.cfg.training.lr
+                )
+                param_groups.append(
+                    {"params": teacher_trainable, "lr": teacher_lr}
+                )
+                self.logger.info(
+                    f"[Online Distillation] Teacher trainable params: "
+                    f"{sum(p.numel() for p in teacher_trainable):,}  lr={teacher_lr}"
+                )
         if list(self.distiller.parameters()):
             param_groups.append(
                 {"params": self.distiller.parameters(), "lr": self.cfg.training.lr}
@@ -414,6 +444,8 @@ class DistillTrainer(BaseTrainer):
     def train_epoch(self, epoch) -> Dict[str, float]:
         self.student.train()
         self.distiller.train()
+        if self._is_online:
+            self.teacher.train()
 
         running_losses = {}
         pbar = tqdm(
@@ -429,8 +461,11 @@ class DistillTrainer(BaseTrainer):
 
             self.distiller.on_step_begin()
 
-            with torch.no_grad():
+            if self._is_online:
                 teacher_outputs = self._call_teacher(images)
+            else:
+                with torch.no_grad():
+                    teacher_outputs = self._call_teacher(images)
 
             student_outputs = self._call_student(images)
 
@@ -479,6 +514,8 @@ class DistillTrainer(BaseTrainer):
 
     def validate(self, epoch) -> Dict[str, float]:
         self.student.eval()
+        if self._is_online:
+            self.teacher.eval()
         val_metrics = self._evaluate_model(self.student, self.val_loader)
         self.logger.info(f"Epoch {epoch+1} Val Dice: {val_metrics['Dice']:.4f}")
         return val_metrics
@@ -608,16 +645,16 @@ class DistillTrainer(BaseTrainer):
             return {"masks": raw}
 
     def _save_distill_model(self, path: Path, epoch: int, metrics: dict):
-        """Save student + distiller state dict to path."""
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": self.student.state_dict(),
-                "distiller_state_dict": self.distiller.state_dict(),
-                **{k: v for k, v in metrics.items() if isinstance(v, (float, int))},
-            },
-            path,
-        )
+        """Save student + distiller (+ teacher if online) state dict to path."""
+        payload = {
+            "epoch": epoch + 1,
+            "model_state_dict": self.student.state_dict(),
+            "distiller_state_dict": self.distiller.state_dict(),
+            **{k: v for k, v in metrics.items() if isinstance(v, (float, int))},
+        }
+        if self._is_online:
+            payload["teacher_state_dict"] = self.teacher.state_dict()
+        torch.save(payload, path)
 
     @staticmethod
     def _numeric_items(d: dict) -> dict:

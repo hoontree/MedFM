@@ -17,7 +17,6 @@ hardware:
 
 # Global Flags
 debug: false
-use_gradnorm: false
 
 # Output & Visualization
 output:

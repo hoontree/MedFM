@@ -2,6 +2,6 @@
 name: TinyUSFM
 _target_: model.tinyusfm_seg.SegmentationModel
 num_classes: ${data.num_classes}
-checkpoint: "logs/train/TinyUSFM/20260326_170811_bs8_lr0.0001/checkpoints/best_epoch_59_dice_0.8019.pth"
+checkpoint: experiment_results/TinyUSFM_binary_ft/checkpoints/best_epoch_59_dice_0.8043.pth
 use_alignment: false
 img_size: ${data.img_size}

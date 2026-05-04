@@ -4,6 +4,7 @@
 training:
   num_epochs: 1000
   lr: 0.0001           # Learning rate for student
+  teacher_lr: 0.00001  # Learning rate for teacher (online distillation only)
   warmup_epochs: 5
   batch_size: 64
   num_workers: 8

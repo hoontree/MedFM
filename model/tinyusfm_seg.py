@@ -511,8 +511,13 @@ class SegmentationModel(nn.Module):
             self.mask_decoder = None
             self.sam_cls_conv = None
 
+        import os
         if self.checkpoint_path:
-            self.load_checkpoint(self.checkpoint_path)
+            self.load_finetuned(self.checkpoint_path)
+        else:
+            default_pretrained = "checkpoints/TinyUSFM.pt"
+            if os.path.exists(default_pretrained):
+                self.load_pretrained(default_pretrained)
 
     def forward(self, x, return_features=False):
         # Extract features from backbone
@@ -614,17 +619,15 @@ class SegmentationModel(nn.Module):
 
         return seg_logits
 
-    def load_checkpoint(self, path=None):
-        """Load checkpoint with TinyUSFM specific mapping."""
+    def load_pretrained(self, path=None):
+        """Load pretrained backbone weights with TinyUSFM key mapping (model. -> backbone.)."""
         load_path = path or self.checkpoint_path
         if not load_path:
-            print("Warning: No checkpoint path provided for load_checkpoint.")
+            print("Warning: No checkpoint path provided for load_pretrained.")
             return
 
         try:
             checkpoint = torch.load(load_path, map_location="cpu")
-            # TinyUSFM specific mapping: model. -> backbone.
-            # Also pass through keys that are already in the correct format (e.g. backbone.xxx)
             new_state_dict = {}
             for k, v in checkpoint.items():
                 if k.startswith("model."):
@@ -632,11 +635,34 @@ class SegmentationModel(nn.Module):
                 else:
                     new_state_dict[k] = v
             load_info = self.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded checkpoint from {load_path}")
+            print(f"Loaded pretrained weights from {load_path}")
             print(f"Missing keys: {len(load_info.missing_keys)}")
             print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
         except Exception as e:
-            print(f"Warning: Failed to load checkpoint. Error: {e}")
+            print(f"Warning: Failed to load pretrained weights. Error: {e}")
+
+    def load_finetuned(self, path):
+        """Load a finetuned checkpoint (keys already match this model's state dict)."""
+        try:
+            checkpoint = torch.load(path, map_location="cpu")
+            # Support checkpoints saved as {'model': state_dict, ...} or plain state dicts
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
+                state_dict = checkpoint["model"]
+            else:
+                state_dict = checkpoint
+            load_info = self.load_state_dict(state_dict, strict=False)
+            print(f"Loaded finetuned checkpoint from {path}")
+            print(f"Missing keys: {len(load_info.missing_keys)}")
+            print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
+        except Exception as e:
+            print(f"Warning: Failed to load finetuned checkpoint. Error: {e}")
+
+    def load_checkpoint(self, path=None):
+        """Load checkpoint with TinyUSFM specific mapping (pretrained weights).
+
+        Deprecated: use load_pretrained() or load_finetuned() instead.
+        """
+        self.load_pretrained(path)
 
     def load_sam_decoder_weights(self, path: str) -> None:
         """Load pretrained SAM weights into the sam_mask branch modules.

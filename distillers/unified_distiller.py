@@ -2,13 +2,13 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from distillers.base_distiller import BaseDistiller
 
 logger = logging.getLogger(__name__)
 
 
-from utils.sam_utils import DiceLoss
+from utils.criterion import TaskLoss, LogitDistillLoss, FeatureDistillLoss, UncertaintyWeightedKDLoss
 from utils.feature_extractor import FeatureExtractor
 
 
@@ -35,47 +35,36 @@ class UnifiedDistiller(BaseDistiller):
     3. Feature Distillation (MSE on intermediate layers) - gamma
     """
 
-    LOSS_WEIGHT_MAP = {
-        "task_loss": "alpha",
-        "distill_loss": "beta",
-        "feature_loss": "gamma",
-    }
-
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg)
         self.num_classes = cfg.data.num_classes
-
-        # GradNorm settings
-        self.use_gradnorm = cfg.method.get("use_gradnorm", False)
-        self.gradnorm_alpha = cfg.method.get("gradnorm_alpha", 0.1)
-        self.theta_ref_name = cfg.method.get("reference_layer", "backbone.blocks.11")
-
-        # Initial weights for GradNorm (if enabled, these will be optimized)
-        self.loss_weights = nn.ParameterDict(
-            {
-                "alpha": nn.Parameter(torch.tensor(float(self.alpha))),
-                "beta": nn.Parameter(torch.tensor(float(self.beta))),
-                "gamma": nn.Parameter(torch.tensor(float(self.gamma))),
-            }
-        )
-        for p in self.loss_weights.values():
-            p.requires_grad = (
-                False  # Weights are updated via GradNorm, not optimizer directly
-            )
 
         # Task Loss components
         self.use_dice = cfg.method.get("use_dice", True)
         self.use_ce = cfg.method.get("use_ce", True)
 
-        if self.num_classes == 1:
-            self.register_buffer("pos_weight", torch.tensor([5.0]))
-            self.task_criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-        else:
-            self.task_criterion = nn.CrossEntropyLoss()
+        self.task_loss_fn = TaskLoss(
+            num_classes=self.num_classes,
+            use_ce=self.use_ce,
+            use_dice=self.use_dice,
+        )
+        self.logit_loss_fn = LogitDistillLoss(
+            num_classes=self.num_classes,
+            temperature=self.temperature,
+        )
+        self.feature_loss_fn = FeatureDistillLoss()
 
-        self.dice_loss = DiceLoss(self.num_classes)
-        self.kl_div = nn.KLDivLoss(reduction="batchmean")
-        self.mse_loss = nn.MSELoss()
+        # Uncertainty-weighted KD (optional)
+        self.use_uncertainty_kd = cfg.method.get("use_uncertainty_weighted_kd", False)
+        self.kd_lambda = cfg.method.get("kd_lambda", 1.0)
+        if self.use_uncertainty_kd:
+            self.uncertainty_kd_fn = UncertaintyWeightedKDLoss(
+                num_classes=self.num_classes,
+                tau=cfg.method.get("kd_tau", self.temperature),
+                weight_type=cfg.method.get("uncertainty_weight_type", "linear"),
+                beta=cfg.method.get("uncertainty_beta", 1.0),
+                eps=cfg.method.get("uncertainty_eps", 1e-8),
+            )
 
         # Feature adapters (for multiple layer mapping)
         self.layer_mapping = cfg.method.get("layer_mapping", {})
@@ -92,12 +81,8 @@ class UnifiedDistiller(BaseDistiller):
         self.teacher_extractor: Optional[FeatureExtractor] = None
         self.student_extractor: Optional[FeatureExtractor] = None
 
-        # GradNorm reference parameters
-        self.theta_ref = None
-
     def prepare(self, student: nn.Module, teacher: nn.Module):
         """Setup hooks for feature extraction."""
-        # 1. Intermediate Feature Extraction
         t_layers = list(self.layer_mapping.values())
         s_layers = list(self.layer_mapping.keys())
 
@@ -105,31 +90,6 @@ class UnifiedDistiller(BaseDistiller):
             self.teacher_extractor = FeatureExtractor(teacher, t_layers)
         if s_layers:
             self.student_extractor = FeatureExtractor(student, s_layers)
-
-        # 2. GradNorm reference parameters
-        if self.use_gradnorm:
-            for name, module in student.named_modules():
-                if name == self.theta_ref_name:
-                    # Use all parameters in the module as reference
-                    self.theta_ref = list(module.parameters())
-                    logger.info(
-                        f"[UnifiedDistiller] GradNorm reference module: {name} ({len(self.theta_ref)} parameters)"
-                    )
-                    break
-            if self.theta_ref is None:
-                # Fallback: search in named_parameters if module name didn't match exactly
-                self.theta_ref = [
-                    p for n, p in student.named_parameters() if self.theta_ref_name in n
-                ]
-                if self.theta_ref:
-                    logger.info(
-                        f"[UnifiedDistiller] GradNorm reference parameters found by name pattern: {self.theta_ref_name} ({len(self.theta_ref)} parameters)"
-                    )
-                else:
-                    logger.warning(
-                        f"GradNorm reference layer '{self.theta_ref_name}' not found in student. GradNorm will be disabled."
-                    )
-                    self.use_gradnorm = False
 
     def on_step_begin(self):
         """Clear extracted features."""
@@ -146,50 +106,26 @@ class UnifiedDistiller(BaseDistiller):
         """Task Loss (GT Dice/CE) - alpha"""
         if self.alpha <= 0:
             return self._zero(student_logits.device)
-
-        target_mask = targets.float()
-        losses = []
-        if self.use_ce:
-            if self.num_classes == 1:
-                losses.append(self.task_criterion(student_logits, target_mask))
-            else:
-                target_idx = targets.argmax(dim=1).long()
-                losses.append(self.task_criterion(student_logits, target_idx))
-        if self.use_dice:
-            use_softmax = self.num_classes > 1
-            losses.append(self.dice_loss(student_logits, target_mask, softmax=use_softmax, sigmoid=not use_softmax))
-        return (
-            sum(losses) / len(losses) if losses else self._zero(student_logits.device)
-        )
+        return self.task_loss_fn(student_logits, targets)
 
     def _compute_logit_loss(self, student_logits, teacher_logits):
         """Logit Distillation (KL Div) - beta"""
         if self.beta <= 0:
             return self._zero(student_logits.device)
+        return self.logit_loss_fn(student_logits, teacher_logits)
 
-        if self.num_classes == 1:
-            s_soft = F.log_softmax(
-                torch.cat([torch.zeros_like(student_logits), student_logits], dim=1)
-                / self.temperature,
-                dim=1,
-            )
-            t_soft = F.softmax(
-                torch.cat([torch.zeros_like(teacher_logits), teacher_logits], dim=1)
-                / self.temperature,
-                dim=1,
-            )
-        else:
-            s_soft = F.log_softmax(student_logits / self.temperature, dim=1)
-            t_soft = F.softmax(teacher_logits / self.temperature, dim=1)
-
-        distill_loss = self.kl_div(s_soft, t_soft) * (self.temperature**2)
-        
-        # PyTorch KLDivLoss with batchmean divides by batch_size, but sums over spatial dimensions.
-        # We need to average over spatial dimensions to match typical segmentation task loss scale.
-        if student_logits.dim() == 4:
-            distill_loss = distill_loss / (student_logits.shape[2] * student_logits.shape[3])
-
-        return distill_loss
+    def _compute_uncertainty_kd_loss(self, student_logits, teacher_logits):
+        """Uncertainty-weighted KD loss — weighted by kd_lambda."""
+        if not self.use_uncertainty_kd:
+            return self._zero(student_logits.device), {}
+        loss, uncertainty, weight = self.uncertainty_kd_fn(student_logits, teacher_logits)
+        diagnostics = {
+            "uncertainty_kd_loss_raw": loss.item(),
+            "uncertainty_kd_loss_weighted": (self.kd_lambda * loss).item(),
+            "mean_teacher_uncertainty": uncertainty.mean().item(),
+            "mean_kd_weight": weight.mean().item(),
+        }
+        return loss, diagnostics
 
     def _compute_feature_loss(self, device):
         """Feature Distillation (MSE on intermediate layers) - gamma"""
@@ -241,15 +177,7 @@ class UnifiedDistiller(BaseDistiller):
                 if adapter_key in self.adapters:
                     s_f = self.adapters[adapter_key](s_f)
 
-                if s_f.shape != t_f.shape:
-                    t_f = F.interpolate(
-                        t_f,
-                        size=s_f.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-
-                feature_loss += self.mse_loss(s_f, t_f)
+                feature_loss += self.feature_loss_fn(s_f, t_f)
                 count += 1
 
         return feature_loss / count if count > 0 else feature_loss
@@ -286,109 +214,33 @@ class UnifiedDistiller(BaseDistiller):
         # 3. Feature Distillation
         losses["feature_loss"] = self._compute_feature_loss(device)
 
-        # Total Loss (Weighted)
+        # Total Loss (Weighted sum with fixed coefficients from cfg)
         total_loss = (
-            self.loss_weights["alpha"] * losses["task_loss"]
-            + self.loss_weights["beta"] * losses["distill_loss"]
-            + self.loss_weights["gamma"] * losses["feature_loss"]
+            self.alpha * losses["task_loss"]
+            + self.beta * losses["distill_loss"]
+            + self.gamma * losses["feature_loss"]
         )
+
+        # 4. Uncertainty-weighted KD (optional, disabled by default)
+        unc_kd_loss, unc_diagnostics = self._compute_uncertainty_kd_loss(
+            student_logits, teacher_logits
+        )
+        total_loss = total_loss + self.kd_lambda * unc_kd_loss
+        losses["uncertainty_kd_loss"] = unc_kd_loss
+        losses.update(unc_diagnostics)  # flat floats flow into existing step/epoch logging
 
         losses["loss"] = total_loss
 
-        # 9. GradNorm Balancing & Detailed Logging
-        if self.theta_ref and self.training:
-            self._apply_gradnorm(losses)
-        else:
-            # Basic logging even if not training or GradNorm is not applicable
-            for key, weight_key in self.LOSS_WEIGHT_MAP.items():
-                if key in losses:
-                    raw_val = losses[key].item()
-                    weight_val = self.loss_weights[weight_key].item()
-                    losses[f"{key}_raw"] = raw_val
-                    losses[f"{key}_weight"] = weight_val
-                    losses[f"{key}_weighted"] = weight_val * raw_val
+        # Log per-component raw and weighted values
+        weights = {"task_loss": self.alpha, "distill_loss": self.beta, "feature_loss": self.gamma}
+        for key, weight_val in weights.items():
+            if key in losses:
+                raw_val = losses[key].item()
+                losses[f"{key}_raw"] = raw_val
+                losses[f"{key}_weight"] = weight_val
+                losses[f"{key}_weighted"] = weight_val * raw_val
 
         return losses
-
-    def _apply_gradnorm(self, losses: Dict[str, torch.Tensor]):
-        """Adjust loss weights and log detailed gradient contributions."""
-        norms = []
-        active_keys = []
-
-        # 1. Capture basic metrics and compute gradient norms
-        # Iterate over list to avoid "dictionary changed size during iteration"
-        for key, loss_val in list(losses.items()):
-            if (
-                key == "loss"
-                or not isinstance(loss_val, torch.Tensor)
-                or loss_val.numel() == 0
-                or abs(loss_val.item()) < 1e-8
-            ):
-                continue
-
-            weight_key = self.LOSS_WEIGHT_MAP.get(key)
-            if weight_key is None:
-                continue
-
-            weight = self.loss_weights[weight_key]
-            weight_val = weight.item()
-            raw_val = loss_val.item()
-
-            # Log basic metrics
-            losses[f"{key}_raw"] = raw_val
-            losses[f"{key}_weight"] = weight_val
-            losses[f"{key}_weighted"] = weight_val * raw_val
-
-            if not self.use_gradnorm or weight_val <= 0:
-                continue
-
-            # Compute gradient of weighted loss: || ∇_{θ_s} (w_i * L_i) ||
-            grads_weighted = torch.autograd.grad(
-                weight * loss_val, self.theta_ref, retain_graph=True, allow_unused=True
-            )
-            valid_grads_weighted = [
-                g.contiguous().view(-1) for g in grads_weighted if g is not None
-            ]
-
-            if valid_grads_weighted:
-                norm_weighted_val = torch.norm(
-                    torch.cat(valid_grads_weighted), p=2
-                ).item()
-                losses[f"{key}_grad_norm_weighted"] = norm_weighted_val
-                losses[f"{key}_grad_norm_unweighted"] = norm_weighted_val / (
-                    weight_val + 1e-8
-                )
-
-                norms.append(torch.tensor(norm_weighted_val, device=loss_val.device))
-                active_keys.append(weight_key)
-
-        if not norms or not self.use_gradnorm:
-            return
-
-        # 2. Update weights to equalize norms (GradNorm Multiplicative Update)
-        norms_stack = torch.stack(norms)
-        avg_norm = norms_stack.mean().item()
-
-        for i, weight_key in enumerate(active_keys):
-            current_norm = norms[i].item()
-            if current_norm > 0:
-                ratio = avg_norm / current_norm
-                new_weight = self.loss_weights[weight_key].item() * (
-                    ratio**self.gradnorm_alpha
-                )
-                # Avoid extreme values
-                new_weight = max(1e-4, min(10.0, new_weight))
-                self.loss_weights[weight_key].data.fill_(new_weight)
-
-        # 3. Log normalized weights
-        current_weights = [self.loss_weights[k].item() for k in active_keys]
-        w_sum = sum(current_weights)
-        if w_sum > 0:
-            norm_factor = len(active_keys) / w_sum
-            for k in active_keys:
-                losses[f"weight_normalized/{k}"] = (
-                    self.loss_weights[k].item() * norm_factor
-                )
 
     def __del__(self):
         """Cleanup hooks."""

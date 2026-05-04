@@ -1,0 +1,34 @@
+# Online Distillation Configuration
+# Teacher and student are trained simultaneously.
+# Teacher receives its own task loss (teacher_alpha) while also guiding the student.
+
+_target_: distillers.OnlineDistiller
+
+name: online
+temperature: 4.0
+
+# Student loss weights
+alpha: 1.0        # Student task loss (GT Dice/CE)
+beta: 1.0         # Logit KD (KL Divergence)
+gamma: 0          # Feature KD (MSE on intermediate layers)
+
+# Teacher task loss weight (how strongly teacher is updated)
+teacher_alpha: 1.0
+
+# Task loss components
+use_dice: true
+use_ce: true
+
+# Feature distillation settings (gamma > 0 to enable)
+layer_mapping:
+  backbone.blocks.7: sam.image_encoder.blocks.7
+  backbone.blocks.9: sam.image_encoder.blocks.9
+  backbone.blocks.11: sam.image_encoder.blocks.11
+
+layer_channels:
+  backbone.blocks.7: 192
+  backbone.blocks.9: 192
+  backbone.blocks.11: 192
+  sam.image_encoder.blocks.7: 768
+  sam.image_encoder.blocks.9: 768
+  sam.image_encoder.blocks.11: 768
