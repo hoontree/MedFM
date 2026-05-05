@@ -212,34 +212,83 @@ class ChannelWiseDistillLoss(nn.Module):
 
     Each channel's spatial activations are softmax-normalized into a probability
     map, then KL divergence is computed channel-by-channel between teacher and
-    student. The result is averaged over channels and batch.
+    student. The result is averaged over channels and batch and τ²-rescaled.
 
-    Works with any (B, C, H, W) pair where C matches between student and
-    teacher. For binary segmentation (C=1) it still yields a meaningful spatial
-    saliency-alignment signal, unlike per-pixel KL which collapses to a near-
-    trivial 2-class distribution.
+    Channel alignment
+        The paper aligns teacher/student channels via a 1×1 conv on the
+        student side. In this codebase that role is normally played by
+        ``FeatureAdapter`` inside ``UnifiedDistiller`` — pass already-aligned
+        tensors and leave ``student_channels=None``. When the loss is used
+        standalone, set ``student_channels`` and ``teacher_channels`` to build
+        an internal 1×1 projection (Conv2d → BN → ReLU, paper-style).
+
+    Binary segmentation (C=1)
+        CWD still yields a per-channel spatial-saliency alignment signal and
+        avoids the near-trivial collapse of per-pixel KL on a 2-class
+        distribution. However it only matches the *relative* foreground
+        saliency map within each channel — it does NOT distill the calibrated
+        foreground/background probability or the decision boundary itself.
+        Use it together with the task loss (BCE+Dice), not as a replacement.
 
     Args:
-        temperature:    softmax temperature τ (default 4.0).
-        match_spatial: bilinearly resize teacher to student spatial size if
-                       they differ (default True).
+        temperature:       softmax temperature τ (default 4.0).
+        match_spatial:     bilinearly resize teacher to student spatial size
+                           when they differ (default True).
+        student_channels:  if set with ``teacher_channels``, build an internal
+                           1×1 projection from student_channels → teacher_channels.
+        teacher_channels:  see above.
+        detach_teacher:    detach teacher tensor before loss to keep teacher
+                           out of the autograd graph (default True).
     """
 
-    def __init__(self, temperature: float = 4.0, match_spatial: bool = True):
+    def __init__(
+        self,
+        temperature: float = 4.0,
+        match_spatial: bool = True,
+        student_channels: int = None,
+        teacher_channels: int = None,
+        detach_teacher: bool = True,
+    ):
         super().__init__()
         self.temperature = temperature
         self.match_spatial = match_spatial
+        self.detach_teacher = detach_teacher
+
+        if (student_channels is None) ^ (teacher_channels is None):
+            raise ValueError(
+                "student_channels and teacher_channels must both be set or both be None"
+            )
+        if student_channels is not None and student_channels != teacher_channels:
+            self.align = nn.Sequential(
+                nn.Conv2d(student_channels, teacher_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(teacher_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.align = None
 
     def forward(
         self, student_feat: torch.Tensor, teacher_feat: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
-            student_feat: [B, C, H, W]   logits or feature map
-            teacher_feat: [B, C, H', W'] same C; H'×W' may differ
+            student_feat: [B, C_s, H, W]   logits or feature map
+            teacher_feat: [B, C_t, H', W'] (C_t must equal C_s after optional
+                          internal 1×1 alignment; H'×W' may differ)
         Returns:
             Scalar CWD loss.
         """
+        if self.detach_teacher:
+            teacher_feat = teacher_feat.detach()
+
+        if self.align is not None:
+            student_feat = self.align(student_feat)
+
+        if student_feat.dtype != teacher_feat.dtype:
+            teacher_feat = teacher_feat.to(student_feat.dtype)
+        if student_feat.device != teacher_feat.device:
+            teacher_feat = teacher_feat.to(student_feat.device)
+
         if self.match_spatial and student_feat.shape[-2:] != teacher_feat.shape[-2:]:
             teacher_feat = F.interpolate(
                 teacher_feat,
@@ -249,8 +298,10 @@ class ChannelWiseDistillLoss(nn.Module):
             )
 
         assert student_feat.shape[1] == teacher_feat.shape[1], (
-            f"CWD requires matching channel count, "
-            f"got student C={student_feat.shape[1]} vs teacher C={teacher_feat.shape[1]}"
+            f"CWD requires matching channel count after alignment, "
+            f"got student C={student_feat.shape[1]} vs teacher C={teacher_feat.shape[1]}. "
+            f"Either pre-align externally (e.g. via FeatureAdapter) or set "
+            f"student_channels/teacher_channels on this loss."
         )
 
         T = self.temperature
