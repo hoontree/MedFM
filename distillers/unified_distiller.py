@@ -124,9 +124,19 @@ class UnifiedDistiller(BaseDistiller):
         return self.task_loss_fn(student_logits, targets)
 
     def _compute_logit_loss(self, student_logits, teacher_logits):
-        """Logit Distillation (KL Div) - beta"""
+        """Logit Distillation - beta.
+
+        Binary segmentation (num_classes == 1): standard Hinton-style KD
+        (sigmoid + KL) via LogitDistillLoss.
+        Multi-class (num_classes >= 2): Channel-wise Distillation (CWD,
+        ICCV 2021) on the logit map — softmax over spatial dims per class
+        channel is a better fit than per-pixel softmax-KL for dense
+        segmentation.
+        """
         if self.beta <= 0:
             return self._zero(student_logits.device)
+        if self.num_classes >= 2:
+            return self.cwd_loss_fn(student_logits, teacher_logits)
         return self.logit_loss_fn(student_logits, teacher_logits)
 
     def _compute_uncertainty_kd_loss(self, student_logits, teacher_logits):
@@ -201,7 +211,19 @@ class UnifiedDistiller(BaseDistiller):
         """Channel-wise distillation on the final logit map - delta"""
         if self.delta <= 0:
             return self._zero(student_logits.device)
+        # Binary segmentation produces 1-channel fg logits, which collapses
+        # CWD's channel-softmax into a degenerate single-channel signal.
+        # Expand to [bg, fg] = [-x, x] so spatial saliency is contrasted
+        # against an explicit background channel before channel-wise KL.
+        student_logits = self._expand_binary_logits(student_logits)
+        teacher_logits = self._expand_binary_logits(teacher_logits)
         return self.cwd_loss_fn(student_logits, teacher_logits)
+
+    @staticmethod
+    def _expand_binary_logits(logits):
+        if logits.dim() == 4 and logits.shape[1] == 1:
+            return torch.cat([-logits, logits], dim=1)
+        return logits
 
     def _compute_feature_cwd_loss(self, device):
         """Channel-wise distillation on intermediate features - zeta"""
