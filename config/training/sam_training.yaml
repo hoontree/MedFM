@@ -31,7 +31,7 @@ scheduler:
 
 # Hardware configuration
 hardware:
-  gpu_ids: [2]
+  gpu_ids: [1]
   seed: 42
 
 # Output configuration

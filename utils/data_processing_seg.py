@@ -85,7 +85,7 @@ class SegDatasetProcessor:
         data_cfg = OmegaConf.load(config_path)
 
         # Override global settings
-        for attr in ["img_size", "num_classes", "normalization", "multiclass"]:
+        for attr in ["img_size", "num_classes", "normalization"]:
             if hasattr(cfg.data, attr):
                 setattr(data_cfg, attr, getattr(cfg.data, attr))
 

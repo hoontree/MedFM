@@ -41,7 +41,7 @@ hardware:
   n_gpus: 1
   seed: 42
   deterministic: 1
-  gpu_ids: [3]
+  gpu_ids: [1]
 
 # Output configuration
 output:
