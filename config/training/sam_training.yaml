@@ -6,7 +6,6 @@ training:
   warmup_epochs: 2
   batch_size: 32
   num_workers: 4
-  limit_train_batches: null
   dice_weight: 0.8
   moe_loss_weight: 100
   warmup:
@@ -32,7 +31,7 @@ scheduler:
 
 # Hardware configuration
 hardware:
-  gpu_ids: [0]
+  gpu_ids: [2]
   seed: 42
 
 # Output configuration
@@ -59,5 +58,4 @@ wandb:
       num_epochs: ${training.num_epochs}
       dice_weight: ${training.dice_weight}
     data:
-      multiclass: ${data.multiclass}
       num_classes: ${data.num_classes}

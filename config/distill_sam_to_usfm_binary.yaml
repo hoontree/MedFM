@@ -1,14 +1,15 @@
-# Knowledge Distillation Configuration
+# Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student) — binary
 defaults:
   - data: dynamic
-  - teacher: tinyusfm
-  - student: sam
-  - method: unified
+  - method: cwd_feature
   - training: distillation
   - _self_
 
 trainer:
   _target_: trainers.distill_trainer.DistillTrainer
+
+teacher: sam
+student: tinyusfm
 
 # Hardware Configuration (Global Overrides)
 hardware:

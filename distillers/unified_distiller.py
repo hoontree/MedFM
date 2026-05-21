@@ -1,8 +1,9 @@
 import logging
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from distillers.base_distiller import BaseDistiller
 
 logger = logging.getLogger(__name__)
@@ -81,30 +82,103 @@ class UnifiedDistiller(BaseDistiller):
                 eps=cfg.method.get("uncertainty_eps", 1e-8),
             )
 
-        # Feature adapters (for multiple layer mapping)
-        self.layer_mapping = cfg.method.get("layer_mapping", {})
-        self.adapters = nn.ModuleDict()
-        layer_channels = cfg.method.get("layer_channels", {})
+        # Feature pairs: list of transformer block indices to align between
+        # student and teacher (e.g. [7, 9, 11]). The actual module path
+        # (`backbone.blocks.7` vs `sam.image_encoder.blocks.7` vs
+        # `image_encoder.blocks.7` etc.) is auto-detected per model in
+        # ``prepare()``, so the same yaml works regardless of teacher/student
+        # role assignment.
+        self.feature_pairs: List[int] = self._parse_feature_pairs(cfg.method)
+        self.adapters = nn.ModuleDict()  # lazy-initialized in first forward
+        self._adapters_built = False
 
-        for s_layer, t_layer in self.layer_mapping.items():
-            s_ch = layer_channels.get(s_layer, 48)
-            t_ch = layer_channels.get(t_layer, 256)
-            if s_ch != t_ch:
-                self.adapters[s_layer.replace(".", "_")] = FeatureAdapter(s_ch, t_ch)
+        # Resolved per-block module paths (filled in by ``prepare``)
+        self.student_layers: Dict[int, str] = {}
+        self.teacher_layers: Dict[int, str] = {}
 
         # Extractor placeholders
         self.teacher_extractor: Optional[FeatureExtractor] = None
         self.student_extractor: Optional[FeatureExtractor] = None
 
-    def prepare(self, student: nn.Module, teacher: nn.Module):
-        """Setup hooks for feature extraction."""
-        t_layers = list(self.layer_mapping.values())
-        s_layers = list(self.layer_mapping.keys())
+    @staticmethod
+    def _parse_feature_pairs(method_cfg: Any) -> List[int]:
+        """Accept the new ``feature_pairs: [7, 9, 11]`` form, falling back to
+        the legacy ``layer_mapping`` dict (block indices parsed from path)."""
+        pairs = method_cfg.get("feature_pairs", None)
+        if pairs:
+            return [int(p) for p in pairs]
 
-        if t_layers:
-            self.teacher_extractor = FeatureExtractor(teacher, t_layers)
-        if s_layers:
-            self.student_extractor = FeatureExtractor(student, s_layers)
+        legacy = method_cfg.get("layer_mapping", {}) or {}
+        if legacy:
+            logger.warning(
+                "`layer_mapping` is deprecated; use `feature_pairs: [<block_idx>, ...]` "
+                "instead. Auto-extracting block indices from legacy keys."
+            )
+            indices = []
+            for key in legacy.keys():
+                m = re.search(r"blocks\.(\d+)", key)
+                if m:
+                    indices.append(int(m.group(1)))
+            return sorted(set(indices))
+        return []
+
+    @staticmethod
+    def _resolve_block_paths(model: nn.Module, indices: List[int]) -> Dict[int, str]:
+        """Find module paths matching `*blocks.{idx}` for each requested index.
+
+        Returns a dict {block_idx: dotted_path}. Picks the shortest matching
+        path when multiple candidates exist (e.g. prefers `blocks.7` over
+        `image_encoder.blocks.7.attn` — though the regex already excludes
+        the latter)."""
+        if not indices:
+            return {}
+        wanted = set(indices)
+        candidates: Dict[int, List[str]] = {i: [] for i in wanted}
+        pattern = re.compile(r"(?:^|\.)blocks\.(\d+)$")
+        for name, _ in model.named_modules():
+            m = pattern.search(name)
+            if m:
+                idx = int(m.group(1))
+                if idx in wanted:
+                    candidates[idx].append(name)
+        resolved: Dict[int, str] = {}
+        for idx, paths in candidates.items():
+            if paths:
+                resolved[idx] = min(paths, key=len)
+        return resolved
+
+    def prepare(self, student: nn.Module, teacher: nn.Module):
+        """Resolve per-model block paths and set up extraction hooks."""
+        if not self.feature_pairs:
+            return
+
+        self.student_layers = self._resolve_block_paths(student, self.feature_pairs)
+        self.teacher_layers = self._resolve_block_paths(teacher, self.feature_pairs)
+
+        missing_s = [i for i in self.feature_pairs if i not in self.student_layers]
+        missing_t = [i for i in self.feature_pairs if i not in self.teacher_layers]
+        if missing_s:
+            logger.warning("Student has no `*.blocks.%s` modules", missing_s)
+        if missing_t:
+            logger.warning("Teacher has no `*.blocks.%s` modules", missing_t)
+
+        usable = [i for i in self.feature_pairs
+                  if i in self.student_layers and i in self.teacher_layers]
+        if not usable:
+            logger.warning("No usable feature pairs after resolution; "
+                           "feature distillation will be skipped.")
+            return
+
+        logger.info("Feature pairs resolved (block_idx → student / teacher):")
+        for i in usable:
+            logger.info("  %d: %s  ↔  %s", i, self.student_layers[i], self.teacher_layers[i])
+
+        self.student_extractor = FeatureExtractor(
+            student, [self.student_layers[i] for i in usable]
+        )
+        self.teacher_extractor = FeatureExtractor(
+            teacher, [self.teacher_layers[i] for i in usable]
+        )
 
     def on_step_begin(self):
         """Clear extracted features."""
@@ -152,42 +226,76 @@ class UnifiedDistiller(BaseDistiller):
         }
         return loss, diagnostics
 
+    @staticmethod
+    def _to_bchw(feat: torch.Tensor) -> Optional[torch.Tensor]:
+        """Normalize a hooked tensor to [B, C, H, W]. Returns None if the
+        shape can't be interpreted as a square spatial token grid."""
+        if feat.dim() == 3:
+            B, N, C = feat.shape
+            H_sq = int(N ** 0.5)
+            if H_sq * H_sq == N:
+                H = W = H_sq
+            else:
+                N_no_cls = N - 1
+                H_sq = int(N_no_cls ** 0.5)
+                if H_sq * H_sq == N_no_cls:
+                    feat = feat[:, 1:, :]
+                    H = W = H_sq
+                else:
+                    return None
+            return feat.transpose(1, 2).reshape(B, feat.shape[-1], H, W)
+        if feat.dim() == 4 and feat.shape[1] < feat.shape[3]:
+            # [B, H, W, C] (SAM-style) → [B, C, H, W]
+            return feat.permute(0, 3, 1, 2)
+        return feat
+
+    def _build_adapters(self, pairs: List[Tuple[int, torch.Tensor, torch.Tensor]]):
+        """Lazily create 1×1 channel adapters on student side using the
+        actually-observed channel counts."""
+        device = next(iter(p[1] for p in pairs)).device
+        for idx, s_f, t_f in pairs:
+            s_ch, t_ch = s_f.shape[1], t_f.shape[1]
+            key = f"block_{idx}"
+            if s_ch != t_ch and key not in self.adapters:
+                self.adapters[key] = FeatureAdapter(s_ch, t_ch).to(device)
+        self._adapters_built = True
+
     def _collect_feature_pairs(self):
-        """Walk layer_mapping and yield (student_feat, teacher_feat) tensors
-        already reshaped to [B, C, H, W] and channel-adapted."""
+        """Yield (student_feat, teacher_feat) tensors aligned to [B,C,H,W]
+        with channel adaptation applied. Adapters are built lazily on the
+        first forward, using the observed channel counts."""
         s_feats = self.student_extractor.get_features()
         t_feats = self.teacher_extractor.get_features()
 
-        for s_layer, t_layer in self.layer_mapping.items():
-            s_f = s_feats.get(s_layer)
-            t_f = t_feats.get(t_layer)
+        # Stage 1: collect & normalize shapes
+        staged: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
+        for idx in self.feature_pairs:
+            s_path = self.student_layers.get(idx)
+            t_path = self.teacher_layers.get(idx)
+            if s_path is None or t_path is None:
+                continue
+            s_f = s_feats.get(s_path)
+            t_f = t_feats.get(t_path)
             if s_f is None or t_f is None:
                 continue
+            s_f = self._to_bchw(s_f)
+            t_f = self._to_bchw(t_f)
+            if s_f is None or t_f is None:
+                continue
+            staged.append((idx, s_f, t_f))
 
-            # Student: [B, N, C] → [B, C, H, W] (handle optional CLS token)
-            if s_f.dim() == 3:
-                B, N, C = s_f.shape
-                H_sq = int(N ** 0.5)
-                if H_sq * H_sq == N:
-                    H = W = H_sq
-                else:
-                    N_no_cls = N - 1
-                    H_sq = int(N_no_cls ** 0.5)
-                    if H_sq * H_sq == N_no_cls:
-                        s_f = s_f[:, 1:, :]
-                        H = W = H_sq
-                    else:
-                        continue
-                s_f = s_f.transpose(1, 2).reshape(B, s_f.shape[-1], H, W)
+        if not staged:
+            return
 
-            # Teacher: SAM-style [B, H, W, C] → [B, C, H, W]
-            if t_f.dim() == 4 and t_f.shape[1] < t_f.shape[3]:
-                t_f = t_f.permute(0, 3, 1, 2)
+        # Stage 2: lazy adapter init on first call
+        if not self._adapters_built:
+            self._build_adapters(staged)
 
-            adapter_key = s_layer.replace(".", "_")
-            if adapter_key in self.adapters:
-                s_f = self.adapters[adapter_key](s_f)
-
+        # Stage 3: apply adapters and yield
+        for idx, s_f, t_f in staged:
+            key = f"block_{idx}"
+            if key in self.adapters:
+                s_f = self.adapters[key](s_f)
             yield s_f, t_f
 
     def _compute_feature_loss(self, device):
@@ -309,8 +417,6 @@ class UnifiedDistiller(BaseDistiller):
         for key, weight_val in weights.items():
             if key in losses:
                 raw_val = losses[key].item()
-                losses[f"{key}_raw"] = raw_val
-                losses[f"{key}_weight"] = weight_val
                 losses[f"{key}_weighted"] = weight_val * raw_val
 
         return losses

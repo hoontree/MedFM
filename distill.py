@@ -5,7 +5,7 @@ from hydra.utils import instantiate
 from utils.hardware import set_gpu
 
 
-@hydra.main(version_base=None, config_path="config", config_name="distill_usfm_to_sam")
+@hydra.main(version_base=None, config_path="config", config_name="distill_sam_to_usfm_binary")
 def main(cfg: DictConfig):
     set_gpu(cfg)
 

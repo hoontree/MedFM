@@ -8,7 +8,6 @@ training:
   warmup_epochs: 5
   batch_size: 64
   num_workers: 8
-  limit_train_batches: null
   early_stopping:
     enabled: true
     patience: 10
@@ -34,13 +33,11 @@ wandb:
   entity: hheo
   log_model: true
   log_config:
-    teacher:
-      name: ${teacher.name}
-    student:
-      name: ${student.name}
+    teacher: ${teacher}
+    student: ${student}
     training:
       lr: ${training.lr}
       batch_size: ${training.batch_size}
       num_epochs: ${training.num_epochs}
     data:
-      multiclass: ${data.multiclass}
+      num_classes: ${data.num_classes}

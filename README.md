@@ -73,7 +73,7 @@ python train.py training.batch_size=8 training.num_epochs=100
 Teacher 학습 완료 후, 같은 컨텍스트(데이터/하드웨어/스플릿)로 Distillation 단계까지 자동 실행:
 
 ```bash
-python train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora model.use_alignment=true
+python train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora
 ```
 
 ### 3) Distillation 단독 실행
@@ -90,7 +90,6 @@ python distill.py
 python distill.py \
   teacher.encoder_mode=frozen \
   teacher.decoder_mode=lora \
-  teacher.use_alignment=true \
   student=tinyusfm \
   distillation.adaptation_ratio=0.3 \
   hardware.gpu_ids=[0]

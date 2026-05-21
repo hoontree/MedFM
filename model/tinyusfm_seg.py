@@ -399,8 +399,6 @@ class SegmentationModel(nn.Module):
         self,
         num_classes,
         checkpoint=None,
-        use_alignment=False,
-        alignment_out_channels=256,
         decoder_type="fpn",
         sam_transformer_dim=256,
         **kwargs,
@@ -440,21 +438,6 @@ class SegmentationModel(nn.Module):
             align_corners=False,
         )
 
-        # Student alignment layer (Proj/Adapter)
-        self.use_alignment = use_alignment
-        self.alignment_out_channels = alignment_out_channels
-
-        if self.use_alignment:
-            in_channels = int(192 * 0.25)  # matches neck output channels
-            self.alignment_layer = nn.Sequential(
-                nn.Conv2d(
-                    in_channels, self.alignment_out_channels, kernel_size=1, bias=False
-                ),
-                nn.BatchNorm2d(self.alignment_out_channels),
-                nn.ReLU(inplace=True),
-            )
-        else:
-            self.alignment_layer = None
 
         # ------------------------------------------------------------------ #
         # SAM-mask decoder branch (experimental)                             #
@@ -515,9 +498,7 @@ class SegmentationModel(nn.Module):
         if self.checkpoint_path:
             self.load_finetuned(self.checkpoint_path)
         else:
-            default_pretrained = "checkpoints/TinyUSFM.pt"
-            if os.path.exists(default_pretrained):
-                self.load_pretrained(default_pretrained)
+            self.load_pretrained("checkpoints/TinyUSFM.pth")
 
     def forward(self, x, return_features=False):
         # Extract features from backbone
@@ -542,8 +523,6 @@ class SegmentationModel(nn.Module):
             # Return seg_logits and the 3rd scale feature (14x14 for 224 input)
             # neck_features[2] corresponds to rescale=1.0, matching ViT output size
             feat = neck_features[2]
-            # if self.use_alignment:
-            #     feat = self.alignment_layer(feat)
             return seg_logits, feat
 
         return seg_logits
@@ -656,13 +635,6 @@ class SegmentationModel(nn.Module):
             print(f"Unexpected keys: {len(load_info.unexpected_keys)}")
         except Exception as e:
             print(f"Warning: Failed to load finetuned checkpoint. Error: {e}")
-
-    def load_checkpoint(self, path=None):
-        """Load checkpoint with TinyUSFM specific mapping (pretrained weights).
-
-        Deprecated: use load_pretrained() or load_finetuned() instead.
-        """
-        self.load_pretrained(path)
 
     def load_sam_decoder_weights(self, path: str) -> None:
         """Load pretrained SAM weights into the sam_mask branch modules.

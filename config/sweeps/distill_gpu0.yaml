@@ -27,6 +27,5 @@ command:
   - ${args_no_hyphens}
   - teacher.encoder_mode=frozen
   - teacher.decoder_mode=lora
-  - teacher.use_alignment=true
   - hardware.gpu_ids=[0]
   - wandb.project=medfm_distill_sweep

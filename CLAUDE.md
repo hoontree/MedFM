@@ -72,7 +72,7 @@ uv run run_distill_experiments.py --debug  # Quick debug run
 
 ```bash
 # Train teacher, then automatically run distillation with the same data/hardware/split context
-uv run train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora model.use_alignment=true
+uv run train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora
 
 # Example with explicit encoder/decoder modes
 uv run train.py \
@@ -250,13 +250,10 @@ Key combinations:
 - `encoder_mode=lora, decoder_mode=lora` — LoRA on both (default efficient fine-tuning)
 - `encoder_mode=conv_lora` — Conv-LoRA with MoE experts on encoder qkv layers
 - `encoder_mode=frozen, decoder_mode=ft` — freeze encoder, fine-tune decoder only
-- `use_alignment=true` — inserts `AlignmentLayer` (256ch residual blocks) between encoder and decoder
 
 **Key parameters:**
 - `r_e` / `r_d`: LoRA rank for encoder / decoder (default 4)
 - `conv_lora_expert_num`: number of MoE experts for Conv-LoRA (default 4)
-- `use_alignment`: enable alignment layer (default false)
-- `alignment_num_blocks`: depth of alignment layer (default 4)
 - `checkpoint`: SAM pretrained path (e.g. `checkpoints/sam_vit_b_*.pth`) or fine-tuned checkpoint
 
 ### Dataset Configuration

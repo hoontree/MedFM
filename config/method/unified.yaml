@@ -19,19 +19,11 @@ cwd_temperature: 4.0
 use_dice: true
 use_ce: true
 
-# --- Feature Distillation Settings (gamma > 0) ---
-layer_mapping:
-  backbone.blocks.7: sam.image_encoder.blocks.7
-  backbone.blocks.9: sam.image_encoder.blocks.9
-  backbone.blocks.11: sam.image_encoder.blocks.11
-
-layer_channels:
-  backbone.blocks.7: 192
-  backbone.blocks.9: 192
-  backbone.blocks.11: 192
-  sam.image_encoder.blocks.7: 768
-  sam.image_encoder.blocks.9: 768
-  sam.image_encoder.blocks.11: 768
+# --- Feature Distillation Settings (gamma > 0 or zeta > 0) ---
+# Just list transformer block indices to align between teacher & student.
+# Module paths and channel counts are auto-detected, so the same yaml works
+# regardless of which model is teacher vs student.
+feature_pairs: [7, 9, 11]
 
 # --- Uncertainty-Weighted KD (disabled by default) ---
 use_uncertainty_weighted_kd: true

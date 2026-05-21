@@ -52,7 +52,6 @@ splits/
 scripts/
 tests/
 wandb/
-notebooks/
 
 # External distillation reference repos (not direct dependencies)
 submodules/

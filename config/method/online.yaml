@@ -20,15 +20,4 @@ use_dice: true
 use_ce: true
 
 # Feature distillation settings (gamma > 0 to enable)
-layer_mapping:
-  backbone.blocks.7: sam.image_encoder.blocks.7
-  backbone.blocks.9: sam.image_encoder.blocks.9
-  backbone.blocks.11: sam.image_encoder.blocks.11
-
-layer_channels:
-  backbone.blocks.7: 192
-  backbone.blocks.9: 192
-  backbone.blocks.11: 192
-  sam.image_encoder.blocks.7: 768
-  sam.image_encoder.blocks.9: 768
-  sam.image_encoder.blocks.11: 768
+feature_pairs: [7, 9, 11]

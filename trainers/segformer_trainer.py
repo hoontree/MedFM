@@ -190,8 +190,13 @@ class SegformerTrainer(BaseTrainer):
 
         return metrics
 
-    def validate(self, epoch: int) -> Dict[str, float]:
-        """Validate model."""
+    def validate(self, epoch: int, return_predictions: bool = False):
+        """Validate model.
+
+        Note: Segformer's evaluator does not yet expose ``return_predictions``,
+        so when requested we return ``None`` for the cache and ``_visualize_validation``
+        falls back to running a separate visualization forward pass.
+        """
         self.model.eval()
 
         # Use evaluator to compute metrics in a single pass (like SAM trainer)
@@ -199,6 +204,8 @@ class SegformerTrainer(BaseTrainer):
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
+        if return_predictions:
+            return val_metrics, None
         return val_metrics
 
     def test(self) -> Dict[str, float]:

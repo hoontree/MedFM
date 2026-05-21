@@ -1,5 +1,0 @@
-# USFM student config for distillation
-_target_: model.usfm_seg.VisionTransformer
-name: USFM
-num_classes: ${data.num_classes}
-checkpoint: null  # Set to pretrained checkpoint path

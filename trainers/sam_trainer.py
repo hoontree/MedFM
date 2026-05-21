@@ -5,7 +5,7 @@ This module provides a trainer for SAM models with LoRA adaptation.
 """
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, override
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -45,6 +45,7 @@ class SAMTrainer(BaseTrainer):
             "warmup", {"enabled": False, "steps": 0}
         )
 
+    @override
     def _create_model(self):
         """Create SAM model using ModelBuilder."""
         # Keep trainer runtime img_size aligned with any pre-dataloader sync.
@@ -56,9 +57,9 @@ class SAMTrainer(BaseTrainer):
 
         self._setup_loss_functions()
 
-        self.step_log_interval = 10
-        self._log_model_configuration()
+        self._log_model_info()
 
+    @override
     def _create_optimizer(self):
         """Create optimizer."""
         self.optimizer = optim.AdamW(
@@ -69,6 +70,7 @@ class SAMTrainer(BaseTrainer):
 
         self.logger.info(f"Optimizer: AdamW, Base LR: {self.base_lr}")
 
+    @override
     def _create_scheduler(self):
         """Create learning rate scheduler with warmup and polynomial decay."""
         warmup_cfg = self.warmup_config
@@ -106,24 +108,19 @@ class SAMTrainer(BaseTrainer):
             f"max_iterations={total_iters}, power={power}, min_lr={min_lr}"
         )
 
-    def _get_current_lr(self) -> float:
-        """Get current learning rate from optimizer."""
-        return self.optimizer.param_groups[0]["lr"]
-
-    def _log_model_configuration(self):
-        """Log resolved SAM adaptation and pretrained configuration."""
-        self._log_model_info()
+    @override
+    def _log_model_info(self):
+        """Override: also log SAM adaptation configuration (encoder/decoder mode)."""
+        super()._log_model_info()
 
         encoder_mode = getattr(self.model, "encoder_mode", "N/A")
         decoder_mode = getattr(self.model, "decoder_mode", "N/A")
-        use_alignment = getattr(self.model, "use_alignment", False)
 
         self.logger.info("SAM Configuration:")
         self.logger.info(
-            "encoder_mode=%s, decoder_mode=%s, alignment=%s",
+            "encoder_mode=%s, decoder_mode=%s",
             encoder_mode,
             decoder_mode,
-            use_alignment,
         )
 
         if wandb.run is not None:
@@ -131,7 +128,6 @@ class SAMTrainer(BaseTrainer):
                 {
                     "model.encoder_mode": encoder_mode,
                     "model.decoder_mode": decoder_mode,
-                    "model.use_alignment": use_alignment,
                 },
                 allow_val_change=True,
             )
@@ -192,6 +188,7 @@ class SAMTrainer(BaseTrainer):
 
         return loss, loss_ce, loss_dice, loss_moe
 
+    @override
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
@@ -232,7 +229,7 @@ class SAMTrainer(BaseTrainer):
             self.scheduler.step()
 
             # Get current learning rate
-            lr = self._get_current_lr()
+            lr = self.optimizer.param_groups[0]["lr"]
 
             # Update metrics
             total_loss += loss.item()
@@ -269,22 +266,36 @@ class SAMTrainer(BaseTrainer):
 
         return metrics
 
-    def validate(self, epoch: int) -> Dict[str, float]:
-        """Validate model."""
+    @override
+    def validate(self, epoch: int, return_predictions: bool = False):
+        """Validate model.
+
+        When ``return_predictions=True``, also returns a predictions cache so that
+        visualization reuses the same forward pass as metric computation.
+        """
         self.model.eval()
 
-        val_metrics = self.evaluator.evaluate_model_sam(
+        result = self.evaluator.evaluate_model_sam(
             self.model,
             self.val_loader,
             self.device,
             self.cfg.data.num_classes,
             img_size=self.img_size,
+            return_predictions=return_predictions,
         )
+
+        if return_predictions:
+            val_metrics, images_l, preds_l, masks_l, fnames_l, _ = result
+        else:
+            val_metrics = result
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
+        if return_predictions:
+            return val_metrics, {"__val__": (images_l, preds_l, masks_l, fnames_l)}
         return val_metrics
 
+    @override
     def test(self) -> Dict[str, float]:
         """Test model and visualize predictions using cached inference results."""
         self.model.eval()
@@ -306,7 +317,7 @@ class SAMTrainer(BaseTrainer):
                 img_size=self.img_size,
                 return_predictions=True,
             )
-            metrics, images_list, preds_list, masks_list, filenames_list = result
+            metrics, images_list, preds_list, masks_list, filenames_list, per_sample = result
 
             self.evaluator.print_metrics(
                 metrics,
@@ -320,8 +331,8 @@ class SAMTrainer(BaseTrainer):
             else:
                 test_metrics = metrics
 
-            # Cache predictions for visualization
-            predictions_cache[name] = (images_list, preds_list, masks_list, filenames_list)
+            # Cache predictions for visualization + per-sample metrics for CSV
+            predictions_cache[name] = (images_list, preds_list, masks_list, filenames_list, per_sample)
 
         # Visualize predictions using cached results (all samples)
         vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
@@ -335,14 +346,17 @@ class SAMTrainer(BaseTrainer):
         """Return the underlying LoRA_Sam, unwrapping DataParallel if needed."""
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
+    @override
     def _get_model_type(self) -> str:
         """SAM model type for visualization inference."""
         return "sam"
 
+    @override
     def _save_model(self, path: Path):
         """Save SAM model (LoRA parameters)."""
         self._get_base_model().save_lora_parameters(str(path))
 
+    @override
     def _load_checkpoint(self, path: Path):
         """Load SAM model checkpoint."""
         self.logger.info(f"Loading checkpoint: {path}")

@@ -1,18 +1,19 @@
-# Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student)
+# Knowledge Distillation Configuration: TinyUSFM (teacher) -> SAM (student) — binary
 defaults:
   - data: dynamic
-  - teacher: sam
-  - student: tinyusfm
-  - method: unified
+  - method: cwd_feature
   - training: distillation
   - _self_
 
 trainer:
   _target_: trainers.distill_trainer.DistillTrainer
 
+teacher: tinyusfm
+student: sam
+
 # Hardware Configuration (Global Overrides)
 hardware:
-  gpu_ids: [0]
+  gpu_ids: [2]
   seed: 42
 
 # Global Flags

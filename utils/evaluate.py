@@ -486,8 +486,9 @@ class Evaluator_seg:
         sensitivity_list = []
         specificity_list = []
         pixel_acc_list = []
-        bf_score_list = []
         boundary_iou_list =  []
+        bf_score_list = []
+        per_sample_filenames = [] if return_predictions else None
         all_probs = []
         all_labels = []
 
@@ -531,7 +532,7 @@ class Evaluator_seg:
                     masks_list.append(labels.cpu())
                     filenames_list.append(batch_fnames)
 
-                for pred, gt in zip(preds, labels):
+                for sample_idx, (pred, gt) in enumerate(zip(preds, labels)):
                     pred_np = pred.squeeze().cpu().numpy().astype(bool)
                     gt_np = gt.squeeze().cpu().numpy().astype(bool)
 
@@ -544,10 +545,10 @@ class Evaluator_seg:
                         hausdorff = float(max(gt_np.shape))
                     iou = Evaluator_seg.compute_jaccard(pred_np, gt_np)
                     biou = Evaluator_seg.boundary_iou(pred_np, gt_np)
+                    bf = Evaluator_seg.compute_boundary_score(pred_np, gt_np)
                     sens = recall(pred_np, gt_np)
                     spec = Evaluator_seg.compute_specificity(pred_np, gt_np)
                     pixel_acc = (pred_np == gt_np).sum() / gt_np.size
-                    bf_score = Evaluator_seg.compute_boundary_score(pred_np, gt_np)
 
                     dice_list.append(dice)
                     hd95_list.append(hausdorff)
@@ -555,8 +556,14 @@ class Evaluator_seg:
                     sensitivity_list.append(sens)
                     specificity_list.append(spec)
                     pixel_acc_list.append(pixel_acc)
-                    bf_score_list.append(bf_score)
                     boundary_iou_list.append(biou)
+                    bf_score_list.append(bf)
+
+                    if return_predictions:
+                        if batch_fnames is not None and sample_idx < len(batch_fnames):
+                            per_sample_filenames.append(batch_fnames[sample_idx])
+                        else:
+                            per_sample_filenames.append(f"sample_{len(per_sample_filenames):05d}")
                 # Cleanup batch-level tensors
                 if img_size is not None:
                     del raw_out
@@ -579,16 +586,27 @@ class Evaluator_seg:
             "Specificity_std": np.std(specificity_list),
             "PixelAcc": np.mean(pixel_acc_list),
             "PixelAcc_std": np.std(pixel_acc_list),
-            "BFScore": np.mean(bf_score_list),
-            "BFScore_std": np.std(bf_score_list),
             "ECE": ece,
             "BoundaryIoU": np.mean(boundary_iou_list),
             "BoundaryIoU_std": np.std(boundary_iou_list),
+            "BFScore": np.mean(bf_score_list),
+            "BFScore_std": np.std(bf_score_list),
         }
         if criterion is not None:
             metrics["loss"] = total_loss / total_samples if total_samples > 0 else 0.0
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list, filenames_list
+            per_sample = {
+                "filename": per_sample_filenames,
+                "Dice": dice_list,
+                "HD95": hd95_list,
+                "IoU": iou_list,
+                "BoundaryIoU": boundary_iou_list,
+                "BFScore": bf_score_list,
+                "Sensitivity": sensitivity_list,
+                "Specificity": specificity_list,
+                "PixelAcc": pixel_acc_list,
+            }
+            return metrics, images_list, preds_list, masks_list, filenames_list, per_sample
         return metrics
 
     @staticmethod
@@ -598,17 +616,29 @@ class Evaluator_seg:
     ):
         dice_per_class = [[] for _ in range(num_classes)]
         boundary_iou_per_class = [[] for _ in range(num_classes)]
+        bf_score_per_class = [[] for _ in range(num_classes)]
         iou_per_class = [[] for _ in range(num_classes)]
         pixel_acc_list = []
         sensitivity_per_class = [[] for _ in range(num_classes)]
         specificity_per_class = [[] for _ in range(num_classes)]
         hd95_per_class = [[] for _ in range(num_classes)]
-        bfscore_per_class = [[] for _ in range(num_classes)]
 
         images_list = [] if return_predictions else None
         preds_list = [] if return_predictions else None
         masks_list = [] if return_predictions else None
         filenames_list = [] if return_predictions else None
+
+        # Per-sample mean across foreground classes (for CSV).
+        ps_filenames = [] if return_predictions else None
+        ps_dice = [] if return_predictions else None
+        ps_hd95 = [] if return_predictions else None
+        ps_iou = [] if return_predictions else None
+        ps_biou = [] if return_predictions else None
+        ps_bf = [] if return_predictions else None
+        ps_sens = [] if return_predictions else None
+        ps_spec = [] if return_predictions else None
+        ps_pixacc = [] if return_predictions else None
+        ps_per_class = [] if return_predictions else None  # list of dicts: {class_id: {Dice, HD95, ...}}
 
         total_loss = 0.0
         total_samples = 0
@@ -643,13 +673,17 @@ class Evaluator_seg:
                     masks_list.append(labels.cpu())
                     filenames_list.append(batch_fnames)
 
-                for pred, gt in zip(preds, gt_indices):
+                for sample_idx, (pred, gt) in enumerate(zip(preds, gt_indices)):
                     pred_np = pred.cpu().numpy()
                     gt_np = gt.cpu().numpy()
 
                     pixel_acc = (pred_np == gt_np).mean()
                     pixel_acc_list.append(pixel_acc)
 
+                    sample_dice, sample_hd, sample_iou = [], [], []
+                    sample_sens, sample_spec, sample_biou = [], [], []
+                    sample_bf = []
+                    sample_per_class = {}
                     for class_id in range(num_classes):
                         pred_class = pred_np == class_id
                         gt_class = gt_np == class_id
@@ -662,6 +696,7 @@ class Evaluator_seg:
                         dice = 2 * tp / (pred_class.sum() + gt_class.sum() + 1e-8)
                         iou = Evaluator_seg.compute_jaccard(pred_class, gt_class)
                         biou = Evaluator_seg.boundary_iou(pred_class, gt_class)
+                        bf = Evaluator_seg.compute_boundary_score(pred_class, gt_class)
                         fn = np.logical_and(~pred_class, gt_class).sum()
                         sensitivity = tp / (tp + fn + 1e-8)
                         tn = np.logical_and(~pred_class, ~gt_class).sum()
@@ -674,7 +709,6 @@ class Evaluator_seg:
                             )
                         else:
                             hd = float(max(gt_np.shape))
-                        bfscore = Evaluator_seg.compute_boundary_score(pred_class, gt_class)
 
                         dice_per_class[class_id].append(dice)
                         iou_per_class[class_id].append(iou)
@@ -682,7 +716,38 @@ class Evaluator_seg:
                         specificity_per_class[class_id].append(specificity)
                         hd95_per_class[class_id].append(hd)
                         boundary_iou_per_class[class_id].append(biou)
-                        bfscore_per_class[class_id].append(bfscore)
+                        bf_score_per_class[class_id].append(bf)
+
+                        if class_id >= 1:
+                            sample_dice.append(float(dice))
+                            sample_hd.append(float(hd))
+                            sample_iou.append(float(iou))
+                            sample_biou.append(float(biou))
+                            sample_bf.append(float(bf))
+                            sample_sens.append(float(sensitivity))
+                            sample_spec.append(float(specificity))
+                            sample_per_class[class_id] = {
+                                "Dice": float(dice), "HD95": float(hd),
+                                "IoU": float(iou), "BoundaryIoU": float(biou),
+                                "BFScore": float(bf),
+                                "Sensitivity": float(sensitivity),
+                                "Specificity": float(specificity),
+                            }
+
+                    if return_predictions:
+                        if batch_fnames is not None and sample_idx < len(batch_fnames):
+                            ps_filenames.append(batch_fnames[sample_idx])
+                        else:
+                            ps_filenames.append(f"sample_{len(ps_filenames):05d}")
+                        ps_dice.append(float(np.mean(sample_dice)) if sample_dice else 0.0)
+                        ps_hd95.append(float(np.mean(sample_hd)) if sample_hd else 224.0)
+                        ps_iou.append(float(np.mean(sample_iou)) if sample_iou else 0.0)
+                        ps_biou.append(float(np.mean(sample_biou)) if sample_biou else 0.0)
+                        ps_bf.append(float(np.mean(sample_bf)) if sample_bf else 0.0)
+                        ps_sens.append(float(np.mean(sample_sens)) if sample_sens else float("nan"))
+                        ps_spec.append(float(np.mean(sample_spec)) if sample_spec else float("nan"))
+                        ps_pixacc.append(float(pixel_acc))
+                        ps_per_class.append(sample_per_class)
 
         foreground_ids = list(range(1, num_classes))
 
@@ -726,10 +791,10 @@ class Evaluator_seg:
             [item for i in foreground_ids for item in boundary_iou_per_class[i]]
         )
         metrics["BFScore"] = np.nanmean(
-            [np.nanmean(bfscore_per_class[i]) for i in foreground_ids]
+            [np.nanmean(bf_score_per_class[i]) for i in foreground_ids]
         )
         metrics["BFScore_std"] = np.nanstd(
-            [item for i in foreground_ids for item in bfscore_per_class[i]]
+            [item for i in foreground_ids for item in bf_score_per_class[i]]
         )
 
         # Per-class metrics for each foreground class
@@ -746,14 +811,26 @@ class Evaluator_seg:
             metrics[f"Specificity_class_{i}_std"] = np.nanstd(specificity_per_class[i])
             metrics[f"BoundaryIoU_class_{i}"] = np.nanmean(boundary_iou_per_class[i])
             metrics[f"BoundaryIoU_class_{i}_std"] = np.nanstd(boundary_iou_per_class[i])
-            metrics[f"BFScore_class_{i}"] = np.nanmean(bfscore_per_class[i])
-            metrics[f"BFScore_class_{i}_std"] = np.nanstd(bfscore_per_class[i])
+            metrics[f"BFScore_class_{i}"] = np.nanmean(bf_score_per_class[i])
+            metrics[f"BFScore_class_{i}_std"] = np.nanstd(bf_score_per_class[i])
 
         if criterion is not None:
             metrics["loss"] = total_loss / total_samples if total_samples > 0 else 0.0
 
         if return_predictions:
-            return metrics, images_list, preds_list, masks_list, filenames_list
+            per_sample = {
+                "filename": ps_filenames,
+                "Dice": ps_dice,
+                "HD95": ps_hd95,
+                "IoU": ps_iou,
+                "BoundaryIoU": ps_biou,
+                "BFScore": ps_bf,
+                "Sensitivity": ps_sens,
+                "Specificity": ps_spec,
+                "PixelAcc": ps_pixacc,
+                "_per_class": ps_per_class,
+            }
+            return metrics, images_list, preds_list, masks_list, filenames_list, per_sample
         return metrics
 
     @staticmethod

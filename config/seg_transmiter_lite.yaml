@@ -1,0 +1,98 @@
+# Seg-TransMiter-lite prototype config.
+#
+# Adapter-based knowledge transfer between TinyUSFM and SAM for 3-class
+# breast ultrasound segmentation (normal / benign / malignant).
+#
+# Default direction: tiny_student
+#   * Frozen TinyUSFM + ResidualConvAdapter is the deployable model.
+#   * SAM serves only as a teacher *prior* via the pre-computed cache.
+#   * SAM is NOT required at inference time.
+#
+# Reverse direction (sam_student): launched via train_sam_us_adapter.py.
+#
+# Note: this config is loaded by plain OmegaConf (no Hydra), so it
+# intentionally has no `defaults:` block and no `${now:...}` resolvers.
+
+direction: tiny_student        # one of {tiny_student, sam_student}
+freeze_base: true              # freeze the base segmentation model
+output_dir: null               # null -> CLI fallback (logs/seg_transmiter_lite/<ts>)
+
+# ----------------------------------------------------------------------
+# Data — 3-class semantic segmentation (self-contained, no `defaults:` import)
+# ----------------------------------------------------------------------
+data:
+  name: dynamic
+  type: Dynamic
+  multiclass: true
+  num_classes: 3
+  img_size: 224
+  normalization: imagenet
+  augment_train: true
+  # img_size auto-sync is for SAM-only trainers; not needed here.
+  auto_img_size_by_sam_type: false
+  sam_img_size_map:
+    vit_b: 224
+    vit_l: 1024
+    vit_h: 1024
+  # 3-class ground truth is only available on lesion-class-aware datasets.
+  # BUS_UCLM ships per-class colors (red=malignant, green=benign).
+  train: [BUS_UCLM]
+  val: []
+  test: [BUS_UCLM_filtered]
+
+training:
+  batch_size: 8
+  num_workers: 4
+  num_epochs: 60
+  base_lr: 3.0e-4
+  weight_decay: 1.0e-4
+  amp: true
+
+# ----------------------------------------------------------------------
+# TinyUSFM base
+# ----------------------------------------------------------------------
+tiny:
+  checkpoint: null              # null -> load default pretrained TinyUSFM.pth
+  # Provide a fine-tuned TinyUSFM checkpoint here to start from a stronger base, e.g.:
+  # checkpoint: experiment_results/TinyUSFM_binary_ft/checkpoints/best_epoch_59_dice_0.8043.pth
+
+# ----------------------------------------------------------------------
+# SAM base (used only when direction == sam_student)
+# ----------------------------------------------------------------------
+sam:
+  sam_type: vit_b
+  checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  encoder_mode: frozen          # {frozen, lora, conv_lora, ft}
+  decoder_mode: frozen          # {frozen, lora, ft}
+  r_e: 4
+  r_d: 4
+  use_alignment: false
+
+# ----------------------------------------------------------------------
+# SAM teacher cache
+#   cache_dir contains <image_id>.pt records produced by sam_teacher_cache.py.
+#   embedding_shape pins the (C, h, w) used for the FeatureProjector target.
+#   For SAM vit_b @ 224, embedding is (256, 14, 14).
+# ----------------------------------------------------------------------
+sam_teacher:
+  sam_type: vit_b
+  checkpoint: checkpoints/sam_vit_b_01ec64.pth
+  cache_dir: cache/seg_transmiter_lite/sam_teacher
+  embedding_shape: [256, 14, 14]
+  threshold: 0.0                # don't filter at cache time; trainer gates per-step
+
+# ----------------------------------------------------------------------
+# Adapter
+# ----------------------------------------------------------------------
+adapter:
+  bottleneck: null              # null -> max(in_channels // 2, 16)
+
+# ----------------------------------------------------------------------
+# Loss composition
+# ----------------------------------------------------------------------
+loss:
+  sup: 1.0
+  obj: 0.5
+  boundary: 0.2
+  feat: 0.1
+  sam_threshold: 0.75

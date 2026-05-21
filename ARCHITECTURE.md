@@ -283,7 +283,6 @@ Total Loss = α × Task Loss
            + β × Distill Loss (KL Divergence)
            + γ × Feature Loss (MSE, 다중 레이어)
            + γ_attn × Attention Map Loss (MSE)
-           + γ_align × Alignment Layer Loss (MSE)
            + λ_boundary × Boundary KD (Sobel edge map)
            + λ_shape × Shape KD (Signed Distance Transform)
            + λ_uncertainty × Uncertainty KD (Entropy map)

@@ -10,7 +10,6 @@ All visualization functions share consistent styling (colormap, alpha, dpi, font
 """
 
 import torch
-import torch.nn.functional as F
 import matplotlib
 
 matplotlib.use("Agg")  # Use non-interactive backend
@@ -123,7 +122,8 @@ def log_wandb_images(
         import wandb
 
         if wandb_images and wandb.run is not None:
-            wandb.log({f"{phase_name}/visualizations": wandb_images})
+            max_items = getattr(wandb.Image, "MAX_ITEMS", 108)
+            wandb.log({f"{phase_name}/visualizations": wandb_images[:max_items]})
     except ImportError:
         pass
 
@@ -234,20 +234,9 @@ def plot_distillation_panel(
     dpi: int = DEFAULT_DPI,
     font_size: int = DEFAULT_FONT_SIZE,
     filename: Optional[str] = None,
+    labels: Tuple[str, str] = ("Teacher", "Student"),
 ) -> None:
-    """Render a 4-panel distillation comparison: Image | GT | Teacher | Student.
-
-    Args:
-        img: Denormalized image (HW or HWC).
-        gt: Ground truth mask (HW).
-        teacher_pred: Teacher prediction mask (HW).
-        student_pred: Student prediction mask (HW).
-        save_path: Path to save the figure.
-        num_classes: Number of segmentation classes.
-        dpi: Figure DPI.
-        font_size: Title font size.
-        filename: Optional source filename to display in the Image panel title.
-    """
+    """Render a 4-panel distillation comparison: Image | GT | label0 | label1."""
     fig, axes = plt.subplots(
         1, 4, figsize=(DEFAULT_PANEL_WIDTH * 4, DEFAULT_PANEL_HEIGHT)
     )
@@ -265,12 +254,12 @@ def plot_distillation_panel(
 
     axes[2].imshow(img, cmap=img_cmap)
     axes[2].imshow(teacher_pred, cmap=DEFAULT_CMAP, alpha=DEFAULT_OVERLAY_ALPHA)
-    axes[2].set_title("Teacher", fontsize=font_size)
+    axes[2].set_title(labels[0], fontsize=font_size)
     axes[2].axis("off")
 
     axes[3].imshow(img, cmap=img_cmap)
     axes[3].imshow(student_pred, cmap=DEFAULT_CMAP, alpha=DEFAULT_OVERLAY_ALPHA)
-    axes[3].set_title("Student", fontsize=font_size)
+    axes[3].set_title(labels[1], fontsize=font_size)
     axes[3].axis("off")
 
     plt.tight_layout()
@@ -281,56 +270,6 @@ def plot_distillation_panel(
 # ──────────────────────────────────────────────────────────────────────
 # High-level: batch visualization
 # ──────────────────────────────────────────────────────────────────────
-
-
-def _infer_predictions(
-    model: torch.nn.Module,
-    images: torch.Tensor,
-    masks: torch.Tensor,
-    model_type: str,
-    num_classes: int,
-    img_size: Optional[int],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run model inference and return (predictions, masks_for_vis).
-
-    Returns:
-        preds: [B, 1, H, W] binary/class predictions.
-        masks_vis: [B, 1, H, W] ground truth for visualization.
-    """
-    # Convert multi-class masks to index form for visualization
-    if num_classes > 1:
-        masks_vis = torch.argmax(masks, dim=1, keepdim=True).float()
-    else:
-        masks_vis = masks
-
-    if model_type == "sam":
-        multimask_output = num_classes > 1
-        outputs = model(images, multimask_output, img_size)
-        logits = outputs.get("masks", outputs.get("low_res_logits"))
-        if logits is None:
-            logits = list(outputs.values())[0]
-        if logits.shape[-2:] != masks.shape[-2:]:
-            logits = F.interpolate(
-                logits, size=masks.shape[-2:], mode="bilinear", align_corners=False
-            )
-    elif model_type == "segformer":
-        outputs = model(images)
-        logits = outputs.logits
-        if logits.shape[-2:] != masks.shape[-2:]:
-            logits = F.interpolate(
-                logits, size=masks.shape[-2:], mode="bilinear", align_corners=False
-            )
-    else:  # default (TinyUSFM, etc.)
-        logits = model(images)
-        if logits.dim() == 3:
-            logits = logits.unsqueeze(1)
-
-    if num_classes == 1:
-        preds = (torch.sigmoid(logits) > 0.5).float()
-    else:
-        preds = torch.argmax(logits, dim=1, keepdim=True).float()
-
-    return preds, masks_vis
 
 
 def _visualize_sample_arrays(
@@ -365,97 +304,9 @@ def _visualize_sample_arrays(
     )
 
 
-def visualize_predictions_with_inference(
-    model: torch.nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    device: torch.device,
-    num_classes: int,
-    save_dir: Union[Path, str],
-    num_samples: Optional[int] = None,
-    model_type: str = "default",
-    img_size: Optional[int] = None,
-    phase_name: str = "test",
-    mean: np.ndarray = IMAGENET_MEAN,
-    std: np.ndarray = IMAGENET_STD,
-    log_to_wandb: bool = True,
-    max_wandb_images: Optional[int] = None,
-) -> None:
-    """Visualize model predictions with inference.
-
-    Runs model forward pass on each batch and creates segmentation panels.
-
-    Args:
-        model: The torch model to evaluate.
-        dataloader: DataLoader yielding (images, masks, ...).
-        device: Device to run the model on.
-        num_classes: Number of segmentation classes.
-        save_dir: Directory to save visualization images.
-        num_samples: Max samples to visualize (None = all).
-        model_type: Model type ('default', 'sam', 'segformer').
-        img_size: Image size for SAM model.
-        phase_name: Phase name for WandB logging.
-        mean: Denormalization mean.
-        std: Denormalization std.
-        log_to_wandb: If True, upload saved images to WandB.
-        max_wandb_images: Max number of images to upload to WandB.
-            Does not affect how many files are saved to disk.
-    """
-    from tqdm import tqdm
-
-    model.eval()
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    sample_count = 0
-    wandb_images = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Visualizing {phase_name} predictions"):
-            images = batch[0].to(device)
-            masks = batch[1].to(device)
-            filenames = _extract_filenames(batch)
-
-            preds, masks_vis = _infer_predictions(
-                model, images, masks, model_type, num_classes, img_size
-            )
-
-            images_np = images.cpu().numpy()
-            masks_np = masks_vis.cpu().numpy()
-            preds_np = preds.cpu().numpy()
-
-            for i in range(images_np.shape[0]):
-                fname = filenames[i] if filenames else None
-                file_label = fname or f"{sample_count:03d}"
-                save_path = save_dir / f"sample_{file_label}.png"
-                _visualize_sample_arrays(
-                    images_np[i], masks_np[i], preds_np[i],
-                    save_path, num_classes, mean, std, metrics=None,
-                    filename=fname,
-                )
-
-                if log_to_wandb and (
-                    max_wandb_images is None
-                    or len(wandb_images) < max_wandb_images
-                ):
-                    caption = fname or f"Sample {sample_count}"
-                    wb_img = _collect_wandb_image(save_path, caption)
-                    if wb_img is not None:
-                        wandb_images.append(wb_img)
-
-                sample_count += 1
-                if num_samples is not None and sample_count >= num_samples:
-                    break
-
-            if num_samples is not None and sample_count >= num_samples:
-                break
-
-    if log_to_wandb:
-        log_wandb_images(wandb_images, phase_name)
-
-
-def visualize_precomputed_predictions(
+def visualize_segmentation(
     images_list: List[torch.Tensor],
-    preds_list: List[torch.Tensor],
+    preds_list: List[Dict[str, torch.Tensor]],
     masks_list: List[torch.Tensor],
     num_classes: int,
     save_dir: Union[Path, str],
@@ -466,55 +317,83 @@ def visualize_precomputed_predictions(
     filenames_list: Optional[List[List[str]]] = None,
     log_to_wandb: bool = True,
     max_wandb_images: Optional[int] = None,
+    epoch: Optional[int] = None,
 ) -> None:
-    """Visualize pre-computed predictions (no model inference).
+    """Render per-sample panels from precomputed predictions and (optionally) log to W&B.
+
+    Each entry of ``preds_list`` is a dict mapping a label to a [B, 1, H, W] tensor:
+    - 1 entry  -> standard segmentation panel (Image | GT | Prediction).
+    - 2 entries -> distillation panel (Image | GT | first | second), labels become titles.
 
     Args:
-        images_list: List of image tensors [B, C, H, W].
-        preds_list: List of prediction tensors [B, 1, H, W].
-        masks_list: List of mask tensors [B, C, H, W].
-        num_classes: Number of segmentation classes.
-        save_dir: Directory to save visualization images.
-        num_samples: Max samples to visualize (None = all).
-        phase_name: Phase name for WandB logging.
-        mean: Denormalization mean.
-        std: Denormalization std.
-        filenames_list: Optional list of filename lists, one per batch.
-        log_to_wandb: If True, upload saved images to WandB.
-        max_wandb_images: Max number of images to upload to WandB.
-            Does not affect how many files are saved to disk.
+        images_list: per-batch image tensors [B, C, H, W].
+        preds_list:  per-batch prediction dicts; all batches must share the same key set.
+        masks_list:  per-batch ground-truth masks [B, C, H, W] or [B, 1, H, W].
+        num_classes: number of segmentation classes.
+        save_dir:    output directory (a subdirectory ``epoch_{N}`` is added if epoch given).
+        num_samples: max samples to render (None = all).
+        phase_name:  W&B log key prefix.
+        filenames_list: optional per-batch filename lists.
+        log_to_wandb: upload rendered PNGs as a W&B Image gallery.
+        max_wandb_images: cap on uploaded images (does not limit files saved to disk).
+        epoch: if given, append ``epoch_{epoch+1}`` to ``save_dir``.
     """
     save_dir = Path(save_dir)
+    if epoch is not None:
+        save_dir = save_dir / f"epoch_{epoch + 1}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    pred_keys: Optional[List[str]] = None
     sample_count = 0
-    wandb_images = []
+    wandb_images: list = []
+    fnames_iter = iter(filenames_list) if filenames_list else None
 
-    _fnames_iter = iter(filenames_list) if filenames_list else None
+    for batch_idx, (images, preds_dict, masks) in enumerate(
+        zip(images_list, preds_list, masks_list)
+    ):
+        if pred_keys is None:
+            pred_keys = list(preds_dict.keys())
+            if len(pred_keys) not in (1, 2):
+                raise ValueError(
+                    f"preds_list entries must have 1 or 2 keys, got {len(pred_keys)}"
+                )
 
-    for images, preds, masks in zip(images_list, preds_list, masks_list):
         if num_classes > 1 and masks.shape[1] == num_classes:
             masks = torch.argmax(masks, dim=1, keepdim=True).float()
 
-        batch_fnames = next(_fnames_iter) if _fnames_iter else None
-
-        images_np = images.numpy()
-        preds_np = preds.numpy()
-        masks_np = masks.numpy()
+        batch_fnames = next(fnames_iter) if fnames_iter else None
+        images_np = images.numpy() if isinstance(images, torch.Tensor) else images
+        masks_np = masks.numpy() if isinstance(masks, torch.Tensor) else masks
+        preds_np = {
+            k: (v.numpy() if isinstance(v, torch.Tensor) else v)
+            for k, v in preds_dict.items()
+        }
 
         for i in range(images_np.shape[0]):
             fname = batch_fnames[i] if batch_fnames else None
             file_label = fname or f"{sample_count:03d}"
             save_path = save_dir / f"sample_{file_label}.png"
-            _visualize_sample_arrays(
-                images_np[i], masks_np[i], preds_np[i],
-                save_path, num_classes, mean, std,
-                filename=fname,
-            )
+
+            img = denormalize_image(images_np[i], mean, std)
+            gt = prepare_mask_for_plot(masks_np[i])
+            sample_preds = [
+                prepare_mask_for_plot(preds_np[k][i]) for k in pred_keys
+            ]
+
+            if len(pred_keys) == 1:
+                plot_segmentation_panel(
+                    img, gt, sample_preds[0], save_path, num_classes,
+                    metrics=None, overlay=False, filename=fname,
+                )
+            else:
+                plot_distillation_panel(
+                    img, gt, sample_preds[0], sample_preds[1], save_path,
+                    num_classes, filename=fname,
+                    labels=(pred_keys[0].capitalize(), pred_keys[1].capitalize()),
+                )
 
             if log_to_wandb and (
-                max_wandb_images is None
-                or len(wandb_images) < max_wandb_images
+                max_wandb_images is None or len(wandb_images) < max_wandb_images
             ):
                 caption = fname or f"Sample {sample_count}"
                 wb_img = _collect_wandb_image(save_path, caption)
@@ -531,189 +410,3 @@ def visualize_precomputed_predictions(
     if log_to_wandb:
         log_wandb_images(wandb_images, phase_name)
 
-
-def visualize_distillation(
-    teacher_model: torch.nn.Module,
-    student_model: torch.nn.Module,
-    test_loader: torch.utils.data.DataLoader,
-    device: torch.device,
-    num_classes: int,
-    teacher_img_size: int,
-    save_dir: Union[Path, str],
-    num_samples: int = 10,
-    epoch: Optional[int] = None,
-    mean: np.ndarray = IMAGENET_MEAN,
-    std: np.ndarray = IMAGENET_STD,
-) -> None:
-    """Visualize teacher vs student predictions side-by-side.
-
-    Args:
-        teacher_model: Teacher model (SAM-like or generic).
-        student_model: Student model.
-        test_loader: DataLoader yielding (images, masks, ...).
-        device: Computation device.
-        num_classes: Number of segmentation classes.
-        teacher_img_size: Image size for SAM teacher inference.
-        save_dir: Base directory for saving visualizations.
-        num_samples: Max samples to visualize.
-        epoch: Current epoch (None for final evaluation).
-        mean: Denormalization mean.
-        std: Denormalization std.
-    """
-    from tqdm import tqdm
-
-    teacher_model.eval()
-    student_model.eval()
-
-    if epoch is not None:
-        vis_dir = Path(save_dir) / f"epoch_{epoch + 1}"
-    else:
-        vis_dir = Path(save_dir)
-    vis_dir.mkdir(parents=True, exist_ok=True)
-
-    sample_count = 0
-    wandb_images = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Visualizing distillation"):
-            images = batch[0].to(device)
-            masks = batch[1].to(device)
-            filenames = _extract_filenames(batch)
-
-            # Teacher inference
-            if hasattr(teacher_model, "image_encoder") or hasattr(teacher_model, "sam"):
-                multimask = num_classes > 1
-                teacher_outputs = teacher_model(images, multimask, teacher_img_size)
-            else:
-                teacher_outputs = {"masks": teacher_model(images)}
-
-            # Student inference
-            if hasattr(student_model, "image_encoder") or hasattr(student_model, "sam"):
-                multimask = num_classes > 1
-                student_raw = student_model(images, multimask, teacher_img_size)
-                student_logits = student_raw["masks"] if isinstance(student_raw, dict) else student_raw[0]
-            else:
-                student_raw = student_model(images)
-                student_logits = (
-                    student_raw[0] if isinstance(student_raw, tuple) else student_raw
-                )
-            teacher_logits = teacher_outputs["masks"]
-
-            # Convert logits to predictions
-            if num_classes == 1:
-                teacher_preds = (torch.sigmoid(teacher_logits) > 0.5).float()
-                student_preds = (torch.sigmoid(student_logits) > 0.5).float()
-            else:
-                teacher_preds = torch.argmax(teacher_logits, dim=1, keepdim=True).float()
-                student_preds = torch.argmax(student_logits, dim=1, keepdim=True).float()
-
-            for i in range(images.size(0)):
-                if sample_count >= num_samples:
-                    log_wandb_images(wandb_images, "distillation")
-                    return
-
-                fname = filenames[i] if filenames else None
-                img = denormalize_image(images[i].cpu().numpy(), mean, std)
-                t_pred = prepare_mask_for_plot(teacher_preds[i].cpu().numpy())
-                s_pred = prepare_mask_for_plot(student_preds[i].cpu().numpy())
-                gt = prepare_mask_for_plot(masks[i].cpu().numpy())
-
-                file_label = fname or f"{sample_count:03d}"
-                save_path = vis_dir / f"sample_{file_label}.png"
-                plot_distillation_panel(
-                    img, gt, t_pred, s_pred, save_path, num_classes,
-                    filename=fname,
-                )
-
-                caption = fname or f"Sample {sample_count}"
-                wb_img = _collect_wandb_image(save_path, caption)
-                if wb_img is not None:
-                    wandb_images.append(wb_img)
-
-                sample_count += 1
-
-    log_wandb_images(wandb_images, "distillation")
-
-
-def visualize_distillation_precomputed(
-    images_list: List[torch.Tensor],
-    teacher_preds_list: List[torch.Tensor],
-    student_preds_list: List[torch.Tensor],
-    masks_list: List[torch.Tensor],
-    num_classes: int,
-    save_dir: Union[Path, str],
-    num_samples: Optional[int] = None,
-    phase_name: str = "distillation",
-    mean: np.ndarray = IMAGENET_MEAN,
-    std: np.ndarray = IMAGENET_STD,
-    filenames_list: Optional[List[List[str]]] = None,
-    log_to_wandb: bool = True,
-    epoch: Optional[int] = None,
-) -> None:
-    """Visualize teacher vs student predictions from pre-computed tensors (no inference).
-
-    Args:
-        images_list: List of image tensors [B, C, H, W].
-        teacher_preds_list: List of teacher prediction tensors [B, 1, H, W].
-        student_preds_list: List of student prediction tensors [B, 1, H, W].
-        masks_list: List of ground-truth mask tensors [B, C, H, W].
-        num_classes: Number of segmentation classes.
-        save_dir: Base directory for saving visualizations.
-        num_samples: Max samples to visualize (None = all).
-        phase_name: Phase name for WandB logging key.
-        mean: Denormalization mean.
-        std: Denormalization std.
-        filenames_list: Optional list of filename lists, one per batch.
-        log_to_wandb: If True, upload saved images to WandB.
-        epoch: Current epoch (None for final evaluation).
-    """
-    if epoch is not None:
-        vis_dir = Path(save_dir) / f"epoch_{epoch + 1}"
-    else:
-        vis_dir = Path(save_dir)
-    vis_dir.mkdir(parents=True, exist_ok=True)
-
-    sample_count = 0
-    wandb_images = []
-
-    _fnames_iter = iter(filenames_list) if filenames_list else None
-
-    for images, teacher_preds, student_preds, masks in zip(
-        images_list, teacher_preds_list, student_preds_list, masks_list
-    ):
-        if num_classes > 1 and masks.shape[1] == num_classes:
-            masks = torch.argmax(masks, dim=1, keepdim=True).float()
-
-        batch_fnames = next(_fnames_iter) if _fnames_iter else None
-
-        images_np = images.numpy()
-        t_preds_np = teacher_preds.numpy()
-        s_preds_np = student_preds.numpy()
-        masks_np = masks.numpy()
-
-        for i in range(images_np.shape[0]):
-            fname = batch_fnames[i] if batch_fnames else None
-            img = denormalize_image(images_np[i], mean, std)
-            t_pred = prepare_mask_for_plot(t_preds_np[i])
-            s_pred = prepare_mask_for_plot(s_preds_np[i])
-            gt = prepare_mask_for_plot(masks_np[i])
-
-            file_label = fname or f"{sample_count:03d}"
-            save_path = vis_dir / f"sample_{file_label}.png"
-            plot_distillation_panel(img, gt, t_pred, s_pred, save_path, num_classes, filename=fname)
-
-            if log_to_wandb:
-                caption = fname or f"Sample {sample_count}"
-                wb_img = _collect_wandb_image(save_path, caption)
-                if wb_img is not None:
-                    wandb_images.append(wb_img)
-
-            sample_count += 1
-            if num_samples is not None and sample_count >= num_samples:
-                break
-
-        if num_samples is not None and sample_count >= num_samples:
-            break
-
-    if log_to_wandb:
-        log_wandb_images(wandb_images, phase_name)

@@ -1,176 +1,48 @@
-import random
-import numpy as np
-import torch
+import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any, List
-import logging
+from typing import Optional
+
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 
-def get_teacher_short_name(cfg: DictConfig) -> str:
-    """Create a short teacher model identifier from encoder_mode/decoder_mode/use_alignment."""
-    teacher_name = cfg.teacher.name
-
-    # SAM-based models: build name from mode fields
-    if teacher_name in ("sam", "sam_hybrid"):
-        sam_type = cfg.teacher.get("sam_type", "vit_b")
-        encoder_mode = cfg.teacher.get("encoder_mode", "frozen")
-        decoder_mode = cfg.teacher.get("decoder_mode", "lora")
-        use_alignment = cfg.teacher.get("use_alignment", False)
-
-        name = f"sam_{sam_type}"
-        if encoder_mode != "frozen":
-            name = f"{name}_e{encoder_mode}"
-        if use_alignment:
-            name = f"{name}_align"
-        if decoder_mode != "frozen":
-            name = f"{name}_d{decoder_mode}"
-
-        # Add hyperparameters
-        if cfg.teacher.get("alignment_num_blocks") is not None:
-            name = f"{name}_al{cfg.teacher.alignment_num_blocks}"
-        if cfg.teacher.get("r_d") is not None:
-            name = f"{name}_rd{cfg.teacher.r_d}"
-
-        return name
-
-    return teacher_name.lower()
+# Project-relative directory holding per-model yaml definitions.
+_MODEL_CFG_DIR = Path(__file__).resolve().parent.parent / "config" / "model"
 
 
-def _sync_teacher_cfg_from_exp_dir(cfg: DictConfig, exp_dir: Path, logger: logging.Logger) -> None:
-    """Merge the original experiment's model config into cfg.teacher in-place.
+def load_model_cfg(name: str, num_classes: int) -> DictConfig:
+    """Load ``config/model/{name}.yaml`` and extract the ``model:`` section.
 
-    Fields that belong to the current distill config (checkpoint, exp_id) are
-    preserved and never overwritten by the old experiment's values.
+    The model yaml is expected to expose ``binary_checkpoint`` and
+    ``multiclass_checkpoint`` fields. The correct one is picked based on
+    ``num_classes`` (``1`` → binary, otherwise → multiclass) and assigned to
+    ``checkpoint`` so downstream model classes can consume it transparently.
+
+    Variable interpolations like ``${data.num_classes}`` are intentionally left
+    unresolved here — the caller is responsible for merging this into a parent
+    config so interpolations resolve correctly.
     """
-    conf_file = exp_dir / "config.yaml"
-    if not conf_file.exists():
-        return
-    try:
-        old_cfg = OmegaConf.load(conf_file)
-        # train.yaml stores the model under 'model:'; distill.yaml uses 'teacher:'
-        src_model_cfg = old_cfg.get("model", None)
-        if src_model_cfg is None:
-            return
+    cfg_path = _MODEL_CFG_DIR / f"{name}.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Model config not found: {cfg_path}")
 
-        keep = {k: v for k in ("checkpoint", "exp_id") if (v := cfg.teacher.get(k)) is not None}
-        merged = OmegaConf.merge(cfg.teacher, src_model_cfg)
-
-        # Restore protected fields
-        OmegaConf.set_struct(merged, False)
-        for k, v in keep.items():
-            OmegaConf.update(merged, k, v, merge=False)
-
-        # Write back to cfg.teacher in-place
-        OmegaConf.set_struct(cfg.teacher, False)
-        for key in merged:
-            OmegaConf.update(cfg.teacher, key, merged[key], merge=False)
-
-        logger.info(f"Synchronized teacher config from {conf_file} (protected: {list(keep)})")
-    except Exception as e:
-        logger.warning(f"Failed to sync teacher config from {conf_file}: {e}")
-
-
-def _find_exp_dir_by_id(exp_id, cfg: DictConfig, logger: logging.Logger) -> Optional[Path]:
-    """Search for an experiment directory matching exp_id under the logs tree."""
-    # YAML may strip underscores from a timestamp-like value (e.g. 20260313_012805 → 20260313012805).
-    exp_id_str = str(exp_id)
-    if len(exp_id_str) == 14 and exp_id_str.isdigit():
-        exp_id_fmt = exp_id_str[:8] + "_" + exp_id_str[8:]
-    else:
-        exp_id_fmt = exp_id_str
-    variants = list(dict.fromkeys([exp_id_str, exp_id_fmt]))  # dedup, preserve order
-
-    def _matches(d: Path) -> bool:
-        return any(v in d.name for v in variants)
-
-    logs_root = Path(cfg.get("output", {}).get("dir", "logs"))
-    encoder_mode = cfg.teacher.get("encoder_mode", "frozen")
-    decoder_mode = cfg.teacher.get("decoder_mode", "lora")
-    peft_mode = f"e_{encoder_mode}_d_{decoder_mode}"
-    logs_sam = logs_root / "sam"
-
-    # Search order: specific peft dir → all of logs/sam/ → entire logs tree
-    search_roots = [
-        (logs_sam / peft_mode, False),
-        (logs_sam, True),
-        (logs_root, True),
-    ]
-    for root, recursive in search_roots:
-        if not root.exists():
-            continue
-        candidates = (
-            sorted(root.rglob("*")) if recursive else list(root.iterdir())
+    full_cfg = OmegaConf.load(cfg_path)
+    model_cfg = full_cfg.get("model")
+    if model_cfg is None:
+        raise ValueError(
+            f"{cfg_path} does not contain a 'model:' section."
         )
-        matching = [
-            p for p in candidates
-            if p.is_dir() and _matches(p) and (not recursive or (p / "config.yaml").exists())
-        ]
-        if matching:
-            exp_dir = sorted(matching)[-1]
-            logger.info(f"Resolved exp_id '{exp_id_str}' → {exp_dir}")
-            return exp_dir
-        if recursive:
-            logger.info(f"exp_id '{exp_id_str}' not found under {root}, expanding search...")
 
-    logger.warning(f"No experiment directory found for exp_id: {exp_id_str} (tried: {variants})")
-    return None
+    OmegaConf.set_struct(model_cfg, False)
 
+    # Select binary / multiclass checkpoint based on the task.
+    binary_ckpt = model_cfg.pop("binary_checkpoint", None)
+    multi_ckpt = model_cfg.pop("multiclass_checkpoint", None)
+    selected = binary_ckpt if num_classes == 1 else multi_ckpt
+    if selected is not None:
+        model_cfg.checkpoint = selected
 
-def resolve_teacher_checkpoint(cfg: DictConfig) -> Optional[str]:
-    """Resolve teacher checkpoint and synchronize teacher config from the
-    original experiment's config.yaml.
-
-    Priority:
-    1) Explicit cfg.teacher.checkpoint → infer exp_dir from checkpoint path,
-       sync config, then return the checkpoint.
-    2) cfg.teacher.exp_id → locate exp_dir, sync config, find best checkpoint.
-    """
-    logger = logging.getLogger("medfm.distill")
-
-    # 1. Explicit checkpoint path
-    checkpoint = cfg.teacher.get("checkpoint")
-    if checkpoint is not None:
-        ckpt_path = Path(checkpoint)
-        if ckpt_path.exists():
-            # Infer exp_dir: checkpoint lives inside <exp_dir>/checkpoints/
-            exp_dir = ckpt_path.parent.parent
-            if (exp_dir / "config.yaml").exists():
-                _sync_teacher_cfg_from_exp_dir(cfg, exp_dir, logger)
-            return str(checkpoint)
-        logger.warning(f"Explicit teacher checkpoint not found: {checkpoint}")
-
-    # 2. Resolve via exp_id
-    exp_id = cfg.teacher.get("exp_id")
-    if not exp_id:
-        return None
-
-    exp_dir = _find_exp_dir_by_id(exp_id, cfg, logger)
-    if exp_dir is None:
-        return None
-
-    _sync_teacher_cfg_from_exp_dir(cfg, exp_dir, logger)
-
-    # Locate best checkpoint inside the experiment directory
-    ckpt_dir = exp_dir / "checkpoints"
-    if not ckpt_dir.exists():
-        logger.warning(f"Checkpoint directory not found: {ckpt_dir}")
-        return None
-
-    checkpoints = list(ckpt_dir.glob("best_epoch_*_dice*.pth")) or list(ckpt_dir.glob("epoch_*.pth"))
-    if not checkpoints:
-        logger.warning(f"No checkpoints found in {ckpt_dir}")
-        return None
-
-    best_ckpt = sorted(checkpoints)[-1]
-    logger.info(f"Automatically resolved teacher checkpoint: {best_ckpt}")
-    return str(best_ckpt)
-
-
-def get_student_short_name(cfg: DictConfig) -> str:
-    """Create a short student model identifier."""
-    return cfg.student.name.lower()
+    return model_cfg
 
 
 def get_dataset_short_name(cfg: DictConfig) -> str:
@@ -210,11 +82,23 @@ def resolve_distillation_split_path(
     return Path(f"splits/distill_{data_name}_r{adaptation_ratio}_s{seed}.json")
 
 
+def _model_cfg_for_tags(cfg: DictConfig) -> Optional[DictConfig]:
+    """Return the model-shaped DictConfig used for tag extraction.
+
+    Prefers the resolved ``student_cfg`` (distillation), then ``model``
+    (training), then ``teacher_cfg`` as a last resort.
+    """
+    for key in ("student_cfg", "model", "teacher_cfg"):
+        sub = cfg.get(key)
+        if isinstance(sub, DictConfig):
+            return sub
+    return None
+
+
 def get_experiment_tags(cfg: DictConfig) -> list:
     """Generate standardized tags for experiments based on hyperparameters."""
     tags = []
 
-    # Training tags
     if (bs := cfg.get("training", {}).get("batch_size")) is not None:
         tags.append(f"bs{bs}")
 
@@ -222,22 +106,14 @@ def get_experiment_tags(cfg: DictConfig) -> list:
     if lr is not None:
         tags.append(f"lr{lr}")
 
-    # Model structural tags
-    model_cfg = cfg.get(
-        "model", cfg.get("student", {})
-    )  # Use student if model not found (distillation case)
-    if not model_cfg and "teacher" in cfg:
-        model_cfg = cfg.teacher  # Fallback for teacher-only paths if needed
+    model_cfg = _model_cfg_for_tags(cfg)
+    if model_cfg is not None:
+        if model_cfg.get("encoder_mode", "frozen") != "frozen":
+            tags.append(f"encoder_{model_cfg.encoder_mode}")
+            tags.append(f"re{model_cfg.r_e}")
+        if model_cfg.get("decoder_mode", "frozen") == "lora":
+            tags.append(f"rd{model_cfg.r_d}")
 
-    if model_cfg.get("use_alignment", False):
-        tags.append(f"al{model_cfg.alignment_num_blocks}")
-    if model_cfg.get("encoder_mode", "frozen") != "frozen":
-        tags.append(f"encoder_{model_cfg.encoder_mode}")
-        tags.append(f"re{model_cfg.r_e}")
-    if model_cfg.get("decoder_mode", "frozen") == "lora":
-        tags.append(f"rd{model_cfg.r_d}")
-
-    # Distillation coefficients
     method_cfg = cfg.get("method", {})
     coeff_map = {
         "alpha": "a",
@@ -257,17 +133,28 @@ def create_log_dir(cfg: DictConfig) -> Path:
 
     Structure: logs/distill/{teacher}_to_{student}/{timestamp}_{tags}/
     """
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tags = get_experiment_tags(cfg)
     tag_suffix = "_" + "_".join(tags) if tags else ""
 
-    return Path(cfg.output.dir) / "distill" / f"{get_teacher_short_name(cfg)}_to_{get_student_short_name(cfg)}" / f"{timestamp}{tag_suffix}"
+    teacher_name = cfg.get("teacher")
+    student_name = cfg.get("student")
+    return (
+        Path(cfg.output.dir)
+        / "distill"
+        / f"{teacher_name}_to_{student_name}"
+        / f"{timestamp}{tag_suffix}"
+    )
 
 
 def save_experiment_summary(cfg: DictConfig, log_dir: Path):
     """Save human-readable experiment summary for distillation."""
     summary_path = log_dir / "experiment_summary.txt"
+
+    teacher_name = cfg.get("teacher")
+    student_name = cfg.get("student")
+    teacher_cfg = cfg.get("teacher_cfg", OmegaConf.create({}))
+    student_cfg = cfg.get("student_cfg", OmegaConf.create({}))
 
     lines = [
         "=" * 60,
@@ -275,31 +162,27 @@ def save_experiment_summary(cfg: DictConfig, log_dir: Path):
         "=" * 60,
         "",
         "[Teacher Model]",
-        f"  Name: {cfg.teacher.name}",
+        f"  Name: {teacher_name}",
+        f"  Checkpoint: {teacher_cfg.get('checkpoint', 'N/A')}",
     ]
 
-    # Teacher SAM-specific info
-    if cfg.teacher.name in ("sam", "sam_hybrid"):
+    if teacher_name in ("sam", "sam_hybrid"):
         lines.extend(
             [
-                f"  Backbone: {cfg.teacher.get('sam_type', 'N/A')}",
-                f"  Encoder Mode: {cfg.teacher.get('encoder_mode', 'N/A')}",
-                f"  Decoder Mode: {cfg.teacher.get('decoder_mode', 'N/A')}",
-                f"  Use Alignment: {cfg.teacher.get('use_alignment', 'N/A')}",
-                f"  LoRA Rank (decoder): {cfg.teacher.get('r_d', 'N/A')}",
+                f"  Backbone: {teacher_cfg.get('sam_type', 'N/A')}",
+                f"  Encoder Mode: {teacher_cfg.get('encoder_mode', 'N/A')}",
+                f"  Decoder Mode: {teacher_cfg.get('decoder_mode', 'N/A')}",
+                f"  LoRA Rank (decoder): {teacher_cfg.get('r_d', 'N/A')}",
             ]
         )
-    elif cfg.teacher.name.startswith("vit_"):
-        lines.append(f"  Backbone: {cfg.teacher.name}")
 
     lines.extend(
         [
-            f"  Image Size: {cfg.teacher.get('img_size', 'N/A')}",
-            f"  LoRA Checkpoint: {cfg.teacher.get('lora_checkpoint', 'N/A')}",
+            f"  Image Size: {teacher_cfg.get('img_size', 'N/A')}",
             "",
             "[Student Model]",
-            f"  Name: {cfg.student.name}",
-            f"  Pretrained: {cfg.student.get('pretrained', 'N/A')}",
+            f"  Name: {student_name}",
+            f"  Checkpoint: {student_cfg.get('checkpoint', 'N/A')}",
             "",
             "[Distillation Method]",
             f"  Name: {cfg.method.name}",

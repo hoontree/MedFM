@@ -3,13 +3,12 @@
 # Training settings
 training:
   lr: 1e-4                      # Learning rate
-  batch_size: 8
+  batch_size: 16
   num_epochs: 1000
   warmup_epochs: 5
   train_head_only: false           # Train only decoder parts
   num_workers: 8
   save_interval: 20               # Save checkpoint every N epochs
-  limit_train_batches: null       # For debugging purposes, limit number of batches per epoch
   dice_weight: 0.8                # Weight for Dice loss in combined loss
   early_stopping:
     enabled: true
@@ -42,7 +41,7 @@ hardware:
   n_gpus: 1
   seed: 42
   deterministic: 1
-  gpu_ids: [0]
+  gpu_ids: [3]
 
 # Output configuration
 output:
@@ -66,5 +65,5 @@ wandb:
       batch_size: ${training.batch_size}
       train_head_only: ${training.train_head_only}
     data:
-      multiclass: ${data.multiclass}
+      num_classes: ${data.num_classes}
   mode: online

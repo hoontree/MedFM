@@ -23,13 +23,17 @@ alpha: 1.0
 beta: 0.0
 gamma: 0.0
 delta: 1.0   # logit-CWD
-zeta: 0.0    # feature-CWD
+zeta: 1.0    # feature-CWD
 
 # Task loss components
 use_dice: true
 use_ce: true
 
-# Feature pairs for zeta>0 / gamma>0 (auto-resolves block paths/channels per model)
+# Feature pairs for zeta>0 / gamma>0
+# Just list transformer block indices — the actual module path
+# (`backbone.blocks.7` vs `image_encoder.blocks.7` etc.) and channel
+# counts are auto-detected per model, so this works for either
+# distillation direction (TinyUSFM↔SAM) without edits.
 feature_pairs: [7, 9, 11]
 
 # Uncertainty-weighted KD off in CWD baseline

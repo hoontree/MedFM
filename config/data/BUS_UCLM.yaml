@@ -10,7 +10,6 @@ path:
       samples: 16
       interval: 10
 num_classes: 1  # Binary: 1, Multiclass: 3 (background=0, benign=1, malignant=2)
-multiclass: false  # Set true + num_classes=3 for multiclass training
 auto_img_size_by_sam_type: true
 sam_img_size_map:
   vit_b: 224

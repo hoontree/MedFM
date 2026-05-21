@@ -21,30 +21,23 @@ def build_distill_cfg(
     teacher_run_id: Optional[str] = None,
     teacher_log_dir: Optional[str] = None,
 ) -> DictConfig:
-    """Build distillation config by composing base distill config + train context.
+    """Build distillation config from a freshly-trained teacher.
 
-    Merges the full teacher model config from the training run into the
-    distillation teacher section so that every architecture key is carried
-    over automatically.  Also forwards pipeline context (teacher_run_id,
-    teacher_log_dir) for integrated logging.
+    The distillation config selects the teacher by its model name
+    (``cfg.model.name`` from the training run). The teacher's resolved
+    checkpoint path is forwarded via ``pipeline.teacher_ckpt_override`` so
+    DistillTrainer applies it after loading ``config/model/{name}.yaml``.
     """
     teacher_name = train_cfg.model.get("name")
     if not teacher_name:
         raise ValueError("cfg.model.name is required for pipeline distillation.")
 
-    # Verify that a teacher preset yaml exists
-    preset = Path("config/teacher") / f"{teacher_name}.yaml"
+    preset = Path("config/model") / f"{teacher_name}.yaml"
     if not preset.exists():
-        raise FileNotFoundError(f"Teacher preset not found: {preset}")
+        raise FileNotFoundError(f"Model preset not found: {preset}")
 
-    # Compose distillation config with teacher override
     distill_cfg = compose(config_name="distill", overrides=[f"teacher={teacher_name}"])
     OmegaConf.set_struct(distill_cfg, False)
-    OmegaConf.set_struct(distill_cfg.teacher, False)
-
-    # Merge full teacher model arch (carries all keys automatically)
-    distill_cfg.teacher = OmegaConf.merge(distill_cfg.teacher, train_cfg.model)
-    distill_cfg.teacher.checkpoint = str(teacher_ckpt.resolve())
 
     # Carry over shared sections from training config
     distill_cfg.data = train_cfg.data
@@ -57,6 +50,7 @@ def build_distill_cfg(
     pipeline_dict = (
         OmegaConf.to_container(train_cfg.get("pipeline", {}), resolve=False) or {}
     )
+    pipeline_dict["teacher_ckpt_override"] = str(teacher_ckpt.resolve())
     if teacher_run_id is not None:
         pipeline_dict["teacher_run_id"] = teacher_run_id
     if teacher_log_dir is not None:

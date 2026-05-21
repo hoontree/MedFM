@@ -7,7 +7,6 @@ Supported adaptation modes:
     - dual_lora: LoRA on both encoder and decoder
     - dual_ft: Full fine-tune on both encoder and decoder
     - encoder_conv_lora_decoder_{ft,lora,frozen}: Conv-LoRA on encoder, chosen mode on decoder
-    - encoder_conv_lora_alignment_decoder_{ft,lora,frozen}: Conv-LoRA on encoder, alignment layer, chosen mode on decoder
     - encoder_lora_decoder_ft: LoRA on encoder, full fine-tune decoder
     - encoder_lora_decoder_frozen: LoRA on encoder, freeze decoder
     - encoder_ft_decoder_lora: Full fine-tune encoder, LoRA on decoder
@@ -15,9 +14,6 @@ Supported adaptation modes:
     - encoder_frozen_decoder_ft: Freeze encoder, full fine-tune decoder
     - encoder_frozen_decoder_lora: Freeze encoder, LoRA on decoder
     - encoder_frozen_decoder_frozen: Freeze both (inference only)
-    - encoder_frozen_alignment_decoder_ft: Freeze encoder, alignment layer, full fine-tune decoder
-    - encoder_frozen_alignment_decoder_lora: Freeze encoder, alignment layer, LoRA on decoder
-    - encoder_frozen_alignment_decoder_frozen: Freeze encoder and decoder, train alignment layer only
 """
 
 import logging
@@ -29,7 +25,6 @@ import torch
 import torch.nn as nn
 from model.segment_anything import sam_model_registry
 from model.segment_anything.modeling import Sam
-from model.ca_sam.alignment_layer import AlignmentLayer
 from model.adaptation_layers import ConvLoRALinear
 
 LOGGER = logging.getLogger(__name__)
@@ -176,7 +171,6 @@ class LoRA_Sam(nn.Module):
 
     Adaptation mode format:
         - 'encoder_{encoder_mode}_decoder_{decoder_mode}'
-        - 'encoder_{encoder_mode}_alignment_decoder_{decoder_mode}'
         - Special: 'dual_lora', 'dual_ft'
         - encoder_mode: 'lora', 'conv_lora', 'ft', 'frozen'
         - decoder_mode: 'lora', 'ft', 'frozen'
@@ -196,8 +190,6 @@ class LoRA_Sam(nn.Module):
         r_d: int = 4,
         encoder_mode: Optional[str] = None,
         decoder_mode: Optional[str] = None,
-        use_alignment: bool = False,
-        alignment_num_blocks: int = 4,
         conv_lora_expert_num: int = 4,
         checkpoint: Optional[str] = None,
         **kwargs,
@@ -210,34 +202,17 @@ class LoRA_Sam(nn.Module):
 
         self.encoder_mode = encoder_mode
         self.decoder_mode = decoder_mode
-        self.use_alignment = use_alignment
 
         self.sam_type = sam_type
 
-        # Alignment layer configuration
-        self.alignment_num_blocks = alignment_num_blocks
-
-        # checkpoint가 finetuned ckpt이면 pretrained_ckpt=None을 넘겨 pretrained 로딩을
-        # 건너뛴다. SAM 공식 pretrained ckpt이거나 checkpoint가 없으면 그대로 전달한다.
-        _is_finetuned = checkpoint is not None and "sam_vit_" not in str(checkpoint)
-        pretrained_ckpt = None if _is_finetuned else checkpoint
-
-        # 1. Build base SAM model first
-        kwargs = {
-            "image_size": img_size,
-            "num_classes": num_classes,
-            "pixel_mean": pixel_mean,
-            "pixel_std": pixel_std,
-        }
-        if pretrained_ckpt is not None:
-            kwargs["checkpoint"] = pretrained_ckpt
-            
-        sam_model = sam_model_registry[sam_type](**kwargs)
-        
-        if pretrained_ckpt is not None:
-            LOGGER.info("[LoRA_Sam] Loaded SAM pretrained weights from %s", pretrained_ckpt)
-        elif not _is_finetuned:
-            LOGGER.info("[LoRA_Sam] Loaded SAM with default pretrained weights")
+        # 1. Always build SAM with its default pretrained weights from the registry.
+        sam_model = sam_model_registry[sam_type](
+            image_size=img_size,
+            num_classes=num_classes,
+            pixel_mean=pixel_mean,
+            pixel_std=pixel_std,
+        )
+        LOGGER.info("[LoRA_Sam] Loaded SAM '%s' with default pretrained weights", sam_type)
 
         # Setup lora layers for encoder
         self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))
@@ -260,11 +235,6 @@ class LoRA_Sam(nn.Module):
         # Apply adaptation to decoder
         self._adapt_decoder(sam_model, decoder_mode)
 
-        # Setup alignment layer if needed
-        self.alignment_layer = None
-        if self.use_alignment:
-            self._setup_alignment_layer()
-
         # Initialize LoRA parameters
         self.reset_parameters()
 
@@ -273,25 +243,9 @@ class LoRA_Sam(nn.Module):
         # Log trainable parameters
         self._log_trainable_params()
 
-        # Load finetuned/LoRA checkpoint (exactly once, pretrained already skipped above)
-        if _is_finetuned:
+        # 2. If a checkpoint is provided via config, overwrite the pretrained weights.
+        if checkpoint is not None:
             self.load_checkpoint(checkpoint)
-            LOGGER.info(
-                "[LoRA_Sam] Loaded fine-tuned/LoRA checkpoint from %s", checkpoint
-            )
-
-    def _setup_alignment_layer(self):
-        """Setup alignment layer between encoder and decoder."""
-        # SAM encoder output is always 256 channels (prompt_embed_dim)
-        self.alignment_layer = AlignmentLayer(
-            in_channels=256,
-            hidden_channels=256,
-            num_blocks=self.alignment_num_blocks,
-        )
-        LOGGER.info(
-            "[LoRA_Sam] Alignment Layer: %s parameters",
-            f"{self.alignment_layer.get_num_params():,}",
-        )
 
     def _adapt_encoder(self, sam_model: Sam, mode: str):
         """Apply adaptation strategy to the image encoder."""
@@ -467,11 +421,6 @@ class LoRA_Sam(nn.Module):
                 "[LoRA_Sam] Conv-LoRA (encoder): experts=%s",
                 self.conv_lora_expert_num,
             )
-        if self.use_alignment:
-            LOGGER.info(
-                "[LoRA_Sam] Alignment Layer: enabled (blocks=%s)",
-                self.alignment_num_blocks,
-            )
         LOGGER.info("[LoRA_Sam] Total parameters: %s", f"{total_params:,}")
         LOGGER.info(
             "[LoRA_Sam] Trainable parameters: %s (%.2f%%)",
@@ -516,7 +465,6 @@ class LoRA_Sam(nn.Module):
         merged_dict = {
             "encoder_mode": self.encoder_mode,
             "decoder_mode": self.decoder_mode,
-            "use_alignment": self.use_alignment,
         }
 
         # Save encoder LoRA if applicable
@@ -586,12 +534,6 @@ class LoRA_Sam(nn.Module):
                     "fati_vb": self.fa_ti_v_proj_B.weight,
                 }
             )
-
-        # Save alignment layer if applicable
-        if self.use_alignment and self.alignment_layer is not None:
-            merged_dict["alignment_layer"] = self.alignment_layer.state_dict()
-            merged_dict["alignment_num_blocks"] = self.alignment_num_blocks
-            merged_dict["alignment_hidden_channels"] = self.alignment_hidden_channels
 
         # Save prompt encoder and mask decoder (non-transformer) state
         if isinstance(self.sam, torch.nn.DataParallel) or isinstance(
@@ -702,12 +644,6 @@ class LoRA_Sam(nn.Module):
                 self.fa_ti_v_proj_A.weight.data.copy_(state_dict["fati_va"])
                 self.fa_ti_v_proj_B.weight.data.copy_(state_dict["fati_vb"])
 
-        # Load alignment layer if applicable
-        if self.use_alignment and self.alignment_layer is not None:
-            if "alignment_layer" in state_dict:
-                self.alignment_layer.load_state_dict(state_dict["alignment_layer"])
-                LOGGER.info("[LoRA_Sam] Loaded alignment layer from checkpoint")
-
         # Load prompt encoder and mask decoder state
         sam_dict = self.sam.state_dict()
         sam_keys = sam_dict.keys()
@@ -731,41 +667,33 @@ class LoRA_Sam(nn.Module):
         self.sam.load_state_dict(sam_dict)
 
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint. Supports both LoRA and regular SAM checkpoints."""
-        try:
-            # First try loading as LoRA parameters
+        """Overwrite weights with a config-provided checkpoint.
+
+        Dispatches by checkpoint format:
+        - LoRA/adapter ckpt saved via `save_lora_parameters` (carries 'encoder_mode' key)
+        - Full `LoRA_Sam.state_dict()` otherwise
+        """
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+        if isinstance(state_dict, dict) and "encoder_mode" in state_dict:
             self.load_lora_parameters(checkpoint_path)
             LOGGER.info(
-                "[LoRA_Sam] Loaded LoRA/Adapter parameters from %s", checkpoint_path
+                "[LoRA_Sam] Loaded LoRA/adapter parameters from %s", checkpoint_path
             )
-        except Exception as e:
-            # Fallback to regular SAM load_state_dict if it's a full model checkpoint
-            try:
-                state_dict = torch.load(checkpoint_path, map_location="cpu")
-                self.load_state_dict(state_dict)
-                LOGGER.info(
-                    "[LoRA_Sam] Loaded full model state_dict from %s", checkpoint_path
-                )
-            except Exception as e2:
-                LOGGER.warning("Failed to load checkpoint %s", checkpoint_path)
-                LOGGER.warning("LoRA load error: %s", e)
-                LOGGER.warning("Full model load error: %s", e2)
-                raise RuntimeError(
-                    f"Failed to load checkpoint: {checkpoint_path}"
-                ) from e2
+            return
+
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        LOGGER.info(
+            "[LoRA_Sam] Loaded full state_dict from %s (missing=%d, unexpected=%d)",
+            checkpoint_path,
+            len(missing),
+            len(unexpected),
+        )
 
     def forward(self, batched_input, multimask_output, image_size):
-        """Forward pass through the SAM model.
-
-        If alignment layer is enabled, applies it between encoder and decoder.
-        """
-        if self.use_alignment and self.alignment_layer is not None:
-            return self._forward_with_alignment(
-                batched_input, multimask_output, image_size
-            )
-        else:
-            outputs = self.sam(batched_input, multimask_output, image_size)
-            return self._attach_moe_loss(outputs)
+        """Forward pass through the SAM model."""
+        outputs = self.sam(batched_input, multimask_output, image_size)
+        return self._attach_moe_loss(outputs)
 
     def _get_conv_lora_moe_loss(self):
         """Aggregate Conv-LoRA MoE losses from injected encoder qkv adapters."""
@@ -795,89 +723,3 @@ class LoRA_Sam(nn.Module):
                 if isinstance(item, dict):
                     item["moe_loss"] = moe_loss
         return outputs
-
-    def _forward_with_alignment(self, batched_input, multimask_output, image_size):
-        """Forward pass with alignment layer between encoder and decoder."""
-        if isinstance(batched_input, list):
-            return self._forward_test_with_alignment(batched_input, multimask_output)
-        else:
-            return self._forward_train_with_alignment(
-                batched_input, multimask_output, image_size
-            )
-
-    def _forward_train_with_alignment(
-        self, batched_input, multimask_output, image_size
-    ):
-        """Training forward pass with alignment layer."""
-        input_images = self.sam.preprocess(batched_input)
-        image_embeddings = self.sam.image_encoder(input_images)
-
-        # Apply alignment layer
-        image_embeddings = self.alignment_layer(image_embeddings)
-
-        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
-            points=None, boxes=None, masks=None
-        )
-        low_res_masks, iou_predictions = self.sam.mask_decoder(
-            image_embeddings=image_embeddings,
-            image_pe=self.sam.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-        )
-        masks = self.sam.postprocess_masks(
-            low_res_masks,
-            input_size=(image_size, image_size),
-            original_size=(image_size, image_size),
-        )
-        outputs = {
-            "masks": masks,
-            "iou_predictions": iou_predictions,
-            "low_res_logits": low_res_masks,
-            "image_embeddings": image_embeddings,
-        }
-        return self._attach_moe_loss(outputs)
-
-    @torch.no_grad()
-    def _forward_test_with_alignment(self, batched_input, multimask_output):
-        """Test forward pass with alignment layer."""
-        input_images = torch.stack(
-            [self.sam.preprocess(x["image"]) for x in batched_input], dim=0
-        )
-        image_embeddings = self.sam.image_encoder(input_images)
-
-        # Apply alignment layer
-        image_embeddings = self.alignment_layer(image_embeddings)
-
-        outputs = []
-        for image_record, curr_embedding in zip(batched_input, image_embeddings):
-            if "point_coords" in image_record:
-                points = (image_record["point_coords"], image_record["point_labels"])
-            else:
-                points = None
-            sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
-                points=points,
-                boxes=image_record.get("boxes", None),
-                masks=image_record.get("mask_inputs", None),
-            )
-            low_res_masks, iou_predictions = self.sam.mask_decoder(
-                image_embeddings=curr_embedding.unsqueeze(0),
-                image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-            masks = self.sam.postprocess_masks(
-                low_res_masks,
-                input_size=image_record["image"].shape[-2:],
-                original_size=image_record["original_size"],
-            )
-            masks = masks > self.sam.mask_threshold
-            outputs.append(
-                {
-                    "masks": masks,
-                    "iou_predictions": iou_predictions,
-                    "low_res_logits": low_res_masks,
-                }
-            )
-        return self._attach_moe_loss(outputs)

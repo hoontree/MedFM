@@ -79,6 +79,10 @@ class BaseTrainer(ABC):
     the abstract methods for model creation, data loading, and training logic.
     """
 
+    # =========================================================================
+    # 1. Construction
+    # =========================================================================
+
     def __init__(self, cfg: DictConfig, model: Optional[nn.Module] = None):
         """
         Initialize base trainer.
@@ -116,43 +120,9 @@ class BaseTrainer(ABC):
         self.current_epoch = 0
         self.global_step = 0
 
-    def setup(self, mode: str = "train"):
-        """
-        Setup training environment.
-
-        Args:
-            mode: 'train' or 'test'
-        """
-        # Set random seeds
-        seed = self.cfg.get("hardware", {}).get("seed", 42)
-        deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
-        set_seed(seed, deterministic=deterministic)
-
-        # Setup directories
-        self._setup_directories()
-
-        # Setup logger
-        self._setup_logger()
-
-        # Setup wandb
-        if mode == "train":
-            self._setup_wandb()
-
-        # Create data loaders
-        self._create_dataloaders()
-
-        # Create model
-        self._create_model()
-
-        # Setup training components (only for training mode)
-        if mode == "train":
-            self._create_optimizer()
-            self._create_scheduler()
-            self._setup_early_stopping()
-
-        self.logger.info(f"Setup completed for {mode} mode")
-        self.logger.info(f"Device: {self.device}")
-        self.logger.info(f"Experiment directory: {self.exp_dir}")
+    # =========================================================================
+    # 2. Setup (directories / logging / wandb)
+    # =========================================================================
 
     def _setup_directories(self):
         """
@@ -168,7 +138,7 @@ class BaseTrainer(ABC):
         """
         # Get model name
         model_name = self.cfg.model.name
-        
+
         # Create base directory
         logs_root = Path(self.cfg.get("output", {}).get("dir", "logs")) / "train"
 
@@ -225,6 +195,40 @@ class BaseTrainer(ABC):
             mode=wandb_mode,
         )
 
+        self._define_wandb_metrics()
+
+    def _define_wandb_metrics(self) -> None:
+        """Bind each metric family to its proper x-axis so charts render correctly.
+
+        W&B ``define_metric`` only accepts a single trailing ``*`` glob, which
+        matches the remainder of the key (including ``/``). So ``train/*`` is
+        enough to cover ``train/loss`` and ``train/BUID/Dice`` alike.
+        """
+        if wandb.run is None:
+            return
+
+        wandb.define_metric("epoch")
+        wandb.define_metric("global_step")
+
+        epoch_families = ("train", "val", "test", "final_test")
+        step_families = ("step",)
+
+        def _patterns(family: str) -> tuple[str, ...]:
+            return (f"{family}/*", f"distill/{family}/*")
+
+        for fam in epoch_families:
+            for pat in _patterns(fam):
+                wandb.define_metric(pat, step_metric="epoch")
+        for pat in _patterns("final_test"):
+            wandb.define_metric(pat, step_metric="epoch", summary="last")
+
+        for fam in step_families:
+            for pat in _patterns(fam):
+                wandb.define_metric(pat, step_metric="global_step")
+
+        for pat in ("lr", "lr/*", "distill/lr", "distill/lr/*"):
+            wandb.define_metric(pat, step_metric="global_step")
+
     def _get_wandb_run_name(self) -> str:
         """Return the W&B run name for non-sweep runs. Subclasses can override."""
         return (
@@ -274,6 +278,10 @@ class BaseTrainer(ABC):
                 f"Early stopping enabled: patience={patience}, min_delta={min_delta}"
             )
 
+    # =========================================================================
+    # 3. Model / optimizer construction
+    # =========================================================================
+
     @abstractmethod
     def _create_model(self):
         """Create and initialize model. Must be implemented by subclasses."""
@@ -296,49 +304,6 @@ class BaseTrainer(ABC):
         """Create learning rate scheduler. Must be implemented by subclasses."""
         raise NotImplementedError
 
-    @abstractmethod
-    def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """
-        Train for one epoch.
-
-        Args:
-            epoch: Current epoch number
-
-        Returns:
-            Dictionary of training metrics
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def validate(self, epoch: int) -> Dict[str, float]:
-        """
-        Validate model.
-
-        Args:
-            epoch: Current epoch number
-
-        Returns:
-            Dictionary of validation metrics
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def test(self) -> Dict[str, float]:
-        """
-        Test model.
-
-        Returns:
-            Dictionary of test metrics
-        """
-        raise NotImplementedError
-
-    def _iter_test_loaders(self):
-        """Iterate over test loaders yielding (name, loader) tuples."""
-        if isinstance(self.test_loader, dict):
-            yield from self.test_loader.items()
-        else:
-            yield "test", self.test_loader
-
     def _log_data_sizes(self):
         """Log dataset sizes. Call from _create_dataloaders()."""
         self.logger.info(f"Train set size: {len(self.train_loader.dataset)}")
@@ -360,13 +325,6 @@ class BaseTrainer(ABC):
             wandb.summary["model/total_params"] = total
             wandb.summary["model/trainable_params"] = trainable
 
-    def _log_step_metrics(self, metrics: Dict, step: int):
-        """Log step-level metrics to wandb with step/ prefix."""
-        if wandb.run is not None:
-            data = {"global_step": step}
-            data.update({f"step/{k}": v for k, v in metrics.items()})
-            wandb.log(data)
-
     def _get_model_type(self) -> str:
         """Return the model_type string for visualization inference.
 
@@ -374,185 +332,65 @@ class BaseTrainer(ABC):
         """
         return "default"
 
-    def _visualize_predictions(
-        self,
-        loader=None,
-        vis_dir=None,
-        predictions_cache: Dict = None,
-        num_samples=_UNSET,
-        epoch: int = None,
-        log_to_wandb: bool = True,
-        max_wandb_images: Optional[int] = None,
-    ):
-        """Visualize predictions with a unified implementation.
+    # =========================================================================
+    # 4. Training step (abstract)
+    # =========================================================================
 
-        Supports three modes:
-        1. loader provided -> run model inference on loader (validation).
-        2. predictions_cache provided -> use pre-computed results (test).
-        3. Neither -> iterate test_loaders with model inference (fallback).
-
-        Subclasses can override _get_model_type() to customise inference.
+    @abstractmethod
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Train for one epoch.
 
         Args:
-            num_samples: Max samples to visualize. Defaults to config value.
-                         Pass None explicitly to visualize all samples.
-            log_to_wandb: If True, upload saved images to W&B.
-            max_wandb_images: Max number of images to upload to W&B.
-                Does not affect how many files are saved to disk.
+            epoch: Current epoch number
+
+        Returns:
+            Dictionary of training metrics
         """
-        from utils.visualize import visualize_predictions_with_inference, visualize_precomputed_predictions
+        raise NotImplementedError
 
-        if num_samples is _UNSET:
-            num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+    # =========================================================================
+    # 5. Evaluation (abstract)
+    # =========================================================================
+
+    @abstractmethod
+    def validate(self, epoch: int, return_predictions: bool = False):
+        """
+        Validate model.
+
+        Args:
+            epoch: Current epoch number
+            return_predictions: If True, also return a predictions cache reusable
+                by ``_visualize_validation`` so visualization shares the same
+                forward pass as metric computation.
+
+        Returns:
+            If ``return_predictions`` is False, a dict of validation metrics.
+            Otherwise, a tuple ``(metrics, predictions_cache)`` where the cache
+            has the form ``{"__val__": (images_list, preds_list, masks_list, filenames_list)}``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def test(self) -> Dict[str, float]:
+        """
+        Test model.
+
+        Returns:
+            Dictionary of test metrics
+        """
+        raise NotImplementedError
+
+    def _iter_test_loaders(self):
+        """Iterate over test loaders yielding (name, loader) tuples."""
+        if isinstance(self.test_loader, dict):
+            yield from self.test_loader.items()
         else:
-            num_vis_samples = num_samples
-        model_type = self._get_model_type()
-        img_size = getattr(self, "img_size", None)
+            yield "test", self.test_loader
 
-        # Mode 1: validation visualization
-        if loader is not None:
-            visualize_predictions_with_inference(
-                self.model,
-                loader,
-                self.device,
-                self.cfg.data.num_classes,
-                vis_dir,
-                num_samples=num_vis_samples,
-                model_type=model_type,
-                img_size=img_size,
-                phase_name="val",
-                log_to_wandb=log_to_wandb,
-                max_wandb_images=max_wandb_images,
-            )
-            return
-
-        # Mode 2/3: test visualization
-        if vis_dir is None:
-            vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
-        if log_to_wandb and max_wandb_images is None:
-            max_wandb_images = 10
-
-        sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
-        self.logger.info(
-            f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}..."
-        )
-
-        for name, test_loader in self._iter_test_loaders():
-            save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
-            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
-
-            if predictions_cache and name in predictions_cache:
-                cached = predictions_cache[name]
-                images_list, preds_list, masks_list = cached[0], cached[1], cached[2]
-                filenames_list = cached[3] if len(cached) > 3 else None
-                visualize_precomputed_predictions(
-                    images_list,
-                    preds_list,
-                    masks_list,
-                    self.cfg.data.num_classes,
-                    save_dir,
-                    num_samples=num_vis_samples,
-                    phase_name=phase_name,
-                    filenames_list=filenames_list,
-                    log_to_wandb=log_to_wandb,
-                    max_wandb_images=max_wandb_images,
-                )
-            else:
-                visualize_predictions_with_inference(
-                    self.model,
-                    test_loader,
-                    self.device,
-                    self.cfg.data.num_classes,
-                    save_dir,
-                    num_samples=num_vis_samples,
-                    model_type=model_type,
-                    img_size=img_size,
-                    phase_name=phase_name,
-                    log_to_wandb=log_to_wandb,
-                    max_wandb_images=max_wandb_images,
-                )
-
-        self.logger.info(f"Visualizations saved to {vis_dir}")
-
-    def _visualize_validation(self, epoch: int):
-        """Visualize validation predictions."""
-        vis_dir = self.exp_dir / "visualizations" / f"epoch_{epoch + 1}_val"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        self.logger.info(
-            f"Generating validation visualizations for epoch {epoch + 1}..."
-        )
-        self._visualize_predictions(
-            loader=self.val_loader,
-            vis_dir=vis_dir,
-            epoch=epoch,
-            log_to_wandb=False,
-        )
-
-    def train(self):
-        """Main training loop."""
-        self.logger.info("Starting training")
-
-        num_epochs = self.cfg.training.get("num_epochs", 100)
-
-        for epoch in range(num_epochs):
-            self.current_epoch = epoch
-
-            # Train
-            train_metrics = self.train_epoch(epoch)
-
-            # Validate
-            val_metrics = self.validate(epoch)
-
-            # Visualize validation every 5 epochs
-            if (epoch + 1) % 5 == 0:
-                self._visualize_validation(epoch)
-
-            # Log metrics (removed test_metrics from per-epoch loop)
-            self._log_metrics(epoch, train_metrics, val_metrics)
-
-            # Save checkpoint
-            self._save_checkpoint(epoch, val_metrics)
-
-            # Early stopping check
-            if self.early_stopping is not None:
-                self.early_stopping(
-                    val_metrics.get("Dice", val_metrics.get("dice", 0.0))
-                )
-
-                if self.early_stopping.should_stop():
-                    self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                    break
-
-        # Test with best model
-        if self.best_model_path is not None:
-            self.logger.info("Testing with best model")
-            self._load_checkpoint(self.best_model_path)
-            result = self.test()
-            if isinstance(result, tuple):
-                test_metrics, predictions_cache = result
-            else:
-                test_metrics, predictions_cache = result, None
-            self._save_test_results(test_metrics, predictions_cache=predictions_cache)
-        else:
-            self.logger.warning(
-                "No best model checkpoint found (training may have ended at epoch 0 "
-                "or all checkpoints failed). Skipping final test evaluation."
-            )
-
-        # Capture run ID for pipeline integration before potentially finishing
-        self.wandb_run_id = (
-            self.wandb_run.id
-            if hasattr(self, "wandb_run") and self.wandb_run is not None
-            else None
-        )
-
-        # In pipeline mode, keep the wandb run open so the distillation stage
-        # can continue logging to the same run. Otherwise, finish normally.
-        in_pipeline = self.cfg.get("pipeline", {}).get("enabled", False)
-        if not in_pipeline:
-            wandb.finish()
-
-        self.logger.info("Training completed!")
+    # =========================================================================
+    # 6. Metrics logging & checkpointing
+    # =========================================================================
 
     def _log_metrics(
         self,
@@ -566,13 +404,10 @@ class BaseTrainer(ABC):
         train_items = {k: v for k, v in train_metrics.items() if isinstance(v, (float, int))}
         val_items = {k: v for k, v in val_metrics.items() if isinstance(v, (float, int))}
 
-        # Log to console
+        # Log to console (val metrics are already summarized by Evaluator_seg)
         self.logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
         self.logger.info(
             "Train:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in train_items.items())
-        )
-        self.logger.info(
-            "Val:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
         )
 
         # Log to wandb (epoch-level metrics)
@@ -581,6 +416,13 @@ class BaseTrainer(ABC):
         wandb_metrics.update({f"val/{k}": v for k, v in val_items.items()})
         if wandb.run is not None:
             wandb.log(wandb_metrics)
+
+    def _log_step_metrics(self, metrics: Dict, step: int):
+        """Log step-level metrics to wandb with step/ prefix."""
+        if wandb.run is not None:
+            data = {"global_step": step}
+            data.update({f"step/{k}": v for k, v in metrics.items()})
+            wandb.log(data)
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
@@ -662,6 +504,198 @@ class BaseTrainer(ABC):
         self.logger.info(f"Loading checkpoint: {path}")
         self.model.load_state_dict(torch.load(str(path), map_location=self.device))
 
+    # =========================================================================
+    # 7. Visualization helpers
+    # =========================================================================
+
+    def _run_vis_inference(self, loader, num_samples: Optional[int] = None):
+        """Run forward passes over ``loader`` and collect tensors for visualization.
+
+        Returns ``(images_list, preds_list, masks_list, filenames_list)`` where
+        ``preds_list`` items are dicts ``{"pred": tensor[B,1,H,W]}``.
+        """
+        import torch
+        import torch.nn.functional as F
+        from tqdm import tqdm
+
+        model_type = self._get_model_type()
+        img_size = getattr(self, "img_size", None)
+        num_classes = self.cfg.data.num_classes
+
+        self.model.eval()
+        images_list, preds_list, masks_list, fnames_list = [], [], [], []
+        collected = 0
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Visualization inference"):
+                images = batch[0].to(self.device)
+                masks = batch[1].to(self.device)
+                last = batch[-1]
+                fnames = (
+                    list(last)
+                    if isinstance(last, (list, tuple)) and last and isinstance(last[0], str)
+                    else None
+                )
+
+                if model_type == "sam":
+                    outputs = self.model(images, num_classes > 1, img_size)
+                    logits = outputs.get("masks", outputs.get("low_res_logits"))
+                    if logits is None:
+                        logits = list(outputs.values())[0]
+                elif model_type == "segformer":
+                    logits = self.model(images).logits
+                else:
+                    logits = self.model(images)
+                    if logits.dim() == 3:
+                        logits = logits.unsqueeze(1)
+
+                if logits.shape[-2:] != masks.shape[-2:]:
+                    logits = F.interpolate(
+                        logits, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                    )
+
+                if num_classes == 1:
+                    preds = (torch.sigmoid(logits) > 0.5).float()
+                    masks_vis = masks
+                else:
+                    preds = torch.argmax(logits, dim=1, keepdim=True).float()
+                    masks_vis = torch.argmax(masks, dim=1, keepdim=True).float()
+
+                images_list.append(images.cpu())
+                preds_list.append({"pred": preds.cpu()})
+                masks_list.append(masks_vis.cpu())
+                fnames_list.append(fnames)
+
+                collected += images.size(0)
+                if num_samples is not None and collected >= num_samples:
+                    break
+
+        if not any(fnames_list):
+            fnames_list = None
+        return images_list, preds_list, masks_list, fnames_list
+
+    def _visualize_predictions(
+        self,
+        loader=None,
+        vis_dir=None,
+        predictions_cache: Dict = None,
+        num_samples=_UNSET,
+        epoch: int = None,
+        log_to_wandb: bool = True,
+        max_wandb_images: Optional[int] = None,
+    ):
+        """Visualize predictions with a unified implementation.
+
+        Supports three modes:
+        1. loader provided -> run model inference on loader (validation).
+        2. predictions_cache provided -> use pre-computed results (test).
+        3. Neither -> iterate test_loaders with model inference (fallback).
+
+        Args:
+            num_samples: Max samples to visualize. Defaults to config value.
+                         Pass None explicitly to visualize all samples.
+            log_to_wandb: If True, upload saved images to W&B.
+            max_wandb_images: Max number of images to upload to W&B.
+                Does not affect how many files are saved to disk.
+        """
+        from utils.visualize import visualize_segmentation
+
+        if num_samples is _UNSET:
+            num_vis_samples = self.cfg.get("visualization", {}).get("num_samples", 10)
+        else:
+            num_vis_samples = num_samples
+
+        # Mode 1: validation visualization
+        if loader is not None or (predictions_cache is not None and "__val__" in predictions_cache):
+            if predictions_cache is not None and "__val__" in predictions_cache:
+                cached = predictions_cache["__val__"]
+                images_l, preds_raw, masks_l = cached[0], cached[1], cached[2]
+                fnames_l = cached[3] if len(cached) > 3 else None
+                preds_l = [{"pred": p} for p in preds_raw]
+            else:
+                images_l, preds_l, masks_l, fnames_l = self._run_vis_inference(
+                    loader, num_samples=num_vis_samples
+                )
+            visualize_segmentation(
+                images_l, preds_l, masks_l,
+                num_classes=self.cfg.data.num_classes,
+                save_dir=vis_dir,
+                num_samples=num_vis_samples,
+                phase_name="val",
+                filenames_list=fnames_l,
+                log_to_wandb=log_to_wandb,
+                max_wandb_images=max_wandb_images,
+            )
+            return
+
+        # Mode 2/3: test visualization
+        if vis_dir is None:
+            vis_dir = self.exp_dir / "visualizations" / f"epoch_{self.current_epoch + 1}"
+        if log_to_wandb and max_wandb_images is None:
+            max_wandb_images = 10
+
+        sample_msg = "all" if num_vis_samples is None else f"{num_vis_samples}"
+        self.logger.info(
+            f"Generating {sample_msg} visualizations for epoch {self.current_epoch + 1}..."
+        )
+
+        for name, test_loader in self._iter_test_loaders():
+            save_dir = vis_dir / name if isinstance(self.test_loader, dict) else vis_dir
+            phase_name = f"test_{name}" if isinstance(self.test_loader, dict) else "test"
+
+            if predictions_cache and name in predictions_cache:
+                cached = predictions_cache[name]
+                images_l, preds_raw, masks_l = cached[0], cached[1], cached[2]
+                fnames_l = cached[3] if len(cached) > 3 else None
+                preds_l = [{"pred": p} for p in preds_raw]
+            else:
+                images_l, preds_l, masks_l, fnames_l = self._run_vis_inference(
+                    test_loader, num_samples=num_vis_samples
+                )
+
+            visualize_segmentation(
+                images_l, preds_l, masks_l,
+                num_classes=self.cfg.data.num_classes,
+                save_dir=save_dir,
+                num_samples=num_vis_samples,
+                phase_name=phase_name,
+                filenames_list=fnames_l,
+                log_to_wandb=log_to_wandb,
+                max_wandb_images=max_wandb_images,
+            )
+
+        self.logger.info(f"Visualizations saved to {vis_dir}")
+
+    def _visualize_validation(self, epoch: int, predictions_cache: Dict = None):
+        """Visualize validation predictions.
+
+        If ``predictions_cache`` is provided (with key ``"__val__"``), reuse those
+        predictions instead of running another forward pass — keeps visualization
+        consistent with the metrics computed in ``validate()``.
+        """
+        vis_dir = self.exp_dir / "visualizations" / f"epoch_{epoch + 1}_val"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(
+            f"Generating validation visualizations for epoch {epoch + 1}..."
+        )
+        if predictions_cache is not None:
+            self._visualize_predictions(
+                predictions_cache=predictions_cache,
+                vis_dir=vis_dir,
+                epoch=epoch,
+                log_to_wandb=False,
+            )
+        else:
+            self._visualize_predictions(
+                loader=self.val_loader,
+                vis_dir=vis_dir,
+                epoch=epoch,
+                log_to_wandb=False,
+            )
+
+    # =========================================================================
+    # 8. Test result persistence
+    # =========================================================================
+
     def _save_test_results(self, test_metrics: Dict, predictions_cache: dict = None):
         """Save test results to file and log to wandb as final_test/.
 
@@ -700,30 +734,29 @@ class BaseTrainer(ABC):
     def _save_per_sample_metrics(self, predictions_cache: dict) -> None:
         """Save per-sample segmentation metrics to CSV for every test dataset.
 
-        Writes ``<exp_dir>/test_results/metrics_<dataset>.csv`` for each
-        dataset in *predictions_cache*, and a combined ``metrics_all.csv``
-        when more than one dataset is evaluated.
+        Reuses the per-sample lists already computed inside ``evaluate_model``
+        (no recomputation), so this is essentially I/O-bound.
 
         Args:
             predictions_cache: Dict mapping dataset name →
-                ``(images_list, preds_list, masks_list, filenames_list)``
-                as returned by ``evaluate_model`` with
-                ``return_predictions=True``.
+                ``(images_list, preds_list, masks_list, filenames_list, per_sample)``
+                where ``per_sample`` is the metrics dict produced by
+                ``Evaluator_seg._evaluate_*`` when ``return_predictions=True``.
         """
         import pandas as pd
-        from utils.evaluate import Evaluator_seg
 
         out_dir = self.exp_dir / "test_results"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         all_dfs = []
-        for ds_name, (_, preds_list, masks_list, filenames_list) in predictions_cache.items():
-            df = Evaluator_seg.build_per_sample_df(
-                preds_list,
-                masks_list,
-                filenames_list,
-                num_classes=self.cfg.data.num_classes,
-            )
+        for ds_name, cached in predictions_cache.items():
+            if len(cached) < 5 or cached[4] is None:
+                self.logger.warning(
+                    f"Per-sample metrics unavailable for {ds_name}; skipping CSV."
+                )
+                continue
+            per_sample = cached[4]
+            df = self._per_sample_dict_to_df(per_sample)
             df.insert(0, "dataset", ds_name)
             csv_path = out_dir / f"metrics_{ds_name}.csv"
             df.to_csv(csv_path, index=False, float_format="%.6f")
@@ -736,6 +769,23 @@ class BaseTrainer(ABC):
                 combined_path, index=False, float_format="%.6f"
             )
             self.logger.info(f"Combined per-sample metrics saved → {combined_path}")
+
+    @staticmethod
+    def _per_sample_dict_to_df(per_sample: dict):
+        """Flatten the per-sample dict (incl. optional ``_per_class``) into a DataFrame."""
+        import pandas as pd
+
+        flat = {k: v for k, v in per_sample.items() if k != "_per_class"}
+        df = pd.DataFrame(flat)
+
+        per_class = per_sample.get("_per_class")
+        if per_class:
+            class_ids = sorted({cid for d in per_class for cid in d.keys()})
+            for cid in class_ids:
+                for metric in ("Dice", "HD95", "IoU", "BoundaryIoU", "Sensitivity", "Specificity"):
+                    col = f"{metric}_class_{cid}"
+                    df[col] = [d.get(cid, {}).get(metric, float("nan")) for d in per_class]
+        return df
 
     def _save_latex_metrics_table_from_metrics(self, test_metrics: Dict) -> None:
         """Save a LaTeX table from the authoritative test_metrics dict.
@@ -751,8 +801,8 @@ class BaseTrainer(ABC):
         """
         import re
 
-        RATIO_COLS = {"Dice", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"}
-        BASE_COLS = ["Dice", "HD95", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc", "BFScore"]
+        RATIO_COLS = {"Dice", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc"}
+        BASE_COLS = ["Dice", "HD95", "IoU", "BIoU", "Sensitivity", "Specificity", "PixelAcc"]
 
         # Determine if keys are prefixed with dataset name
         has_prefix = any("/" in k for k in test_metrics)
@@ -838,6 +888,119 @@ class BaseTrainer(ABC):
         out_path = out_dir / "metrics_latex.txt"
         out_path.write_text("\n".join(lines) + "\n")
         self.logger.info(f"LaTeX metrics table saved → {out_path}")
+
+    # =========================================================================
+    # 9. Entry points (main loops)
+    # =========================================================================
+
+    def setup(self, mode: str = "train"):
+        """
+        Setup training environment.
+
+        Args:
+            mode: 'train' or 'test'
+        """
+        # Set random seeds
+        seed = self.cfg.get("hardware", {}).get("seed", 42)
+        deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
+        set_seed(seed, deterministic=deterministic)
+
+        # Setup directories
+        self._setup_directories()
+
+        # Setup logger
+        self._setup_logger()
+
+        # Setup wandb
+        if mode == "train":
+            self._setup_wandb()
+
+        # Create data loaders
+        self._create_dataloaders()
+
+        # Create model
+        self._create_model()
+
+        # Setup training components (only for training mode)
+        if mode == "train":
+            self._create_optimizer()
+            self._create_scheduler()
+            self._setup_early_stopping()
+
+        self.logger.info(f"Setup completed for {mode} mode")
+        self.logger.info(f"Device: {self.device}")
+        self.logger.info(f"Experiment directory: {self.exp_dir}")
+
+    def train(self):
+        """Main training loop."""
+        self.logger.info("Starting training")
+
+        num_epochs = self.cfg.training.get("num_epochs", 100)
+
+        for epoch in range(num_epochs):
+            self.current_epoch = epoch
+
+            # Train
+            train_metrics = self.train_epoch(epoch)
+
+            # Validate (request predictions on visualization epochs to avoid a 2nd forward pass)
+            should_visualize = (epoch + 1) % 5 == 0
+            val_result = self.validate(epoch, return_predictions=should_visualize)
+            if isinstance(val_result, tuple):
+                val_metrics, val_predictions_cache = val_result
+            else:
+                val_metrics, val_predictions_cache = val_result, None
+
+            # Visualize validation every 5 epochs (reuse predictions from validate())
+            if should_visualize:
+                self._visualize_validation(epoch, predictions_cache=val_predictions_cache)
+
+            # Log metrics (removed test_metrics from per-epoch loop)
+            self._log_metrics(epoch, train_metrics, val_metrics)
+
+            # Save checkpoint
+            self._save_checkpoint(epoch, val_metrics)
+
+            # Early stopping check
+            if self.early_stopping is not None:
+                self.early_stopping(
+                    val_metrics.get("Dice", val_metrics.get("dice", 0.0))
+                )
+
+                if self.early_stopping.should_stop():
+                    self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                    break
+
+        # Test with best model
+        if self.best_model_path is not None:
+            self.logger.info("Testing with best model")
+            self._load_checkpoint(self.best_model_path)
+            result = self.test()
+            if isinstance(result, tuple):
+                test_metrics, predictions_cache = result
+            else:
+                test_metrics, predictions_cache = result, None
+            self._save_test_results(test_metrics, predictions_cache=predictions_cache)
+        else:
+            self.logger.warning(
+                "No best model checkpoint found (training may have ended at epoch 0 "
+                "or all checkpoints failed). Skipping final test evaluation."
+            )
+
+        # Capture run ID for pipeline integration before potentially finishing
+        self.wandb_run_id = (
+            self.wandb_run.id
+            if hasattr(self, "wandb_run") and self.wandb_run is not None
+            else None
+        )
+
+        # In pipeline mode, keep the wandb run open so the distillation stage
+        # can continue logging to the same run. Otherwise, finish normally.
+        in_pipeline = self.cfg.get("pipeline", {}).get("enabled", False)
+        if not in_pipeline:
+            wandb.finish()
+
+        self.logger.info("Training completed!")
 
     def run_test_only(self, checkpoint_path: str):
         """Run test-only mode with a specific checkpoint."""

@@ -221,15 +221,25 @@ class TinyUSFMTrainer(BaseTrainer):
 
         return {"loss": epoch_loss, "lr": current_lr}
 
-    def validate(self, epoch: int) -> Dict[str, float]:
-        """Validate model."""
+    def validate(self, epoch: int, return_predictions: bool = False):
+        """Validate model.
+
+        When ``return_predictions=True``, also returns a predictions cache so that
+        visualization reuses the same forward pass as metric computation.
+        """
         self.model.eval()
 
         # Single forward-pass: compute metrics and loss together
-        val_metrics = self.evaluator.evaluate_model(
+        result = self.evaluator.evaluate_model(
             self.model, self.val_loader, self.device, self.cfg.data.num_classes,
             criterion=self.criterion,
+            return_predictions=return_predictions,
         )
+
+        if return_predictions:
+            val_metrics, images_l, preds_l, masks_l, fnames_l, _ = result
+        else:
+            val_metrics = result
 
         # ReduceLROnPlateau needs the val metric; other schedulers are stepped in train_epoch()
         use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
@@ -240,6 +250,8 @@ class TinyUSFMTrainer(BaseTrainer):
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
+        if return_predictions:
+            return val_metrics, {"__val__": (images_l, preds_l, masks_l, fnames_l)}
         return val_metrics
 
     def test(self) -> Dict[str, float]:
@@ -259,8 +271,8 @@ class TinyUSFMTrainer(BaseTrainer):
                 self.cfg.data.num_classes,
                 return_predictions=True,
             )
-            metrics, images_list, preds_list, masks_list, filenames_list = results
-            predictions_cache[name] = (images_list, preds_list, masks_list, filenames_list)
+            metrics, images_list, preds_list, masks_list, filenames_list, per_sample = results
+            predictions_cache[name] = (images_list, preds_list, masks_list, filenames_list, per_sample)
 
             self.evaluator.print_metrics(
                 metrics,

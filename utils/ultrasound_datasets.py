@@ -61,8 +61,8 @@ class BaseUltrasoundDataset(Dataset):
         self.transform = transform
         self.split = split
 
-        # Multiclass mode: use class-specific labels instead of binary foreground
-        self.multiclass = getattr(cfg, "multiclass", False)
+        # Multiclass mode is determined solely by num_classes (>1 → multiclass).
+        self.multiclass = self.num_classes > 1
 
         # Image and mask sizes
         img_size = int(cfg.img_size)

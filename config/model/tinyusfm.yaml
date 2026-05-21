@@ -13,7 +13,9 @@ model:
   name: TinyUSFM
   num_classes: ${data.num_classes}
   img_size: ${data.img_size}
-  checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights
+  # checkpoint: checkpoints/TinyUSFM.pth  # Pretrained backbone weights
+  binary_checkpoint: experiment_results/TinyUSFM_binary_ft/checkpoints/best_epoch_59_dice_0.8043.pth
+  multiclass_checkpoint: experiment_results/TinyUSFM_multiclass_ft/checkpoints/best_epoch_44_dice_0.7053.pth
 
   # ------------------------------------------------------------------
   # Decoder branch selection

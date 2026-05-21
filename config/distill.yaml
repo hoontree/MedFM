@@ -1,8 +1,6 @@
 # Knowledge Distillation Configuration
 defaults:
   - data: dynamic
-  - teacher: sam
-  - student: tinyusfm
   - method: unified
   - training: distillation
   - _self_
@@ -10,9 +8,15 @@ defaults:
 trainer:
   _target_: trainers.distill_trainer.DistillTrainer
 
+# Teacher / Student model names — resolved against config/model/{name}.yaml.
+# Each model yaml is expected to expose `binary_checkpoint` and
+# `multiclass_checkpoint`; the appropriate one is selected from data.num_classes.
+teacher: sam
+student: tinyusfm
+
 # Hardware Configuration (Global Overrides)
 hardware:
-  gpu_ids: [0]
+  gpu_ids: [3]
   seed: 42
 
 # Global Flags

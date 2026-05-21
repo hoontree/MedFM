@@ -16,10 +16,9 @@ model:
   pixel_std: [58.395, 57.12, 57.375]
   encoder_mode: "ft"
   decoder_mode: "ft"
-  use_alignment: false
   r_e: 4
   r_d: 4
-  alignment_num_blocks: 4
-  alignment_hidden_channels: 256
   conv_lora_expert_num: 4
   checkpoint: null
+  binary_checkpoint: experiment_results/SAM_binary_ft/checkpoints/best_epoch_43_dice_0.7637.pth
+  multiclass_checkpoint: experiment_results/SAM_multiclass_ft/checkpoints/best_epoch_52_dice_0.5694.pth

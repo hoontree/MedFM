@@ -7,7 +7,7 @@ import torch.optim as optim
 import wandb
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple, override
 
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
@@ -15,13 +15,12 @@ from utils.logger import setup_logger
 from utils.schedule import build_scheduler
 from distillers import create_distiller
 from utils.distill_utils import (
-    get_teacher_short_name,
-    get_student_short_name,
     get_dataset_short_name,
     create_log_dir,
     save_experiment_summary,
+    load_model_cfg,
 )
-from utils.visualize import visualize_distillation, visualize_distillation_precomputed
+from utils.visualize import visualize_segmentation
 from utils.utils import set_seed
 from trainers.base_trainer import BaseTrainer
 from omegaconf import OmegaConf, DictConfig
@@ -32,6 +31,10 @@ class DistillTrainer(BaseTrainer):
     Trainer for Knowledge Distillation.
     Inherits common infrastructure from BaseTrainer and overrides distillation-specific logic.
     """
+
+    # =========================================================================
+    # 1. Construction
+    # =========================================================================
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)  # initializes cfg, device, evaluator, base attrs
@@ -47,23 +50,20 @@ class DistillTrainer(BaseTrainer):
 
         set_seed(cfg.hardware.seed)
 
-        from utils.distill_utils import resolve_teacher_checkpoint
-        self.teacher_ckpt = resolve_teacher_checkpoint(self.cfg)
-        if self.teacher_ckpt:
-            self.cfg.teacher.checkpoint = self.teacher_ckpt
+        # Resolve teacher/student model configs from config/model/{name}.yaml.
+        # The selected binary/multiclass checkpoint is folded into `checkpoint`.
+        self._resolve_model_cfgs()
 
         self._setup_directories()
-        save_experiment_summary(cfg, self.exp_dir)
+        save_experiment_summary(self.cfg, self.exp_dir)
         self._setup_logger()
         self._setup_pipeline_log()
 
-        self.teacher_short = get_teacher_short_name(cfg)
-        self.student_short = get_student_short_name(cfg)
         self.dataset_name = get_dataset_short_name(cfg)
 
         self.logger.info(f"Starting Distillation: {cfg.method.name}")
         self.logger.info(
-            f"Teacher: {self.teacher_short} -> Student: {self.student_short}"
+            f"Teacher: {self.teacher_name} -> Student: {self.student_name}"
         )
         self.logger.info(f"Dataset: {self.dataset_name}")
         self.logger.info(f"Experiment directory: {self.exp_dir}")
@@ -75,10 +75,51 @@ class DistillTrainer(BaseTrainer):
         self._create_scheduler()
         self._setup_early_stopping()  # sets self.early_stopping from base
 
-    # -------------------------------------------------------------------------
-    # Overrides: directories / logger / wandb
-    # -------------------------------------------------------------------------
+    def _resolve_model_cfgs(self):
+        """Load teacher/student model configs from config/model/{name}.yaml.
 
+        Reads ``cfg.teacher`` / ``cfg.student`` (each a string model name),
+        loads the corresponding yaml under ``config/model/``, picks the
+        binary or multiclass checkpoint based on ``data.num_classes``, and
+        exposes the result as ``cfg.teacher_cfg`` / ``cfg.student_cfg`` plus
+        the convenience attrs ``self.teacher_name`` / ``self.student_name``.
+        """
+        num_classes = self.cfg.data.num_classes
+        self.teacher_name = self.cfg.teacher
+        self.student_name = self.cfg.student
+        if not isinstance(self.teacher_name, str) or not isinstance(self.student_name, str):
+            raise ValueError(
+                "cfg.teacher and cfg.student must be model names (strings) "
+                "referring to config/model/{name}.yaml."
+            )
+
+        teacher_cfg = load_model_cfg(self.teacher_name, num_classes)
+        student_cfg = load_model_cfg(self.student_name, num_classes)
+
+        # Pipeline mode: a freshly-trained teacher checkpoint can be injected
+        # via pipeline.teacher_ckpt_override and takes precedence over the
+        # binary/multiclass default.
+        pipeline_cfg = self.cfg.get("pipeline", {})
+        if (ckpt_override := pipeline_cfg.get("teacher_ckpt_override")):
+            teacher_cfg.checkpoint = ckpt_override
+
+        # Student should not inherit the teacher's fine-tuned checkpoint by
+        # default — students typically train from a pretrained backbone or
+        # from scratch. The user can re-enable via student_cfg.checkpoint=...
+        if self.cfg.get("use_student_finetuned_ckpt", False) is False:
+            student_cfg.checkpoint = None
+
+        OmegaConf.set_struct(self.cfg, False)
+        self.cfg.teacher_cfg = teacher_cfg
+        self.cfg.student_cfg = student_cfg
+
+        self.teacher_ckpt = teacher_cfg.get("checkpoint")
+
+    # =========================================================================
+    # 2. Setup (directories / logging / wandb)
+    # =========================================================================
+
+    @override
     def _setup_directories(self):
         """Setup experiment directories using the standardized create_log_dir structure."""
         self.exp_dir = create_log_dir(self.cfg)
@@ -95,6 +136,7 @@ class DistillTrainer(BaseTrainer):
         with open(config_file, "w") as f:
             OmegaConf.save(self.cfg, f)
 
+    @override
     def _setup_logger(self):
         """Override: use distill.log and medfm.distill logger name."""
         log_file = self.exp_dir / "distill.log"
@@ -114,6 +156,7 @@ class DistillTrainer(BaseTrainer):
             pipeline_handler.setFormatter(_logging.Formatter(fmt))
             self.logger.addHandler(pipeline_handler)
 
+    @override
     def _setup_wandb(self):
         """Override: support pipeline mode by reusing the teacher wandb run."""
         pipeline_cfg = self.cfg.get("pipeline", {})
@@ -135,7 +178,7 @@ class DistillTrainer(BaseTrainer):
             exp_name = (
                 None
                 if is_sweep
-                else f"{self.teacher_short}_{self.student_short}_{self.cfg.method.name}"
+                else f"{self.teacher_name}_{self.student_name}_{self.cfg.method.name}"
             )
             self.wandb_run = wandb.init(
                 project=self.cfg.wandb.project,
@@ -144,10 +187,7 @@ class DistillTrainer(BaseTrainer):
                 config=OmegaConf.to_container(self.cfg, resolve=True),
                 mode=wandb_mode,
             )
-
-    # -------------------------------------------------------------------------
-    # Pipeline-prefix wandb helpers
-    # -------------------------------------------------------------------------
+            self._define_wandb_metrics()
 
     def _wandb_log(self, data: dict) -> None:
         """Log metrics to wandb, applying pipeline prefix when sharing a run."""
@@ -165,10 +205,11 @@ class DistillTrainer(BaseTrainer):
             data = {f"{self._wandb_metric_prefix}{k}": v for k, v in data.items()}
         self.wandb_run.summary.update(data)
 
-    # -------------------------------------------------------------------------
-    # Abstract method implementations (BaseTrainer interface)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 3. Model / optimizer construction
+    # =========================================================================
 
+    @override
     def _create_dataloaders(self):
         self.train_loader, self.val_loader, self.test_loader = (
             SegDatasetProcessor.build_data_loaders(self.cfg)
@@ -182,12 +223,13 @@ class DistillTrainer(BaseTrainer):
         """
         return self.cfg.get("method", {}).get("name") == "online"
 
+    @override
     def _create_model(self):
         """Create teacher, student, and distiller."""
         if self.teacher_ckpt:
             self.logger.info(f"Using teacher checkpoint: {self.teacher_ckpt}")
 
-        self.teacher = instantiate(self.cfg.teacher)
+        self.teacher = instantiate(self.cfg.teacher_cfg)
         self.teacher = self.teacher.to(self.device)
 
         if self._is_online:
@@ -200,41 +242,9 @@ class DistillTrainer(BaseTrainer):
             for param in self.teacher.parameters():
                 param.requires_grad = False
 
-        OmegaConf.set_struct(self.cfg.student, False)
         OmegaConf.set_struct(self.cfg.method, False)
 
-        teacher_uses_alignment = getattr(self.teacher, "use_alignment", False)
-
-        if teacher_uses_alignment:
-            t_align_channels = getattr(self.teacher, "alignment_hidden_channels", 256)
-            self.logger.info(
-                f"Teacher uses alignment layer with {t_align_channels} channels. "
-                "Enabling student alignment."
-            )
-            self.cfg.student.use_alignment = True
-            self.cfg.student.alignment_out_channels = t_align_channels
-            self.cfg.student.student_channels = t_align_channels
-            self.cfg.method.teacher_alignment_channels = t_align_channels
-
-            if (
-                self.cfg.method.get("use_gradnorm")
-                and self.cfg.method.get("gamma_align", 0) == 0
-            ):
-                self.logger.info(
-                    "Enabling gamma_align=1.0 for GradNorm balancing as alignment is active."
-                )
-                self.cfg.method.gamma_align = 1.0
-        else:
-            self.logger.info(
-                "Teacher does not use alignment layer. Disabling student alignment layer and align_loss."
-            )
-            self.cfg.student.use_alignment = False
-            self.cfg.method.gamma_align = 0.0
-
-            if "student_channels" not in self.cfg.student:
-                self.cfg.student.student_channels = 48
-
-        self.student = instantiate(self.cfg.student)
+        self.student = instantiate(self.cfg.student_cfg)
         self.student = self.student.to(self.device)
         self.model = self.student  # base-class compatibility
 
@@ -243,6 +253,7 @@ class DistillTrainer(BaseTrainer):
 
         self._log_model_info()
 
+    @override
     def _create_optimizer(self):
         param_groups = [
             {"params": self.student.parameters(), "lr": self.cfg.training.lr}
@@ -270,13 +281,11 @@ class DistillTrainer(BaseTrainer):
             param_groups, weight_decay=self.cfg.optimizer.weight_decay
         )
 
+    @override
     def _create_scheduler(self):
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
-    # -------------------------------------------------------------------------
-    # Overrides: model info / metrics logging / checkpointing / per-sample output
-    # -------------------------------------------------------------------------
-
+    @override
     def _log_model_info(self):
         """Override: log teacher + student parameter counts separately."""
         t_total = sum(p.numel() for p in self.teacher.parameters())
@@ -295,6 +304,180 @@ class DistillTrainer(BaseTrainer):
             }
         )
 
+    # =========================================================================
+    # 4. Forward helpers (teacher / student calls)
+    # =========================================================================
+
+    @staticmethod
+    def _is_sam_model(model) -> bool:
+        """Return True if *model* is a SAM-based model (LoRA_Sam)."""
+        try:
+            from model.sam_hybrid_adapter import LoRA_Sam
+            return isinstance(model, LoRA_Sam)
+        except ImportError:
+            return False
+
+    def _call_teacher(self, images):
+        """Call teacher model with the appropriate forward signature."""
+        if self._is_sam_model(self.teacher):
+            img_size = self.cfg.teacher_cfg.get("img_size", self.cfg.data.img_size)
+            multimask = self.cfg.data.num_classes > 1
+            return self.teacher(images, multimask, img_size)
+        else:
+            raw = self.teacher(images)
+            if isinstance(raw, dict):
+                return raw
+            return {"masks": raw}
+
+    def _call_student(self, images):
+        """Call student model and normalise its output to a dict."""
+        if self._is_sam_model(self.student):
+            img_size = self.cfg.student_cfg.get("img_size", self.cfg.data.img_size)
+            multimask = self.cfg.data.num_classes > 1
+            raw = self.student(images, multimask, img_size)
+            if isinstance(raw, dict):
+                return raw
+            return {"masks": raw}
+        else:
+            raw = self.student(images, return_features=True)
+            if isinstance(raw, (list, tuple)):
+                return {"masks": raw[0], "features": raw[1]}
+            return {"masks": raw}
+
+    # =========================================================================
+    # 5. Training step
+    # =========================================================================
+
+    @override
+    def train_epoch(self, epoch) -> Dict[str, float]:
+        self.student.train()
+        self.distiller.train()
+        if self._is_online:
+            self.teacher.train()
+
+        running_losses = {}
+        pbar = tqdm(
+            self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
+        )
+
+        for i, (images, masks, *_) in enumerate(pbar):
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+
+            self.distiller.on_step_begin()
+
+            if self._is_online:
+                teacher_outputs = self._call_teacher(images)
+            else:
+                with torch.no_grad():
+                    teacher_outputs = self._call_teacher(images)
+
+            student_outputs = self._call_student(images)
+
+            loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
+            loss = loss_dict["loss"]
+
+            self.optimizer.zero_grad()
+            loss.backward()
+
+            max_norm = self.cfg.optimizer.gradient_clip.get("max_norm", 1.0)
+            all_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
+            nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
+
+            self.optimizer.step()
+
+            for k, v in loss_dict.items():
+                val = v.item() if hasattr(v, "item") else v
+                running_losses[k] = running_losses.get(k, 0.0) + val
+
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            if self.global_step % 10 == 0:
+                step_log = {"global_step": self.global_step}
+                for k, v in loss_dict.items():
+                    val = v.item() if hasattr(v, "item") else v
+                    step_log[f"step/{k}"] = val
+                step_log["step/lr"] = self.optimizer.param_groups[0]["lr"]
+                self._wandb_log(step_log)
+            self.global_step += 1
+
+        return {k: v / (i + 1) for k, v in running_losses.items()}
+
+    # =========================================================================
+    # 6. Evaluation
+    # =========================================================================
+
+    @property
+    def _first_test_loader(self):
+        """Get the first test loader (handles both dict and single loader)."""
+        if isinstance(self.test_loader, dict):
+            return next(iter(self.test_loader.values()))
+        return self.test_loader
+
+    def _evaluate_model(self, model, loader, return_predictions=False):
+        """Call the appropriate evaluate_model variant depending on model type."""
+        num_classes = self.cfg.data.num_classes
+        if self._is_sam_model(model):
+            img_size = self.cfg.data.img_size
+            return self.evaluator.evaluate_model_sam(
+                model, loader, self.device, num_classes,
+                img_size=img_size, return_predictions=return_predictions,
+            )
+        return self.evaluator.evaluate_model(
+            model, loader, self.device, num_classes,
+            return_predictions=return_predictions,
+        )
+
+    @override
+    def validate(self, epoch, return_predictions: bool = False):
+        self.student.eval()
+        if self._is_online:
+            self.teacher.eval()
+        result = self._evaluate_model(
+            self.student, self.val_loader, return_predictions=return_predictions
+        )
+        if return_predictions:
+            val_metrics, images_l, preds_l, masks_l, fnames_l, _ = result
+        else:
+            val_metrics = result
+        self.evaluator.print_metrics(val_metrics, phase="validation")
+        if return_predictions:
+            return val_metrics, {"__val__": (images_l, preds_l, masks_l, fnames_l)}
+        return val_metrics
+
+    @override
+    def test(self, phase="test") -> Dict[str, float]:
+        self.student.eval()
+        all_metrics = {}
+        predictions_cache = {}
+        is_multi = isinstance(self.test_loader, dict)
+
+        for ds_name, loader in self._iter_test_loaders():
+            result = self._evaluate_model(self.student, loader, return_predictions=True)
+            metrics, images_list, preds_list, masks_list, fnames_list, per_sample = result
+
+            if is_multi:
+                self.logger.info(f"--- {phase} ({ds_name}) ---")
+                self.evaluator.print_metrics(metrics, phase=f"{phase}_{ds_name}")
+                for k, v in self._numeric_items(metrics).items():
+                    all_metrics[f"{ds_name}/{k}"] = v
+            else:
+                self.logger.info(f"--- {phase} ---")
+                self.evaluator.print_metrics(metrics, phase=phase)
+                all_metrics.update(self._numeric_items(metrics))
+
+            predictions_cache[ds_name] = (images_list, preds_list, masks_list, fnames_list, per_sample)
+
+        if phase == "final_test":
+            return all_metrics, predictions_cache
+
+        return all_metrics
+
+    # =========================================================================
+    # 7. Metrics logging & checkpointing
+    # =========================================================================
+
+    @override
     def _log_metrics(
         self,
         epoch: int,
@@ -309,9 +492,6 @@ class DistillTrainer(BaseTrainer):
             "Train:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items())
         )
         val_items = self._numeric_items(val_metrics)
-        self.logger.info(
-            "Val:\n    " + ", ".join(f"{k}: {v:.4f}" for k, v in val_items.items())
-        )
 
         log_data = {
             "epoch": epoch + 1,
@@ -323,6 +503,7 @@ class DistillTrainer(BaseTrainer):
             log_data[f"val/{k}"] = v
         self._wandb_log(log_data)
 
+    @override
     def _save_checkpoint(self, epoch: int, val_metrics: dict):
         """Override: save best checkpoints for Dice, IoU, BIoU, and HD95."""
         dice = val_metrics.get("Dice", 0.0)
@@ -398,159 +579,97 @@ class DistillTrainer(BaseTrainer):
                 {"best_hd95": hd95, "best_hd95_checkpoint": str(self.best_hd95_path)}
             )
 
-    def _save_per_sample_metrics(self, predictions_cache: dict) -> None:
-        """Override: save per-sample metrics CSV + per-sample visualizations."""
-        import pandas as pd
-        from utils.visualize import visualize_precomputed_predictions
+    def _save_distill_model(self, path: Path, epoch: int, metrics: dict):
+        """Save student + distiller (+ teacher if online) state dict to path."""
+        payload = {
+            "epoch": epoch + 1,
+            "model_state_dict": self.student.state_dict(),
+            "distiller_state_dict": self.distiller.state_dict(),
+            **{k: v for k, v in metrics.items() if isinstance(v, (float, int))},
+        }
+        if self._is_online:
+            payload["teacher_state_dict"] = self.teacher.state_dict()
+        torch.save(payload, path)
 
-        out_dir = self.exp_dir / "test_results"
-        out_dir.mkdir(parents=True, exist_ok=True)
+    # =========================================================================
+    # 8. Visualization helpers
+    # =========================================================================
 
-        all_dfs = []
-        for ds_name, (images_list, preds_list, masks_list, fnames_list) in predictions_cache.items():
+    def _run_distill_vis_inference(self, loader, num_samples: Optional[int] = None):
+        """Run teacher+student forward passes and collect tensors for visualization.
+
+        Returns ``(images_list, preds_list, masks_list, filenames_list)`` where
+        each ``preds_list`` entry is ``{"teacher": ..., "student": ...}``.
+        """
+        from tqdm import tqdm
+
+        self.teacher.eval()
+        self.student.eval()
+        num_classes = self.cfg.data.num_classes
+
+        images_list, preds_list, masks_list, fnames_list = [], [], [], []
+        collected = 0
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Distill visualization inference"):
+                images = batch[0].to(self.device)
+                masks = batch[1].to(self.device)
+                last = batch[-1]
+                fnames = (
+                    list(last)
+                    if isinstance(last, (list, tuple)) and last and isinstance(last[0], str)
+                    else None
+                )
+
+                t_out = self._call_teacher(images)
+                s_out = self._call_student(images)
+                t_logits = t_out["masks"] if isinstance(t_out, dict) else t_out
+                s_logits = s_out["masks"] if isinstance(s_out, dict) else s_out
+
+                if num_classes == 1:
+                    t_preds = (torch.sigmoid(t_logits) > 0.5).float()
+                    s_preds = (torch.sigmoid(s_logits) > 0.5).float()
+                else:
+                    t_preds = torch.argmax(t_logits, dim=1, keepdim=True).float()
+                    s_preds = torch.argmax(s_logits, dim=1, keepdim=True).float()
+
+                images_list.append(images.cpu())
+                preds_list.append({"teacher": t_preds.cpu(), "student": s_preds.cpu()})
+                masks_list.append(masks.cpu())
+                fnames_list.append(fnames)
+
+                collected += images.size(0)
+                if num_samples is not None and collected >= num_samples:
+                    break
+
+        if not any(fnames_list):
+            fnames_list = None
+        return images_list, preds_list, masks_list, fnames_list
+
+    def _save_per_sample_visualizations(self, predictions_cache: dict) -> None:
+        """Save per-sample visualizations for every test dataset.
+
+        Test-only path: this is invoked from ``run_test_only`` so that per-sample
+        figures are not regenerated during the post-training final_test pass.
+        """
+        for ds_name, cached in predictions_cache.items():
+            images_list, preds_list, masks_list, fnames_list = (
+                cached[0], cached[1], cached[2], cached[3],
+            )
             vis_dir = self.vis_dir / "per_sample" / ds_name
-            visualize_precomputed_predictions(
+            visualize_segmentation(
                 images_list,
-                preds_list,
+                [{"pred": p} for p in preds_list],
                 masks_list,
                 num_classes=self.cfg.data.num_classes,
                 save_dir=vis_dir,
                 filenames_list=fnames_list,
             )
 
-            df = Evaluator_seg.build_per_sample_df(
-                preds_list,
-                masks_list,
-                fnames_list,
-                num_classes=self.cfg.data.num_classes,
-            )
-            df.insert(0, "dataset", ds_name)
-            csv_path = out_dir / f"metrics_{ds_name}.csv"
-            df.to_csv(csv_path, index=False, float_format="%.6f")
-            self.logger.info(f"Per-sample metrics saved → {csv_path}")
-            all_dfs.append(df)
+    # =========================================================================
+    # 9. Entry points (main loops)
+    # =========================================================================
 
-        if len(all_dfs) > 1:
-            combined_path = out_dir / "metrics_all.csv"
-            pd.concat(all_dfs, ignore_index=True).to_csv(
-                combined_path, index=False, float_format="%.6f"
-            )
-            self.logger.info(f"Combined per-sample metrics saved → {combined_path}")
-
-    # -------------------------------------------------------------------------
-    # Core training / validation / test
-    # -------------------------------------------------------------------------
-
-    def train_epoch(self, epoch) -> Dict[str, float]:
-        self.student.train()
-        self.distiller.train()
-        if self._is_online:
-            self.teacher.train()
-
-        running_losses = {}
-        pbar = tqdm(
-            self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
-        )
-        limit_batches = self.cfg.training.get("limit_train_batches")
-
-        for i, (images, masks, *_) in enumerate(pbar):
-            if limit_batches is not None and i >= limit_batches:
-                break
-            images = images.to(self.device)
-            masks = masks.to(self.device)
-
-            self.distiller.on_step_begin()
-
-            if self._is_online:
-                teacher_outputs = self._call_teacher(images)
-            else:
-                with torch.no_grad():
-                    teacher_outputs = self._call_teacher(images)
-
-            student_outputs = self._call_student(images)
-
-            loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
-            loss = loss_dict["loss"]
-
-            self.optimizer.zero_grad()
-            loss.backward()
-
-            max_norm = self.cfg.optimizer.gradient_clip.get("max_norm", 1.0)
-            all_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
-            nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
-
-            self.optimizer.step()
-
-            for k, v in loss_dict.items():
-                val = v.item() if hasattr(v, "item") else v
-                running_losses[k] = running_losses.get(k, 0.0) + val
-
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-            if self.global_step % 10 == 0:
-                step_log = {"global_step": self.global_step}
-                for k, v in loss_dict.items():
-                    val = v.item() if hasattr(v, "item") else v
-                    step_log[f"step/{k}"] = val
-                step_log["step/lr"] = self.optimizer.param_groups[0]["lr"]
-                self._wandb_log(step_log)
-            self.global_step += 1
-
-        return {k: v / (i + 1) for k, v in running_losses.items()}
-
-    def _evaluate_model(self, model, loader, return_predictions=False):
-        """Call the appropriate evaluate_model variant depending on model type."""
-        num_classes = self.cfg.data.num_classes
-        if self._is_sam_model(model):
-            img_size = self.cfg.data.img_size
-            return self.evaluator.evaluate_model_sam(
-                model, loader, self.device, num_classes,
-                img_size=img_size, return_predictions=return_predictions,
-            )
-        return self.evaluator.evaluate_model(
-            model, loader, self.device, num_classes,
-            return_predictions=return_predictions,
-        )
-
-    def validate(self, epoch) -> Dict[str, float]:
-        self.student.eval()
-        if self._is_online:
-            self.teacher.eval()
-        val_metrics = self._evaluate_model(self.student, self.val_loader)
-        self.logger.info(f"Epoch {epoch+1} Val Dice: {val_metrics['Dice']:.4f}")
-        return val_metrics
-
-    def test(self, phase="test") -> Dict[str, float]:
-        self.student.eval()
-        all_metrics = {}
-        predictions_cache = {}
-        is_multi = isinstance(self.test_loader, dict)
-
-        for ds_name, loader in self._iter_test_loaders():
-            result = self._evaluate_model(self.student, loader, return_predictions=True)
-            metrics, images_list, preds_list, masks_list, fnames_list = result
-
-            if is_multi:
-                self.logger.info(f"--- {phase} ({ds_name}) ---")
-                self.evaluator.print_metrics(metrics, phase=f"{phase}_{ds_name}")
-                for k, v in self._numeric_items(metrics).items():
-                    all_metrics[f"{ds_name}/{k}"] = v
-            else:
-                self.logger.info(f"--- {phase} ---")
-                self.evaluator.print_metrics(metrics, phase=phase)
-                all_metrics.update(self._numeric_items(metrics))
-
-            predictions_cache[ds_name] = (images_list, preds_list, masks_list, fnames_list)
-
-        if phase == "final_test":
-            return all_metrics, predictions_cache
-
-        return all_metrics
-
-    # -------------------------------------------------------------------------
-    # Main training loop
-    # -------------------------------------------------------------------------
-
+    @override
     def train(self):
         """Main distillation training loop."""
         for epoch in range(self.cfg.training.num_epochs):
@@ -565,15 +684,17 @@ class DistillTrainer(BaseTrainer):
                 self.logger.info(
                     f"Generating validation visualizations for epoch {epoch + 1}..."
                 )
-                visualize_distillation(
-                    self.teacher,
-                    self.student,
-                    vis_loader,
-                    self.device,
-                    self.cfg.data.num_classes,
-                    self.cfg.data.img_size,
-                    self.vis_dir,
+                images_l, preds_l, masks_l, fnames_l = self._run_distill_vis_inference(
+                    vis_loader, num_samples=self.cfg.visualization.num_samples
+                )
+                visualize_segmentation(
+                    images_l, preds_l, masks_l,
+                    num_classes=self.cfg.data.num_classes,
+                    save_dir=self.vis_dir,
                     num_samples=self.cfg.visualization.num_samples,
+                    phase_name="distillation",
+                    filenames_list=fnames_l,
+                    log_to_wandb=True,
                     epoch=epoch,
                 )
 
@@ -596,70 +717,6 @@ class DistillTrainer(BaseTrainer):
             "exp_dir": str(self.exp_dir),
             "final_metrics": dict(self.final_metrics),
         }
-
-    # -------------------------------------------------------------------------
-    # Distill-specific helpers
-    # -------------------------------------------------------------------------
-
-    @property
-    def _first_test_loader(self):
-        """Get the first test loader (handles both dict and single loader)."""
-        if isinstance(self.test_loader, dict):
-            return next(iter(self.test_loader.values()))
-        return self.test_loader
-
-    @staticmethod
-    def _is_sam_model(model) -> bool:
-        """Return True if *model* is a SAM-based model (LoRA_Sam)."""
-        try:
-            from model.sam_hybrid_adapter import LoRA_Sam
-            return isinstance(model, LoRA_Sam)
-        except ImportError:
-            return False
-
-    def _call_teacher(self, images):
-        """Call teacher model with the appropriate forward signature."""
-        if self._is_sam_model(self.teacher):
-            img_size = self.cfg.teacher.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            return self.teacher(images, multimask, img_size)
-        else:
-            raw = self.teacher(images)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
-
-    def _call_student(self, images):
-        """Call student model and normalise its output to a dict."""
-        if self._is_sam_model(self.student):
-            img_size = self.cfg.student.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            raw = self.student(images, multimask, img_size)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
-        else:
-            raw = self.student(images, return_features=True)
-            if isinstance(raw, (list, tuple)):
-                return {"masks": raw[0], "features": raw[1]}
-            return {"masks": raw}
-
-    def _save_distill_model(self, path: Path, epoch: int, metrics: dict):
-        """Save student + distiller (+ teacher if online) state dict to path."""
-        payload = {
-            "epoch": epoch + 1,
-            "model_state_dict": self.student.state_dict(),
-            "distiller_state_dict": self.distiller.state_dict(),
-            **{k: v for k, v in metrics.items() if isinstance(v, (float, int))},
-        }
-        if self._is_online:
-            payload["teacher_state_dict"] = self.teacher.state_dict()
-        torch.save(payload, path)
-
-    @staticmethod
-    def _numeric_items(d: dict) -> dict:
-        """Filter dict to only numeric (float/int) values."""
-        return {k: v for k, v in d.items() if isinstance(v, (float, int))}
 
     def _final_evaluation(self):
         if self.best_model_path and self.best_model_path.exists():
@@ -686,23 +743,27 @@ class DistillTrainer(BaseTrainer):
             self._save_per_sample_metrics(student_cache)
 
             first_ds = next(iter(student_cache))
-            student_images_list, student_preds_list, masks_list, fnames_list = student_cache[first_ds]
+            student_images_list, student_preds_list, masks_list, fnames_list, _ = student_cache[first_ds]
             first_loader = (
                 self._first_test_loader
                 if not isinstance(self.test_loader, dict)
                 else list(self.test_loader.values())[0]
             )
             teacher_result = self._evaluate_model(self.teacher, first_loader, return_predictions=True)
-            _, teacher_images_list, teacher_preds_list, _, _ = teacher_result
+            _, teacher_images_list, teacher_preds_list, _, _, _ = teacher_result
 
-            visualize_distillation_precomputed(
+            preds_dict_list = [
+                {"teacher": t, "student": s}
+                for t, s in zip(teacher_preds_list, student_preds_list)
+            ]
+            visualize_segmentation(
                 student_images_list,
-                teacher_preds_list,
-                student_preds_list,
+                preds_dict_list,
                 masks_list,
                 num_classes=self.cfg.data.num_classes,
                 save_dir=self.vis_dir,
                 num_samples=self.cfg.visualization.num_samples,
+                phase_name="distillation",
                 filenames_list=fnames_list,
                 epoch=None,
             )
@@ -711,15 +772,54 @@ class DistillTrainer(BaseTrainer):
                 "Best model checkpoint not found. Final metrics are unavailable."
             )
 
-    @staticmethod
-    def _make_limited_loader(loader, limit_batches, batch_size):
-        """Create a small DataLoader subset for dry-run testing."""
-        from torch.utils.data import Subset, DataLoader
+    @override
+    def run_test_only(self, checkpoint_path: str):
+        """Override: distill test-only also writes per-sample visualizations.
 
-        n = min(len(loader.dataset), limit_batches * batch_size)
-        return DataLoader(
-            Subset(loader.dataset, list(range(n))), batch_size=batch_size, num_workers=0
-        )
+        Loads the student weights from ``checkpoint_path``, runs the multi-dataset
+        test pass, persists per-sample CSVs (via base ``_save_test_results``), and
+        additionally renders per-sample visualizations under
+        ``vis_dir/per_sample/<dataset>``.
+        """
+        from datetime import datetime
+
+        self.logger.info("TEST-ONLY MODE (distillation student)")
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        self.logger.info(f"Loading checkpoint: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        self.student.load_state_dict(state_dict)
+        self.student.to(self.device)
+        self.student.eval()
+        self.best_model_path = ckpt_path
+
+        if wandb.run is None:
+            self.wandb_run = wandb.init(
+                entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
+                project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
+                name=(
+                    f"{self.teacher_name}_{self.student_name}_"
+                    f"{self.cfg.method.name}_test_only_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                ),
+                config=OmegaConf.to_container(self.cfg, resolve=True),
+                tags=["test-only", "distillation"],
+                mode=(
+                    "disabled"
+                    if self.cfg.get("wandb", {}).get("disabled", False)
+                    else self.cfg.get("wandb", {}).get("mode", None)
+                ),
+            )
+
+        test_metrics, predictions_cache = self.test(phase="final_test")
+        self._save_test_results(test_metrics, predictions_cache=predictions_cache)
+        self._save_per_sample_visualizations(predictions_cache)
+
+        wandb.finish()
+        self.logger.info("Test-only evaluation completed!")
 
     def dry_run(self):
         """Perform a quick end-to-end test of the training pipeline."""
@@ -730,14 +830,7 @@ class DistillTrainer(BaseTrainer):
 
         try:
             self.logger.info(f"Testing training step with {limit_batches} batches...")
-            old_limit = self.cfg.training.get("limit_train_batches")
-            self.cfg.training.limit_train_batches = limit_batches
             self.train_epoch(0)
-
-            if old_limit is not None:
-                self.cfg.training.limit_train_batches = old_limit
-            else:
-                self.cfg.training.limit_train_batches = None
 
             torch.cuda.empty_cache()
 
@@ -764,3 +857,22 @@ class DistillTrainer(BaseTrainer):
             raise e
         finally:
             torch.cuda.empty_cache()
+
+    # =========================================================================
+    # 10. Small utilities
+    # =========================================================================
+
+    @staticmethod
+    def _numeric_items(d: dict) -> dict:
+        """Filter dict to only numeric (float/int) values."""
+        return {k: v for k, v in d.items() if isinstance(v, (float, int))}
+
+    @staticmethod
+    def _make_limited_loader(loader, limit_batches, batch_size):
+        """Create a small DataLoader subset for dry-run testing."""
+        from torch.utils.data import Subset, DataLoader
+
+        n = min(len(loader.dataset), limit_batches * batch_size)
+        return DataLoader(
+            Subset(loader.dataset, list(range(n))), batch_size=batch_size, num_workers=0
+        )
