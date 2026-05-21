@@ -8,12 +8,10 @@ train: [BUSBRA, BUSI, B]
 val: []   # If empty, defaults to same as train (using val split)
 test: [BUID, BUS_UCLM, BUS_UCLM_filtered]  # Each dataset in this list will be evaluated separately
 
-# Canonical location for num_classes, img_size, and multiclass mode.
+# Canonical location for num_classes and img_size.
 # These are propagated to every individual dataset at load time.
-# To enable multiclass training, override both from CLI:
-#   data.multiclass=true data.num_classes=3
-num_classes: 3
-multiclass: true
+# num_classes=1 → binary, num_classes>1 → multiclass.
+num_classes: 1
 img_size: 224
 auto_img_size_by_sam_type: true
 sam_img_size_map:
@@ -21,3 +19,31 @@ sam_img_size_map:
   vit_l: 1024
   vit_h: 1024
 normalization: "imagenet"
+augment_train: true
+
+# Balanced sampling across datasets and image-level classes.
+# - Dataset-level: per-dataset draw probability p_d ∝ N_d^alpha.
+#     alpha=1   → uniform per-sample (large datasets dominate).
+#     alpha=0   → uniform per-dataset (each dataset equally likely).
+#     alpha=0.5 → square-root tempering (paper default for multi-source).
+# - Class-level: per-sample weight w_c for image-level class
+#     0=normal, 1=benign, 2=malignant.
+#     Increase `2: 1.5` for stronger malignant oversampling, etc.
+# - normal_cap: max expected fraction of normal-class draws *within each dataset*.
+#     null → no cap. e.g. 0.3 keeps at most 30% normal images per dataset.
+#
+# Tuning hints:
+#   * Large dataset (BUSBRA) dominates → lower alpha (e.g. 0.3).
+#   * Small dataset (B, 163 samples) overfitting → raise alpha (e.g. 0.7-1.0).
+#   * Want malignant-sensitive model → class_weights.2 > class_weights.1.
+sampling:
+  enabled: true
+  alpha: 0.5
+  class_weights:
+    0: 1.0   # normal
+    1: 1.0   # benign
+    2: 1.0   # malignant
+  normal_cap: null
+  num_samples: null   # null → len(train); set to control epoch length
+  replacement: true
+  seed: 42

@@ -1,10 +1,10 @@
 import random
-from typing import Optional, List, Dict, Union, Type
-from pathlib import Path
+from typing import Optional, List, Dict, Union, Type, Sequence
 
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from omegaconf import OmegaConf, ListConfig
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
+from omegaconf import OmegaConf, ListConfig, DictConfig
 
 from utils.ultrasound_datasets import (
     BUID,
@@ -39,6 +39,138 @@ def get_dataset_class(name: str) -> Type[Dataset]:
     return DATASET_REGISTRY[name]
 
 
+# Image-level class label conventions used across datasets:
+#   0 -> normal (image-level, no lesion present)
+#   1 -> benign
+#   2 -> malignant
+# `class_labels` attribute on each dataset stores these per-sample.
+_DEFAULT_CLASS_WEIGHTS = {0: 1.0, 1: 1.0, 2: 1.0}
+
+
+def _extract_class_labels(ds: Dataset) -> List[int]:
+    """Best-effort extraction of per-sample image-level class labels.
+
+    Each ultrasound dataset stores them under `class_labels`. Datasets that do
+    not expose them (e.g. BUS_UCLM in binary mode) fall back to label=1.
+    """
+    labels = getattr(ds, "class_labels", None)
+    if labels is None:
+        return [1] * len(ds)
+    return list(labels)
+
+
+def _build_balanced_sampler(
+    train_datasets: Sequence[Dataset],
+    train_names: Sequence[str],
+    sampling_cfg: DictConfig,
+) -> Optional[WeightedRandomSampler]:
+    """Build a WeightedRandomSampler combining dataset- and class-level reweighting.
+
+    Per-sample weight is the product of:
+      * dataset weight w_d ∝ N_d^alpha / N_d   (so sampling prob p_d ∝ N_d^alpha)
+      * class weight   w_c  (image-level normal/benign/malignant balance)
+
+    When `augment_train=True`, each dataset is loaded twice (original + augmented),
+    so `train_datasets` may have 2 entries per name. They share the same name/N_d
+    and contribute jointly to N_d.
+    """
+    if not sampling_cfg.get("enabled", False):
+        return None
+    if not train_datasets:
+        return None
+
+    alpha = float(sampling_cfg.get("alpha", 0.5))
+    class_weights_cfg = sampling_cfg.get("class_weights", None)
+    if class_weights_cfg is None:
+        class_weights = dict(_DEFAULT_CLASS_WEIGHTS)
+    else:
+        # OmegaConf DictConfig -> {str: float}; normalize keys to int
+        raw = OmegaConf.to_container(class_weights_cfg, resolve=True) \
+            if isinstance(class_weights_cfg, DictConfig) else dict(class_weights_cfg)
+        class_weights = {int(k): float(v) for k, v in raw.items()}
+        for k, v in _DEFAULT_CLASS_WEIGHTS.items():
+            class_weights.setdefault(k, v)
+
+    normal_cap = sampling_cfg.get("normal_cap", None)
+    num_samples_cfg = sampling_cfg.get("num_samples", None)
+    replacement = bool(sampling_cfg.get("replacement", True))
+
+    # Group dataset entries by source name (original + augmented share weight per N_d)
+    name_to_total_n: Dict[str, int] = {}
+    per_ds_meta = []  # list of (name, n, labels)
+    for ds, name in zip(train_datasets, train_names):
+        labels = _extract_class_labels(ds)
+        n = len(ds)
+        per_ds_meta.append((name, n, labels))
+        name_to_total_n[name] = name_to_total_n.get(name, 0) + n
+
+    # Dataset-level weight per sample: (N_d^alpha) / N_d_effective
+    # We use `name_to_total_n` (includes augmented copies) as the effective count.
+    weights: List[float] = []
+    class_count_by_name: Dict[str, Dict[int, int]] = {}
+    for name, n, labels in per_ds_meta:
+        N_d = max(name_to_total_n[name], 1)
+        ds_weight = (N_d ** alpha) / N_d
+        ccount = class_count_by_name.setdefault(name, {})
+        for lbl in labels:
+            ccount[lbl] = ccount.get(lbl, 0) + 1
+            cls_w = class_weights.get(int(lbl), 1.0)
+            weights.append(ds_weight * cls_w)
+
+    weights_t = torch.as_tensor(weights, dtype=torch.double)
+
+    # Optional cap on the *expected fraction* of normal-class draws per dataset.
+    # If a dataset has too much normal share relative to `normal_cap`, scale its
+    # normal-class weights down so expected normal fraction within that dataset
+    # equals `normal_cap`.
+    if normal_cap is not None:
+        cap = float(normal_cap)
+        idx = 0
+        for name, n, labels in per_ds_meta:
+            cur_w = weights_t[idx: idx + n]
+            normal_mask = torch.tensor([int(l) == 0 for l in labels])
+            total = cur_w.sum().item()
+            normal_sum = cur_w[normal_mask].sum().item()
+            if total > 0 and normal_sum > 0:
+                cur_frac = normal_sum / total
+                if cur_frac > cap:
+                    # scale normal weights so normal_sum' / (total - normal_sum + normal_sum') = cap
+                    other = total - normal_sum
+                    target_normal_sum = cap * other / max(1.0 - cap, 1e-9)
+                    scale = target_normal_sum / normal_sum
+                    cur_w[normal_mask] = cur_w[normal_mask] * scale
+                    weights_t[idx: idx + n] = cur_w
+            idx += n
+
+    num_samples = int(num_samples_cfg) if num_samples_cfg else int(weights_t.numel())
+    generator = None
+    seed = sampling_cfg.get("seed", None)
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+
+    # Diagnostics
+    print("[sampler] BalancedSampler enabled")
+    print(f"[sampler]   alpha={alpha} class_weights={class_weights} "
+          f"normal_cap={normal_cap} num_samples={num_samples} replacement={replacement}")
+    all_w_sum = weights_t.sum().item()
+    for name, total_n in name_to_total_n.items():
+        ccount = class_count_by_name.get(name, {})
+        ds_w_sum = 0.0
+        running = 0
+        for nm, n2, _ in per_ds_meta:
+            if nm == name:
+                ds_w_sum += weights_t[running: running + n2].sum().item()
+            running += n2
+        p_d = ds_w_sum / all_w_sum if all_w_sum > 0 else 0.0
+        print(f"[sampler]   {name}: N={total_n} class_counts={ccount} p_draw={p_d:.3f}")
+
+    return WeightedRandomSampler(
+        weights=weights_t, num_samples=num_samples, replacement=replacement,
+        generator=generator,
+    )
+
+
 class SegDatasetProcessor:
     @staticmethod
     def _sync_img_size_with_sam_type(cfg):
@@ -46,17 +178,19 @@ class SegDatasetProcessor:
 
         Applies to:
         - train path: cfg.model.sam_type
-        - distill path: cfg.teacher.sam_type
+        - distill path: cfg.teacher_cfg.sam_type (then cfg.student_cfg.sam_type)
         """
         data_cfg = cfg.get("data", {})
         if not data_cfg.get("auto_img_size_by_sam_type", True):
             return
 
         sam_cfg = None
-        if "model" in cfg and cfg.model.get("sam_type") is not None:
+        if "model" in cfg and isinstance(cfg.model, DictConfig) and cfg.model.get("sam_type") is not None:
             sam_cfg = cfg.model
-        elif "teacher" in cfg and cfg.teacher.get("sam_type") is not None:
-            sam_cfg = cfg.teacher
+        elif "teacher_cfg" in cfg and cfg.teacher_cfg.get("sam_type") is not None:
+            sam_cfg = cfg.teacher_cfg
+        elif "student_cfg" in cfg and cfg.student_cfg.get("sam_type") is not None:
+            sam_cfg = cfg.student_cfg
         if sam_cfg is None:
             return
 
@@ -71,12 +205,13 @@ class SegDatasetProcessor:
         sam_cfg.img_size = target_size
 
     @staticmethod
-    def load_dataset_from_config(cfg, name, split, force_external=False):
+    def load_dataset_from_config(cfg, name, split, force_external=False, transform=False):
         """Helper to load dataset config and instantiate.
 
         Args:
             force_external: If True, set usage="external" (for external validation sets).
                             If False, keep the config's default usage (for internal splits).
+            transform: Whether to apply data augmentation.
         """
         config_path = Path(f"config/data/{name}.yaml")
         if not config_path.exists():
@@ -85,7 +220,7 @@ class SegDatasetProcessor:
         data_cfg = OmegaConf.load(config_path)
 
         # Override global settings
-        for attr in ["img_size", "num_classes", "normalization", "multiclass"]:
+        for attr in ["img_size", "num_classes", "normalization"]:
             if hasattr(cfg.data, attr):
                 setattr(data_cfg, attr, getattr(cfg.data, attr))
 
@@ -93,11 +228,17 @@ class SegDatasetProcessor:
             data_cfg.usage = "external"
 
         dataset_class = get_dataset_class(data_cfg.name)
-        return dataset_class(data_cfg, split=split)
+        return dataset_class(data_cfg, split=split, transform=transform)
 
     @staticmethod
-    def build_dataset(cfg):
-        """Build train, val, and test datasets according to config."""
+    def build_dataset(cfg, return_components: bool = False):
+        """Build train, val, and test datasets according to config.
+
+        Args:
+            return_components: If True, returns a dict including raw per-dataset
+                lists (`train_components`, `train_component_names`) so callers
+                can build a balanced sampler aware of dataset boundaries.
+        """
         SegDatasetProcessor._sync_img_size_with_sam_type(cfg)
 
         # 1. Train/Val sets (Combine into ConcatDataset if multiple)
@@ -110,17 +251,25 @@ class SegDatasetProcessor:
         if not isinstance(val_list, (list, ListConfig)):
             val_list = [val_list]
 
-        train_datasets = [
-            SegDatasetProcessor.load_dataset_from_config(cfg, n, "train")
-            for n in train_list
-        ]
+        augment_train = getattr(cfg.data, "augment_train", True)
+        train_datasets = []
+        train_component_names: List[str] = []
+        for n in train_list:
+            original = SegDatasetProcessor.load_dataset_from_config(cfg, n, "train", transform=False)
+            train_datasets.append(original)
+            train_component_names.append(n)
+            if augment_train:
+                augmented = SegDatasetProcessor.load_dataset_from_config(cfg, n, "train", transform=True)
+                train_datasets.append(augmented)
+                train_component_names.append(n)
         val_datasets = [
             SegDatasetProcessor.load_dataset_from_config(cfg, n, "val")
             for n in val_list
         ]
 
+        aug_note = " (original + augmented)" if augment_train else ""
         print(
-            f"Loaded Train: {', '.join(train_list)} ({sum(len(d) for d in train_datasets)} samples)"
+            f"Loaded Train: {', '.join(train_list)} ({sum(len(d) for d in train_datasets)} samples{aug_note})"
         )
         print(
             f"Loaded Val: {', '.join(val_list)} ({sum(len(d) for d in val_datasets)} samples)"
@@ -149,28 +298,48 @@ class SegDatasetProcessor:
                 cfg, name, test_datasets
             )
 
-        return (
-            (
-                ConcatDataset(train_datasets)
-                if len(train_datasets) > 1
-                else train_datasets[0]
-            ),
-            ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0],
-            test_datasets,
+        train_concat = (
+            ConcatDataset(train_datasets)
+            if len(train_datasets) > 1
+            else train_datasets[0]
         )
+        val_concat = (
+            ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+        )
+
+        if return_components:
+            return {
+                "train": train_concat,
+                "val": val_concat,
+                "test": test_datasets,
+                "train_components": train_datasets,
+                "train_component_names": train_component_names,
+            }
+
+        return (train_concat, val_concat, test_datasets)
 
     @staticmethod
     def build_data_loaders(cfg):
         """Standard trainer data loader builder."""
-        train_ds, val_ds, test_ds_dict = SegDatasetProcessor.build_dataset(cfg)
+        components = SegDatasetProcessor.build_dataset(cfg, return_components=True)
+        train_ds = components["train"]
+        val_ds = components["val"]
+        test_ds_dict = components["test"]
 
         batch_size = cfg.training.batch_size
         num_workers = cfg.training.num_workers
 
+        sampler = _build_balanced_sampler(
+            components["train_components"],
+            components["train_component_names"],
+            cfg.data.get("sampling", OmegaConf.create({})),
+        )
+        shuffle = sampler is None
         train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=True,
         )
@@ -198,13 +367,7 @@ class SegDatasetProcessor:
     @staticmethod
     def build_distillation_datasets(cfg):
         """Build datasets for distillation workflow (shared train/val)."""
-        train_ds, val_ds, test_ds_dict = SegDatasetProcessor.build_dataset(cfg)
-
-        return {
-            "train": train_ds,
-            "val": val_ds,
-            "test": test_ds_dict,
-        }
+        return SegDatasetProcessor.build_dataset(cfg, return_components=True)
 
     @staticmethod
     def build_distillation_data_loaders(cfg):
@@ -214,17 +377,24 @@ class SegDatasetProcessor:
         batch_size = cfg.training.batch_size
         num_workers = cfg.training.num_workers
 
-        def _get_loader(ds, shuffle):
+        sampler = _build_balanced_sampler(
+            datasets["train_components"],
+            datasets["train_component_names"],
+            cfg.data.get("sampling", OmegaConf.create({})),
+        )
+
+        def _get_loader(ds, shuffle, sampler=None):
             return DataLoader(
                 ds,
                 batch_size=batch_size,
-                shuffle=shuffle,
+                shuffle=shuffle and sampler is None,
+                sampler=sampler,
                 num_workers=num_workers,
                 pin_memory=True,
             )
 
         return {
-            "train": _get_loader(datasets["train"], True),
+            "train": _get_loader(datasets["train"], True, sampler=sampler),
             "val": _get_loader(datasets["val"], False),
             "test": {
                 name: _get_loader(ds, False) for name, ds in datasets["test"].items()
