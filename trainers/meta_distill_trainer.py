@@ -124,6 +124,20 @@ class MetaDistillTrainer(DistillTrainer):
             self.meta_lr,
         )
 
+    # --- resume hooks (persist the separate meta optimiser) ----------------
+    @override
+    def _resume_payload_extra(self) -> dict:
+        if getattr(self, "meta_optimizer", None) is not None:
+            return {"meta_optimizer_state_dict": self.meta_optimizer.state_dict()}
+        return {}
+
+    @override
+    def _load_resume_extra(self, payload: dict) -> None:
+        if getattr(self, "meta_optimizer", None) is not None and payload.get(
+            "meta_optimizer_state_dict"
+        ):
+            self.meta_optimizer.load_state_dict(payload["meta_optimizer_state_dict"])
+
     # --- functional student forward ----------------------------------------
     def _student_logits_functional(self, params: Dict[str, torch.Tensor], images):
         """Forward the student with parameters swapped via ``functional_call``.

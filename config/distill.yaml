@@ -16,11 +16,15 @@ student: tinyusfm
 
 # Hardware Configuration (Global Overrides)
 hardware:
-  gpu_ids: [3]
+  gpu_ids: [1]
   seed: 42
 
 # Global Flags
 debug: false
+
+# Resume: null/false = fresh run; "auto" = reuse latest matching run dir with a
+# checkpoints/last.pth; or an explicit path to last.pth / a run dir.
+resume: null
 
 # Output & Visualization
 output:

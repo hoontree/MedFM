@@ -1,7 +1,7 @@
 # Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student) — binary
 defaults:
   - data: dynamic
-  - method: cwd_feature
+  - method: unified
   - training: distillation
   - _self_
 
@@ -11,14 +11,25 @@ trainer:
 teacher: sam
 student: tinyusfm
 
+# Human-readable experiment label (sweeps set this). Kept separate from
+# method.name (which is semantic: unified/online) so the label can never
+# accidentally flip distiller behaviour (e.g. method.name=="online").
+# Used in the log-dir name and the W&B run name when set.
+run_name: null
+
 # Hardware Configuration (Global Overrides)
 hardware:
-  gpu_ids: [0]
+  gpu_ids: [3]
   seed: 42
 
 # Global Flags
 debug: false
 use_gradnorm: false
+
+# Resume: null/false = fresh run (default); "auto" = reuse the latest prior run
+# dir matching this run's signature (run_name + hparam tags) that holds a
+# checkpoints/last.pth; or an explicit path to a last.pth / run dir.
+resume: null
 
 # Output & Visualization
 output:
@@ -26,3 +37,10 @@ output:
 
 visualization:
   num_samples: 10
+
+# Reliability-map analysis (tools/analyze_reliability.py only; unused by distill.py).
+analysis:
+  loader: null            # null -> first test loader; or a dataset name e.g. BUID
+  num_batches: 4          # batches to aggregate stats over
+  num_panels: 12          # per-sample qualitative panels to render
+  student_checkpoint: null  # optional distilled-student ckpt; null -> ft student

@@ -18,6 +18,10 @@ base_overrides:
   - method.w_logit_cwd=0.0
   - method.w_feature_cwd=0.0
   - method.w_uncertainty_kd=0.0
+  # Resume interrupted runs in place: re-dispatching the same --only set will
+  # pick up each run's checkpoints/last.pth and continue from where it stopped
+  # (finished runs already past num_epochs jump straight to final eval).
+  - resume=auto
 
 experiments:
   # --- A. Reference baselines (context) ---

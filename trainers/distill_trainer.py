@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, override
 
 from utils.data_processing_seg import SegDatasetProcessor
-from utils.evaluate import Evaluator_seg
 from utils.logger import setup_logger
 from utils.schedule import build_scheduler
 from distillers import create_distiller
 from utils.distill_utils import (
     get_dataset_short_name,
     create_log_dir,
+    get_experiment_tags,
     save_experiment_summary,
     load_model_cfg,
 )
@@ -31,11 +31,8 @@ class DistillTrainer(BaseTrainer):
     Trainer for Knowledge Distillation.
     Inherits common infrastructure from BaseTrainer and overrides distillation-specific logic.
     """
-
-    # =========================================================================
-    # 1. Construction
-    # =========================================================================
-
+    
+    # Construction
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)  # initializes cfg, device, evaluator, base attrs
 
@@ -46,18 +43,27 @@ class DistillTrainer(BaseTrainer):
         self.best_biou_path = None
         self.best_hd95_path = None
         self.final_metrics: Dict[str, float] = {}
-        self._wandb_metric_prefix = ""
+
 
         set_seed(cfg.hardware.seed)
+
+        # Resume bookkeeping (set before directory setup so a resumed run can
+        # reuse its previous exp_dir instead of spawning a fresh timestamp).
+        self.start_epoch = 0
+        self._resume_ckpt_path = None
 
         # Resolve teacher/student model configs from config/model/{name}.yaml.
         # The selected binary/multiclass checkpoint is folded into `checkpoint`.
         self._resolve_model_cfgs()
 
+        # Locate a resume checkpoint (cfg.resume = "auto" | <path> | null) before
+        # creating directories — "auto" reuses the latest prior run dir whose
+        # signature (run_name + hparam tags) matches and that holds a last.pth.
+        self._resume_ckpt_path = self._resolve_resume_path()
+
         self._setup_directories()
         save_experiment_summary(self.cfg, self.exp_dir)
         self._setup_logger()
-        self._setup_pipeline_log()
 
         self.dataset_name = get_dataset_short_name(cfg)
 
@@ -74,6 +80,11 @@ class DistillTrainer(BaseTrainer):
         self._create_optimizer()
         self._create_scheduler()
         self._setup_early_stopping()  # sets self.early_stopping from base
+
+        # Restore full training state (weights + optimiser + scheduler + best
+        # trackers + early-stopping + epoch/step) when resuming.
+        if self._resume_ckpt_path is not None:
+            self._load_resume_state(self._resume_ckpt_path)
 
     def _resolve_model_cfgs(self):
         """Load teacher/student model configs from config/model/{name}.yaml.
@@ -96,13 +107,6 @@ class DistillTrainer(BaseTrainer):
         teacher_cfg = load_model_cfg(self.teacher_name, num_classes)
         student_cfg = load_model_cfg(self.student_name, num_classes)
 
-        # Pipeline mode: a freshly-trained teacher checkpoint can be injected
-        # via pipeline.teacher_ckpt_override and takes precedence over the
-        # binary/multiclass default.
-        pipeline_cfg = self.cfg.get("pipeline", {})
-        if (ckpt_override := pipeline_cfg.get("teacher_ckpt_override")):
-            teacher_cfg.checkpoint = ckpt_override
-
         # Student should not inherit the teacher's fine-tuned checkpoint by
         # default — students typically train from a pretrained backbone or
         # from scratch. The user can re-enable via student_cfg.checkpoint=...
@@ -115,14 +119,19 @@ class DistillTrainer(BaseTrainer):
 
         self.teacher_ckpt = teacher_cfg.get("checkpoint")
 
-    # =========================================================================
-    # 2. Setup (directories / logging / wandb)
-    # =========================================================================
-
+    # Setup (directories / logging / wandb)
     @override
     def _setup_directories(self):
-        """Setup experiment directories using the standardized create_log_dir structure."""
-        self.exp_dir = create_log_dir(self.cfg)
+        """Setup experiment directories using the standardized create_log_dir structure.
+
+        When resuming, reuse the previous run's directory (the parent of the
+        located ``checkpoints/last.pth``) so logs/checkpoints continue in place
+        instead of spawning a fresh timestamped dir.
+        """
+        if self._resume_ckpt_path is not None:
+            self.exp_dir = self._resume_ckpt_path.parent.parent
+        else:
+            self.exp_dir = create_log_dir(self.cfg)
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         self.ckpt_dir = self.exp_dir / "checkpoints"
@@ -142,73 +151,56 @@ class DistillTrainer(BaseTrainer):
         log_file = self.exp_dir / "distill.log"
         self.logger = setup_logger(str(log_file), logger_name="medfm.distill")
 
-    def _setup_pipeline_log(self):
-        """Attach an extra file handler for pipeline logging if in pipeline mode."""
-        pipeline_cfg = self.cfg.get("pipeline", {})
-        teacher_log_dir = pipeline_cfg.get("teacher_log_dir", None)
-        if teacher_log_dir:
-            pipeline_log_path = Path(teacher_log_dir) / "pipeline.log"
-            pipeline_handler = _logging.FileHandler(
-                str(pipeline_log_path), mode="a", encoding="utf-8"
-            )
-            pipeline_handler.setLevel(_logging.INFO)
-            fmt = "[%(asctime)s %(name)s] (%(filename)s:%(lineno)d): %(levelname)s %(message)s"
-            pipeline_handler.setFormatter(_logging.Formatter(fmt))
-            self.logger.addHandler(pipeline_handler)
-
     @override
     def _setup_wandb(self):
-        """Override: support pipeline mode by reusing the teacher wandb run."""
-        pipeline_cfg = self.cfg.get("pipeline", {})
-        teacher_run_id = pipeline_cfg.get("teacher_run_id", None)
+        """Override: initialize a single wandb run for the entire distillation process."""
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
         wandb_mode = self.cfg.get("wandb", {}).get("mode", None)
         if self.cfg.get("debug", False) or self.cfg.get("wandb", {}).get("disabled", False):
             wandb_mode = "disabled"
 
-        if teacher_run_id is not None and wandb.run is not None:
-            # Pipeline: reuse open teacher run, prefix metrics with "distill/"
-            self.wandb_run = wandb.run
-            self._wandb_metric_prefix = "distill/"
-            self.logger.info(
-                f"[Pipeline] Reusing teacher WandB run '{self.wandb_run.id}'. "
-                "Distillation metrics will be prefixed with 'distill/'"
-            )
-        else:
-            exp_name = (
-                None
-                if is_sweep
-                else f"{self.teacher_name}_{self.student_name}_{self.cfg.method.name}"
-            )
-            self.wandb_run = wandb.init(
-                project=self.cfg.wandb.project,
-                entity=self.cfg.wandb.entity,
-                name=exp_name,
-                config=OmegaConf.to_container(self.cfg, resolve=True),
-                mode=wandb_mode,
-            )
-            self._define_wandb_metrics()
+        # Prefer the explicit experiment label (run_name) for the W&B run name;
+        # fall back to the teacher/student/method composite.
+        run_label = self.cfg.get("run_name") or self.cfg.method.name
+        exp_name = (
+            None
+            if is_sweep
+            else f"{self.teacher_name}_{self.student_name}_{run_label}"
+        )
+        # Optional grouping/tagging so sweeps (e.g. the reliability ablation)
+        # cluster together in the W&B UI and stay filterable. Both are read
+        # from cfg.wandb when present; absent keys leave W&B defaults.
+        wandb_cfg = self.cfg.get("wandb", {})
+        group = wandb_cfg.get("group", None)
+        tags = wandb_cfg.get("tags", None)
+        if tags is not None:
+            tags = OmegaConf.to_container(tags, resolve=True)
+        self.wandb_run = wandb.init(
+            project=self.cfg.wandb.project,
+            entity=self.cfg.wandb.entity,
+            name=exp_name,
+            group=group,
+            tags=tags,
+            config=OmegaConf.to_container(self.cfg, resolve=True),
+            mode=wandb_mode,
+        )
+        self._define_wandb_metrics()
 
     def _wandb_log(self, data: dict) -> None:
-        """Log metrics to wandb, applying pipeline prefix when sharing a run."""
+        """Log metrics to wandb"""
         if self.wandb_run is None:
             return
-        if self._wandb_metric_prefix:
-            data = {f"{self._wandb_metric_prefix}{k}": v for k, v in data.items()}
+        data = self._round_log_values(data)
         self.wandb_run.log(data)
+        self.logger.debug(f"WandB log: {data}")
 
     def _wandb_summary_update(self, data: dict) -> None:
-        """Update wandb summary, applying pipeline prefix when sharing a run."""
+        """Update wandb summary metrics."""
         if self.wandb_run is None:
             return
-        if self._wandb_metric_prefix:
-            data = {f"{self._wandb_metric_prefix}{k}": v for k, v in data.items()}
-        self.wandb_run.summary.update(data)
+        self.wandb_run.summary.update(self._round_log_values(data))
 
-    # =========================================================================
-    # 3. Model / optimizer construction
-    # =========================================================================
-
+    # Model / optimizer construction
     @override
     def _create_dataloaders(self):
         self.train_loader, self.val_loader, self.test_loader = (
@@ -304,10 +296,7 @@ class DistillTrainer(BaseTrainer):
             }
         )
 
-    # =========================================================================
-    # 4. Forward helpers (teacher / student calls)
-    # =========================================================================
-
+    # Forward helpers (teacher / student calls)
     @staticmethod
     def _is_sam_model(model) -> bool:
         """Return True if *model* is a SAM-based model (LoRA_Sam)."""
@@ -344,10 +333,7 @@ class DistillTrainer(BaseTrainer):
                 return {"masks": raw[0], "features": raw[1]}
             return {"masks": raw}
 
-    # =========================================================================
-    # 5. Training step
-    # =========================================================================
-
+    # Training step
     @override
     def train_epoch(self, epoch) -> Dict[str, float]:
         self.student.train()
@@ -403,10 +389,7 @@ class DistillTrainer(BaseTrainer):
 
         return {k: v / (i + 1) for k, v in running_losses.items()}
 
-    # =========================================================================
-    # 6. Evaluation
-    # =========================================================================
-
+    # Evaluation
     @property
     def _first_test_loader(self):
         """Get the first test loader (handles both dict and single loader)."""
@@ -473,9 +456,7 @@ class DistillTrainer(BaseTrainer):
 
         return all_metrics
 
-    # =========================================================================
-    # 7. Metrics logging & checkpointing
-    # =========================================================================
+    # Metrics logging & checkpointing
 
     @override
     def _log_metrics(
@@ -485,7 +466,6 @@ class DistillTrainer(BaseTrainer):
         val_metrics: Dict,
         test_metrics: Dict = None,
     ):
-        """Override: use pipeline-aware _wandb_log and include lr."""
         num_epochs = self.cfg.training.num_epochs
         self.logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
         self.logger.info(
@@ -505,7 +485,19 @@ class DistillTrainer(BaseTrainer):
 
     @override
     def _save_checkpoint(self, epoch: int, val_metrics: dict):
-        """Override: save best checkpoints for Dice, IoU, BIoU, and HD95."""
+        """Override: save best checkpoints for the configured metrics.
+
+        ``cfg.checkpoint.save_best_metrics`` (default all of
+        ``[Dice, IoU, BIoU, HD95]``) controls which best-of checkpoints are
+        kept; e.g. set it to ``[Dice]`` to keep only the selection-metric
+        checkpoint and cut per-run disk ~4×. Best-Dice is always saved (it is
+        the model used for final evaluation) regardless of the setting.
+        """
+        save_metrics = set(
+            self.cfg.get("checkpoint", {}).get(
+                "save_best_metrics", ["Dice", "IoU", "BIoU", "HD95"]
+            )
+        )
         dice = val_metrics.get("Dice", 0.0)
         iou = val_metrics.get("IoU", 0.0)
         biou = val_metrics.get("BIoU", 0.0)
@@ -529,7 +521,7 @@ class DistillTrainer(BaseTrainer):
             )
 
         # --- Best IoU ---
-        if iou > self.best_iou:
+        if "IoU" in save_metrics and iou > self.best_iou:
             if self.best_iou_path and self.best_iou_path.exists():
                 try:
                     self.best_iou_path.unlink()
@@ -546,7 +538,7 @@ class DistillTrainer(BaseTrainer):
             )
 
         # --- Best BIoU ---
-        if biou > self.best_biou:
+        if "BIoU" in save_metrics and biou > self.best_biou:
             if self.best_biou_path and self.best_biou_path.exists():
                 try:
                     self.best_biou_path.unlink()
@@ -563,7 +555,7 @@ class DistillTrainer(BaseTrainer):
             )
 
         # --- Best HD95 (lower is better) ---
-        if hd95 < self.best_hd95:
+        if "HD95" in save_metrics and hd95 < self.best_hd95:
             if self.best_hd95_path and self.best_hd95_path.exists():
                 try:
                     self.best_hd95_path.unlink()
@@ -591,10 +583,142 @@ class DistillTrainer(BaseTrainer):
             payload["teacher_state_dict"] = self.teacher.state_dict()
         torch.save(payload, path)
 
-    # =========================================================================
-    # 8. Visualization helpers
-    # =========================================================================
+    # Resume (full training-state checkpointing)
+    def _resolve_resume_path(self) -> Optional[Path]:
+        """Resolve the resume checkpoint from ``cfg.resume``.
 
+        ``cfg.resume`` may be:
+            * ``null`` / unset / ``false`` → no resume (default).
+            * ``"auto"`` → reuse the most recent prior run dir under
+              ``logs/distill/<teacher>_to_<student>/`` whose name ends with this
+              run's signature (``_<run_name>`` + hparam tags) and contains
+              ``checkpoints/last.pth``.
+            * an explicit path to a ``last.pth`` (or a run dir holding one).
+
+        Returns the checkpoint path, or ``None`` when nothing resumable is found.
+        """
+        resume = self.cfg.get("resume", None)
+        if resume in (None, False, "", "false", "none", "null"):
+            return None
+
+        if resume not in ("auto", True, "true"):
+            p = Path(str(resume))
+            if p.is_dir():
+                p = p / "checkpoints" / "last.pth"
+            return p if p.exists() else None
+
+        base = (
+            Path(self.cfg.output.dir)
+            / "distill"
+            / f"{self.teacher_name}_to_{self.student_name}"
+        )
+        if not base.exists():
+            return None
+        label = f"_{self.cfg.get('run_name')}" if self.cfg.get("run_name") else ""
+        tags = get_experiment_tags(self.cfg)
+        signature = f"{label}{'_' + '_'.join(tags) if tags else ''}"
+        cands = [
+            d for d in base.iterdir()
+            if d.is_dir() and d.name.endswith(signature)
+            and (d / "checkpoints" / "last.pth").exists()
+        ]
+        if not cands:
+            return None
+        latest = max(
+            cands, key=lambda d: (d / "checkpoints" / "last.pth").stat().st_mtime
+        )
+        return latest / "checkpoints" / "last.pth"
+
+    def _resume_payload_extra(self) -> dict:
+        """Hook: extra state to persist for resume (subclasses extend)."""
+        return {}
+
+    def _load_resume_extra(self, payload: dict) -> None:
+        """Hook: restore extra state saved by ``_resume_payload_extra``."""
+        return None
+
+    def _save_resume_checkpoint(self, epoch: int) -> None:
+        """Persist the full training state to ``checkpoints/last.pth`` (atomic).
+
+        Written every epoch so an interrupted run can continue from ``epoch+1``
+        with optimiser/scheduler/best-tracker/early-stopping state intact.
+        """
+        es = self.early_stopping
+        payload = {
+            "epoch": epoch,  # last completed epoch; resume starts at epoch+1
+            "global_step": self.global_step,
+            "model_state_dict": self.student.state_dict(),
+            "distiller_state_dict": self.distiller.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict() if self.scheduler is not None else None
+            ),
+            "best_trackers": {
+                "best_dice": self.best_dice,
+                "best_metric": self.best_metric,
+                "best_iou": self.best_iou,
+                "best_biou": self.best_biou,
+                "best_hd95": self.best_hd95,
+                "best_model_path": str(self.best_model_path) if self.best_model_path else None,
+                "best_iou_path": str(self.best_iou_path) if self.best_iou_path else None,
+                "best_biou_path": str(self.best_biou_path) if self.best_biou_path else None,
+                "best_hd95_path": str(self.best_hd95_path) if self.best_hd95_path else None,
+            },
+            "early_stopping": (
+                {"counter": es.counter, "best_score": es.best_score, "early_stop": es.early_stop}
+                if es is not None else None
+            ),
+            **self._resume_payload_extra(),
+        }
+        if self._is_online:
+            payload["teacher_state_dict"] = self.teacher.state_dict()
+
+        tmp = self.ckpt_dir / "last.pth.tmp"
+        torch.save(payload, tmp)
+        tmp.replace(self.ckpt_dir / "last.pth")
+
+    def _load_resume_state(self, path: Path) -> None:
+        """Restore full training state saved by ``_save_resume_checkpoint``."""
+        self.logger.info(f"Resuming from {path}")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+        self.student.load_state_dict(ckpt["model_state_dict"])
+        self.student.to(self.device)
+        if "distiller_state_dict" in ckpt:
+            self.distiller.load_state_dict(ckpt["distiller_state_dict"], strict=False)
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if self.scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if self._is_online and "teacher_state_dict" in ckpt:
+            self.teacher.load_state_dict(ckpt["teacher_state_dict"])
+
+        bt = ckpt.get("best_trackers", {})
+        self.best_dice = bt.get("best_dice", self.best_dice)
+        self.best_metric = bt.get("best_metric", self.best_metric)
+        self.best_iou = bt.get("best_iou", self.best_iou)
+        self.best_biou = bt.get("best_biou", self.best_biou)
+        self.best_hd95 = bt.get("best_hd95", self.best_hd95)
+        self.best_model_path = Path(bt["best_model_path"]) if bt.get("best_model_path") else None
+        self.best_iou_path = Path(bt["best_iou_path"]) if bt.get("best_iou_path") else None
+        self.best_biou_path = Path(bt["best_biou_path"]) if bt.get("best_biou_path") else None
+        self.best_hd95_path = Path(bt["best_hd95_path"]) if bt.get("best_hd95_path") else None
+
+        es_state = ckpt.get("early_stopping")
+        if es_state is not None and self.early_stopping is not None:
+            self.early_stopping.counter = es_state["counter"]
+            self.early_stopping.best_score = es_state["best_score"]
+            self.early_stopping.early_stop = es_state["early_stop"]
+
+        self._load_resume_extra(ckpt)
+
+        self.global_step = ckpt.get("global_step", 0)
+        self.start_epoch = int(ckpt.get("epoch", -1)) + 1
+        self.logger.info(
+            f"Resumed at epoch {self.start_epoch} (global_step={self.global_step}, "
+            f"best_dice={self.best_dice:.4f})"
+        )
+
+    # Visualization helpers
     def _run_distill_vis_inference(self, loader, num_samples: Optional[int] = None):
         """Run teacher+student forward passes and collect tensors for visualization.
 
@@ -665,14 +789,17 @@ class DistillTrainer(BaseTrainer):
                 filenames_list=fnames_list,
             )
 
-    # =========================================================================
-    # 9. Entry points (main loops)
-    # =========================================================================
+    # Entry points (main loops)
 
     @override
     def train(self):
         """Main distillation training loop."""
-        for epoch in range(self.cfg.training.num_epochs):
+        if self.start_epoch >= self.cfg.training.num_epochs:
+            self.logger.info(
+                f"Resumed run already reached num_epochs "
+                f"({self.start_epoch}/{self.cfg.training.num_epochs}); skipping to final eval."
+            )
+        for epoch in range(self.start_epoch, self.cfg.training.num_epochs):
             self.current_epoch = epoch
             train_losses = self.train_epoch(epoch)
             val_metrics = self.validate(epoch)
@@ -707,6 +834,8 @@ class DistillTrainer(BaseTrainer):
                     break
 
             self.scheduler.step()
+            # Persist full training state so an interrupted run resumes here.
+            self._save_resume_checkpoint(epoch)
 
         self._final_evaluation()
         wandb.finish()
@@ -725,21 +854,20 @@ class DistillTrainer(BaseTrainer):
             del self.distiller
             torch.cuda.empty_cache()
 
-            self.logger.info(
-                f"Loading best model for final evaluation: {self.best_model_path}"
-            )
-            checkpoint = torch.load(
-                self.best_model_path, map_location="cpu", weights_only=False
-            )
+            self.logger.info(f"Loading best model for final evaluation: {self.best_model_path}")
+            checkpoint = torch.load(self.best_model_path, map_location="cpu", weights_only=False)
             self.student.load_state_dict(checkpoint["model_state_dict"])
             self.student.to(self.device)
-            self.student.eval()
 
             test_metrics, student_cache = self.test(phase="final_test")
             self.final_metrics = {f"final_test/{k}": v for k, v in test_metrics.items()}
             self._wandb_summary_update(self.final_metrics)
-            self._wandb_log(self.final_metrics)
+            # final_test/* is bound to step_metric="epoch" in _define_wandb_metrics.
+            # Pass an explicit "epoch" so these points land on the run's final
+            # epoch on the x-axis instead of W&B's last-seen internal step.
+            self._wandb_log({**self.final_metrics, "epoch": self.cfg.training.num_epochs})
             self._save_latex_metrics_table_from_metrics(test_metrics)
+            self._save_final_metrics_json(test_metrics)
             self._save_per_sample_metrics(student_cache)
 
             first_ds = next(iter(student_cache))
@@ -821,47 +949,7 @@ class DistillTrainer(BaseTrainer):
         wandb.finish()
         self.logger.info("Test-only evaluation completed!")
 
-    def dry_run(self):
-        """Perform a quick end-to-end test of the training pipeline."""
-        self.logger.info("Starting Dry Run (Pipeline Validation)...")
-
-        limit_batches = 2
-        batch_size = self.cfg.training.get("batch_size", 1)
-
-        try:
-            self.logger.info(f"Testing training step with {limit_batches} batches...")
-            self.train_epoch(0)
-
-            torch.cuda.empty_cache()
-
-            self.logger.info("Testing validation step...")
-            self._evaluate_model(
-                self.student,
-                self._make_limited_loader(self.val_loader, limit_batches, batch_size),
-            )
-
-            torch.cuda.empty_cache()
-
-            self.logger.info("Testing evaluation step...")
-            self._evaluate_model(
-                self.student,
-                self._make_limited_loader(self._first_test_loader, limit_batches, batch_size),
-            )
-
-            self.logger.info(
-                "Dry Run completed successfully. Your experiment setup is valid."
-            )
-
-        except Exception as e:
-            self.logger.error(f"Dry Run failed: {str(e)}")
-            raise e
-        finally:
-            torch.cuda.empty_cache()
-
-    # =========================================================================
-    # 10. Small utilities
-    # =========================================================================
-
+    # Small utilities
     @staticmethod
     def _numeric_items(d: dict) -> dict:
         """Filter dict to only numeric (float/int) values."""
