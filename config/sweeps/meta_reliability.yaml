@@ -1,0 +1,94 @@
+# Meta-Reliability Distillation sweep.
+#
+# Compares the learnable reliability predictor (learned vs meta-learned) against
+# the hand-crafted map and plain-KD baselines, then ablates the meta machinery.
+# Dispatched by tools/run_reliability_ablation.py with this manifest:
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/meta_reliability.yaml \
+#       --group meta_reliability
+#
+# Baseline rows use method=unified (+ default DistillTrainer); every meta/learned
+# row swaps in method=meta_reliability and the MetaDistillTrainer. The headline
+# contrast is `learned_pseudo` (θ fit to teacher-correct) vs `meta_scalar`
+# (θ meta-learned from the student's post-update meta loss).
+
+base_overrides:
+  - method.w_task=1.0
+  - method.w_logit_cwd=0.0
+  - method.w_feature_cwd=0.0
+  - method.w_uncertainty_kd=0.0
+
+experiments:
+  # --- A. Reference baselines (context) ---
+  base_task_only:
+    - method=unified
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=0.0
+  base_logit_kd:
+    - method=unified
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=1.0
+  handcrafted_reliability:                  # full hand-crafted multiplicative map
+    - method=unified
+    - method.w_reliability_kd=1.0
+    - method.w_logit_kd=0.0
+
+  # --- B. Learnable predictor: learned-prior vs meta (the core comparison) ---
+  learned_pseudo:                           # θ fit to teacher_correct×conf (pseudo-label)
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.mode=learned
+  meta_scalar:                              # HEADLINE: meta-learned scalar reliability
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.mode=meta
+  meta_mixture:                             # extension: [a_gt, a_kd, a_neg] supervision mixture
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.mode=meta
+    - method.meta_reliability.output_mode=mixture
+
+  # --- C. Feature-set ablation (minimal-4 vs full-8) ---
+  meta_full_features:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - 'method.meta_reliability.feature_names=[teacher_confidence,teacher_entropy,teacher_margin,teacher_gt_agreement,student_confidence,student_entropy,teacher_student_disagreement,boundary_score]'
+
+  # --- D. Meta-set source ---
+  meta_split_val:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.meta_split=val
+
+  # --- E. Collapse-prevention ablation (drop regularisers one at a time) ---
+  meta_no_prior:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.prior_weight=0.0
+  meta_no_sparsity:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.sparsity_weight=0.0
+  meta_no_reg:                              # both off — expect collapse (r→0 or →ρ-free)
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.prior_weight=0.0
+    - method.meta_reliability.sparsity_weight=0.0
+
+  # --- F. Density target ρ sensitivity ---
+  meta_rho_0.3:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.target_density=0.3
+  meta_rho_0.7:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.target_density=0.7
+
+  # --- G. Staged schedule (warm-up on r_simple + prior anneal) ---
+  meta_staged:
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.warmup_epochs=5
+    - method.meta_reliability.prior_anneal_epochs=20

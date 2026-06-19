@@ -1,0 +1,77 @@
+# Meta-Reliability Distillation
+#
+# Replaces the hand-crafted multiplicative reliability map with a learnable
+# per-pixel predictor `r = Rθ(z)`. The hand-crafted factors become *input
+# features* (z); how they combine is decided by θ, trained either by a
+# supervised prior (`mode=learned`) or by a meta-objective against the
+# student's post-update validation performance (`mode=meta`, headline).
+#
+# Use with the meta trainer:
+#   uv run distill.py method=meta_reliability \
+#       trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+
+_target_: distillers.MetaReliabilityDistiller
+
+name: meta_reliability
+temperature: 4.0
+
+# Loss weights (same surface as unified.yaml). w_reliability_kd is λ — the
+# global weight on the (reliability-weighted) KD term.
+w_task:           1.0
+w_logit_kd:       0.0
+w_logit_cwd:      0.0
+w_feature_cwd:    0.0
+w_reliability_kd: 1.0   # λ in L = w_task·L_task + λ·r·L_KD
+w_uncertainty_kd: 0.0
+
+normalize_weights: false
+
+# Task loss components (φ-update GT supervision + meta supervised loss).
+use_dice: true
+use_ce: true
+pos_weight: 5.0
+
+# --- Meta-Reliability predictor & training -----------------------------------
+meta_reliability:
+  mode: meta            # meta | learned | fixed
+                        #   meta    : bilevel — θ minimises post-update meta loss
+                        #   learned : θ trained by prior+sparsity only (pseudo-label baseline)
+                        #   fixed   : predictor frozen (load from ckpt to use)
+  output_mode: scalar   # scalar (r∈[0,1]) | mixture ([a_gt,a_kd,a_neg] softmax)
+
+  # Per-pixel input features z (channels of the predictor input). The
+  # recommended minimal-4 set; extend toward ALL_FEATURE_NAMES to probe value.
+  #   teacher_confidence, teacher_entropy, teacher_margin, teacher_gt_agreement,
+  #   student_confidence, student_entropy, teacher_student_disagreement, boundary_score
+  feature_names:
+    - teacher_confidence
+    - teacher_gt_agreement
+    - teacher_student_disagreement
+    - student_confidence
+
+  temperature: 4.0          # logit→prob temperature for the feature signals
+  boundary_kernel_size: 3
+  eps: 1.0e-8
+
+  # Predictor architecture (1×1-conv MLP, pointwise).
+  hidden_dim: 32
+  num_layers: 2
+  init_reliability: 0.5     # scalar head bias so initial r ≈ this
+  dropout: 0.0
+
+  # --- θ optimiser (meta mode) ---
+  inner_lr: 1.0e-4          # η for the one-step virtual student update
+  meta_lr: 1.0e-3           # lr for the predictor (meta) optimiser
+  meta_weight_decay: 0.0
+  meta_grad_clip: 1.0
+  meta_split: train         # train (held-out batch) | val
+
+  # --- θ regularisers (collapse prevention; both modes) ---
+  sparsity_weight: 0.1      # β · |mean(r) − ρ|
+  target_density: 0.5       # ρ — average KD-applied pixel fraction (0.4–0.7)
+  reliability_floor: 0.0    # lower-bound r to floor + (1−floor)·r (KD budget)
+  prior_weight: 0.1         # γ · BCE(r, r_simple) — weak inductive bias
+  prior_anneal_epochs: 0    # >0: linearly anneal γ→0 over this many epochs
+
+  # --- staged schedule ---
+  warmup_epochs: 0          # first N epochs weight KD by r_simple, not Rθ
