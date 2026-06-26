@@ -256,13 +256,12 @@ def gated_mean(per_sample_loss: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
 def supervised_task_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
-    num_classes: int = 3,
 ) -> torch.Tensor:
     """Project-aligned supervised loss using existing :class:`TaskLoss`.
 
     Use this when you want the *exact* averaging convention the rest of the
-    codebase uses (matches distill_trainer/sam_trainer).
+    codebase uses (matches distill_trainer/sam_trainer). Binary vs.
+    multi-class is inferred from ``logits.shape[1]``.
     """
-    fn = TaskLoss(num_classes=num_classes, use_ce=True, use_dice=True)
-    fn = fn.to(logits.device)
+    fn = TaskLoss(use_ce=True, use_dice=True).to(logits.device)
     return fn(logits, target)

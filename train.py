@@ -17,13 +17,12 @@ from utils.hardware import (
     stage_banner,
     suppress_teacher_wandb_in_sweep,
 )
-from utils.pipeline import build_distill_cfg
 
 log = logging.getLogger(__name__)
 
 @hydra.main(version_base=None, config_path="config", config_name="train_sam")
 def main(cfg: DictConfig):
-    """Unified training entry point with optional pipeline distillation."""
+    """Unified training entry point."""
     set_gpu(cfg)
     suppress_teacher_wandb_in_sweep(cfg)
     

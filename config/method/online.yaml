@@ -8,16 +8,15 @@ name: online
 temperature: 4.0
 
 # Student loss weights
-alpha: 1.0        # Student task loss (GT Dice/CE)
-beta: 1.0         # Logit KD (KL Divergence)
-gamma: 0          # Feature KD (MSE on intermediate layers)
+w_task:     1.0   # Student task loss (GT Dice/CE)
+w_logit_kd: 1.0   # Logit KD (KL Divergence)
 
 # Teacher task loss weight (how strongly teacher is updated)
-teacher_alpha: 1.0
+w_teacher_task: 1.0
 
 # Task loss components
 use_dice: true
 use_ce: true
 
-# Feature distillation settings (gamma > 0 to enable)
+# Feature alignment for w_feature_cwd > 0; harmless if unused
 feature_pairs: [7, 9, 11]

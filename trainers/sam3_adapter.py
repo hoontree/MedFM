@@ -511,7 +511,7 @@ class SAM3TrainerAdapter(BaseTrainer):
 
     def _setup_simple_criterion(self):
         """Setup simple criterion as fallback."""
-        from utils.sam_utils import DiceLoss
+        from utils.criterion import DiceLoss
 
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss(self.cfg.data.num_classes)

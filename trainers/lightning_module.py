@@ -21,7 +21,7 @@ from torch.nn.modules.loss import CrossEntropyLoss
 import lightning as L
 
 from utils.evaluate import Evaluator_seg
-from utils.sam_utils import DiceLoss
+from utils.criterion import DiceLoss
 
 log = logging.getLogger(__name__)
 

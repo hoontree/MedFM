@@ -3,6 +3,3 @@ defaults:
   - _self_
   - data: dynamic
   - model: sam
-
-pipeline:
-  enabled: false

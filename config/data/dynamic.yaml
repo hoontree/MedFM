@@ -11,7 +11,7 @@ test: [BUID, BUS_UCLM, BUS_UCLM_filtered]  # Each dataset in this list will be e
 # Canonical location for num_classes and img_size.
 # These are propagated to every individual dataset at load time.
 # num_classes=1 → binary, num_classes>1 → multiclass.
-num_classes: 1
+num_classes: 3
 img_size: 224
 auto_img_size_by_sam_type: true
 sam_img_size_map:
@@ -31,19 +31,23 @@ augment_train: true
 #     Increase `2: 1.5` for stronger malignant oversampling, etc.
 # - normal_cap: max expected fraction of normal-class draws *within each dataset*.
 #     null → no cap. e.g. 0.3 keeps at most 30% normal images per dataset.
+# - decouple_dataset_class: keep dataset draw prob ∝ N_d^alpha exactly, applying
+#     class_weights/normal_cap *within* each dataset only. Leave on (no-op when
+#     class_weights are uniform). Set false for legacy multiplicative behaviour.
 #
 # Tuning hints:
 #   * Large dataset (BUSBRA) dominates → lower alpha (e.g. 0.3).
 #   * Small dataset (B, 163 samples) overfitting → raise alpha (e.g. 0.7-1.0).
 #   * Want malignant-sensitive model → class_weights.2 > class_weights.1.
 sampling:
-  enabled: true
+  enabled: false
   alpha: 0.5
   class_weights:
     0: 1.0   # normal
     1: 1.0   # benign
     2: 1.0   # malignant
   normal_cap: null
+  decouple_dataset_class: true
   num_samples: null   # null → len(train); set to control epoch length
   replacement: true
   seed: 42

@@ -8,7 +8,6 @@ Hydra 기반 설정 시스템으로 **Teacher 학습**, **Knowledge Distillation
 - SAM 계열 Teacher 학습 (LoRA/Hybrid 설정 포함)
 - TinyUSFM Student 학습
 - Teacher → Student 지식 증류 (`distill.py`)
-- Teacher 학습 후 자동 증류 파이프라인 (`train.py pipeline.enabled=true`)
 - 다중 테스트 데이터셋 분리 평가 (`eval.py`)
 
 ## 프로젝트 구조
@@ -66,14 +65,6 @@ python train.py
 python train.py model.encoder_mode=frozen model.decoder_mode=ft data=dynamic
 python train.py hardware.gpu_ids=[0]
 python train.py training.batch_size=8 training.num_epochs=100
-```
-
-### 2) Teacher 학습 후 자동 Distillation 파이프라인
-
-Teacher 학습 완료 후, 같은 컨텍스트(데이터/하드웨어/스플릿)로 Distillation 단계까지 자동 실행:
-
-```bash
-python train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora
 ```
 
 ### 3) Distillation 단독 실행

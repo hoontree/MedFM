@@ -1,0 +1,20 @@
+\begin{table}[t]
+\centering
+\caption{Fair comparison under matched balanced sampling: both teachers trained
+\emph{with} the sampler (SAM full-FT 0.682, SAM LoRA 0.720 val Dice) and the
+TinyUSFM student also trained with sampling. External = mean over
+BUID/BUS\_UCLM/BUS\_UCLM\_filtered; $\Delta$ = external-Dice gain over task-only.
+Best external Dice in \textbf{bold}.}
+\label{tab:kd_sampled_fair}
+\begin{tabular}{l l c c c c}
+\toprule
+Teacher & Method & ext Dice & ext Sens & int Dice & $\Delta$ ext \\
+\midrule
+Task-only (no KD) & -- & 0.619 & 0.631 & 0.765 & -- \\
+FT-sampled & logit-KD & 0.642 & 0.647 & 0.734 & +0.024 \\
+FT-sampled & reliability-KD & 0.637 & 0.615 & 0.759 & +0.018 \\
+LoRA-sampled & logit-KD & \textbf{0.671} & 0.678 & 0.742 & +0.052 \\
+LoRA-sampled & reliability-KD & 0.642 & 0.624 & 0.774 & +0.024 \\
+\bottomrule
+\end{tabular}
+\end{table}

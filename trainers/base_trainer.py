@@ -5,16 +5,17 @@ This module provides a base class for training different models with common func
 """
 
 import os
+import json
+import subprocess
+import numbers
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, Tuple
-import logging
+from typing import Dict, Optional, Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
@@ -219,8 +220,6 @@ class BaseTrainer(ABC):
         for fam in epoch_families:
             for pat in _patterns(fam):
                 wandb.define_metric(pat, step_metric="epoch")
-        for pat in _patterns("final_test"):
-            wandb.define_metric(pat, step_metric="epoch", summary="last")
 
         for fam in step_families:
             for pat in _patterns(fam):
@@ -415,14 +414,37 @@ class BaseTrainer(ABC):
         wandb_metrics.update({f"train/{k}": v for k, v in train_items.items()})
         wandb_metrics.update({f"val/{k}": v for k, v in val_items.items()})
         if wandb.run is not None:
-            wandb.log(wandb_metrics)
+            wandb.log(self._round_log_values(wandb_metrics))
 
     def _log_step_metrics(self, metrics: Dict, step: int):
         """Log step-level metrics to wandb with step/ prefix."""
         if wandb.run is not None:
             data = {"global_step": step}
             data.update({f"step/{k}": v for k, v in metrics.items()})
-            wandb.log(data)
+            wandb.log(self._round_log_values(data))
+
+    @staticmethod
+    def _round_log_values(data: Dict, ndigits: int = 4) -> Dict:
+        """Round float values before sending them to W&B.
+
+        Only real (non-integer) numbers are rounded, so ``epoch``/``global_step``
+        and parameter counts stay intact. Learning-rate keys are skipped so small
+        values such as ``4e-5`` are not flattened to ``0.0`` by 4-decimal rounding.
+        """
+        def _skip(key) -> bool:
+            return "lr" in str(key).split("/")
+
+        out = {}
+        for k, v in data.items():
+            if (
+                isinstance(v, numbers.Real)
+                and not isinstance(v, (bool, int))
+                and not _skip(k)
+            ):
+                out[k] = round(float(v), ndigits)
+            else:
+                out[k] = v
+        return out
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict):
         """Save model checkpoint."""
@@ -444,7 +466,7 @@ class BaseTrainer(ABC):
             self.logger.info(f"Saved best model: {self.best_model_path}")
             if wandb.run is not None:
                 wandb.run.summary["checkpoint_path"] = str(self.best_model_path)
-                wandb.run.summary["best_dice"] = dice_score
+                wandb.run.summary["best_dice"] = round(float(dice_score), 4)
             if (
                 prev_best_model_path is not None
                 and prev_best_model_path != self.best_model_path
@@ -461,7 +483,7 @@ class BaseTrainer(ABC):
             self._save_model(self.best_iou_checkpoint)
             self.logger.info(f"Saved best IoU model: {self.best_iou_checkpoint}")
             if wandb.run is not None:
-                wandb.run.summary["best_iou"] = IoU_score
+                wandb.run.summary["best_iou"] = round(float(IoU_score), 4)
                 wandb.run.summary["best_iou_checkpoint"] = str(self.best_iou_checkpoint)
             if (
                 prev_best_iou_checkpoint is not None
@@ -479,7 +501,7 @@ class BaseTrainer(ABC):
             self._save_model(self.best_hd95_checkpoint)
             self.logger.info(f"Saved best HD95 model: {self.best_hd95_checkpoint}")
             if wandb.run is not None:
-                wandb.run.summary["best_hd95"] = hd95_score
+                wandb.run.summary["best_hd95"] = round(float(hd95_score), 4)
                 wandb.run.summary["best_hd95_checkpoint"] = str(self.best_hd95_checkpoint)
             if (
                 prev_best_hd95_checkpoint is not None
@@ -722,14 +744,78 @@ class BaseTrainer(ABC):
                 for k, v in test_metrics.items()
                 if isinstance(v, (float, int))
             }
-            wandb.log(final_metrics)
-            wandb.run.summary.update(final_metrics)
+            # final_test/* is bound to step_metric="epoch"; pass an explicit
+            # "epoch" so these points land on the run's final epoch on the
+            # x-axis instead of W&B's last-seen internal step.
+            rounded_final = self._round_log_values(final_metrics)
+            wandb.log({**rounded_final, "epoch": self.cfg.training.get("num_epochs", 0)})
+            wandb.run.summary.update(rounded_final)
 
         # Save LaTeX table from test_metrics (authoritative values from evaluate_model)
         self._save_latex_metrics_table_from_metrics(test_metrics)
 
+        # Machine-readable aggregate (full precision) for cross-run analysis.
+        self._save_final_metrics_json(test_metrics)
+
         if predictions_cache is not None:
             self._save_per_sample_metrics(predictions_cache)
+
+    def _save_final_metrics_json(self, test_metrics: Dict) -> None:
+        """Persist final-test metrics as structured JSON for cross-run analysis.
+
+        Replaces brittle parsing of ``test_results.txt``: metrics are nested as
+        ``{dataset: {metric: value}}`` (dataset split from ``"<ds>/<metric>"``
+        keys; flat keys go under ``"_overall"``) at full precision, alongside a
+        ``_meta`` block (run label, models, key hyperparameters, best ckpt,
+        seed, git commit) so a run is self-describing.
+        """
+        per_ds: Dict[str, Dict[str, float]] = {}
+        for key, value in test_metrics.items():
+            if not isinstance(value, numbers.Number):
+                continue
+            ds, _, metric = key.partition("/")
+            if not metric:  # flat key (single-dataset run)
+                ds, metric = "_overall", key
+            per_ds.setdefault(ds, {})[metric] = float(value)
+
+        m = self.cfg.get("method", {})
+        meta = {
+            "run_name": self.cfg.get("run_name"),
+            "method": m.get("name"),
+            "teacher": self.cfg.get("teacher"),
+            "student": self.cfg.get("student"),
+            "num_classes": self.cfg.get("data", {}).get("num_classes"),
+            "seed": self.cfg.get("hardware", {}).get("seed"),
+            "best_checkpoint": (
+                self.best_model_path.name if self.best_model_path else None
+            ),
+            "git_commit": self._git_commit(),
+            "hparams": {
+                "temperature": m.get("temperature"),
+                "w_task": m.get("w_task"),
+                "w_logit_kd": m.get("w_logit_kd"),
+                "w_reliability_kd": m.get("w_reliability_kd"),
+                "w_uncertainty_kd": m.get("w_uncertainty_kd"),
+                "lr": self.cfg.get("training", {}).get("lr"),
+                "batch_size": self.cfg.get("training", {}).get("batch_size"),
+            },
+        }
+        payload = {"_meta": meta, "metrics": per_ds}
+        out_path = self.exp_dir / "final_metrics.json"
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        self.logger.info(f"Final metrics JSON saved → {out_path}")
+
+    @staticmethod
+    def _git_commit() -> Optional[str]:
+        """Short git commit hash of the working tree, or None if unavailable."""
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            return None
 
     def _save_per_sample_metrics(self, predictions_cache: dict) -> None:
         """Save per-sample segmentation metrics to CSV for every test dataset.
@@ -986,19 +1072,6 @@ class BaseTrainer(ABC):
                 "No best model checkpoint found (training may have ended at epoch 0 "
                 "or all checkpoints failed). Skipping final test evaluation."
             )
-
-        # Capture run ID for pipeline integration before potentially finishing
-        self.wandb_run_id = (
-            self.wandb_run.id
-            if hasattr(self, "wandb_run") and self.wandb_run is not None
-            else None
-        )
-
-        # In pipeline mode, keep the wandb run open so the distillation stage
-        # can continue logging to the same run. Otherwise, finish normally.
-        in_pipeline = self.cfg.get("pipeline", {}).get("enabled", False)
-        if not in_pipeline:
-            wandb.finish()
 
         self.logger.info("Training completed!")
 

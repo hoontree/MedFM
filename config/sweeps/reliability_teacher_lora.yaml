@@ -1,0 +1,58 @@
+# Reliability-aware KD with a LoRA-fine-tuned SAM teacher (rank 4).
+#
+# Companion to reliability_ablation.yaml. That sweep uses the fully fine-tuned
+# SAM teacher (sam.yaml, encoder/decoder = ft); this one swaps in the LoRA
+# teacher (sam_lora.yaml) and keeps ONLY the headline methods so the question
+# "does reliability-KD still help when the teacher is a cheap LoRA model?" can
+# be answered without a full ablation.
+#
+# Prerequisite: a multiclass LoRA SAM checkpoint at
+#   experiment_results/SAM_multiclass_lora/checkpoints/best.pth
+# (Phase 1 — see docs/reliability_kd_study.md).
+#
+# Compare cross-sweep against the ft-teacher runs of the same method:
+#   logit_kd        <-> reliability_ablation:base_logit_kd
+#   reliability     <-> reliability_ablation:b2_student_bypass
+#   reliability_sm  <-> reliability_ablation:b3_smoothing
+
+base_overrides:
+  - method=unified
+  - teacher=sam_lora          # the only change vs the ft-teacher sweep
+  - method.w_task=1.0
+  - method.w_reliability_kd=1.0
+  - method.w_logit_kd=0.0
+  - method.w_logit_cwd=0.0
+  - method.w_feature_cwd=0.0
+  - method.w_uncertainty_kd=0.0
+
+experiments:
+  # GT-only student (no KD) — lower bound.
+  task_only:
+    - method.w_reliability_kd=0.0
+  # Plain Hinton logit-KD from the LoRA teacher.
+  logit_kd:
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=1.0
+  # Entropy/uncertainty-weighted KD (added later to fill the §1 comparison).
+  uncertainty_kd:
+    - method.w_reliability_kd=0.0
+    - method.w_uncertainty_kd=1.0
+    - method.use_uncertainty_weighted_kd=true
+  # Full reliability map (== unified.yaml default, T=4).
+  reliability: []
+  # Full reliability map + prediction-aware spatial smoothing.
+  reliability_sm:
+    - method.reliability_kd.use_reliability_smoothing=true
+
+  # --- Hyperparameter comparison (reliability/KD knobs; not a full ablation) ---
+  # Centre point is `reliability` above (T=4, wrong=0.0, bypass=0.1).
+  temp_2.0:
+    - method.temperature=2.0
+    - method.reliability_kd.temperature=2.0
+  temp_8.0:
+    - method.temperature=8.0
+    - method.reliability_kd.temperature=8.0
+  tg_wrong_0.25:
+    - method.reliability_kd.teacher_correctness_wrong_weight=0.25
+  sb_weight_0.3:
+    - method.reliability_kd.student_bypass_weight=0.3

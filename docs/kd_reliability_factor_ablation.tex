@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\caption{Reliability-factor ablation (TinyUSFM student, SAM full-FT teacher). Each
+factor multiplies into the per-pixel reliability map; ``confidence'' and ``entropy''
+are always on, the GT-conditioned gates and smoothing are toggled. External = mean
+over BUID/BUS\_UCLM/BUS\_UCLM\_filtered; best external Dice in \textbf{bold}.}
+\label{tab:reliability_factor_ablation}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l ccccc cc c}
+\toprule
+& \multicolumn{5}{c}{Reliability factors} & \multicolumn{2}{c}{External} & BUID \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-8}\cmidrule(lr){9-9}
+Configuration & Conf & Ent & T-gate & S-byp & Smooth & Dice & Sens & Dice \\
+\midrule
+confidence $\times$ entropy & \checkmark & \checkmark & -- & -- & -- & 0.587 & 0.544 & 0.605 \\
+\quad + teacher gate & \checkmark & \checkmark & \checkmark & -- & -- & \textbf{0.630} & 0.622 & 0.652 \\
+\quad + student bypass (full) & \checkmark & \checkmark & \checkmark & \checkmark & -- & 0.614 & 0.591 & 0.648 \\
+\quad + smoothing & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & 0.597 & 0.578 & 0.636 \\
+full $-$ teacher gate & \checkmark & \checkmark & -- & \checkmark & -- & 0.584 & 0.574 & 0.619 \\
+\bottomrule
+\end{tabular}
+\end{table}

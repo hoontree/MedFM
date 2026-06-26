@@ -1,7 +1,41 @@
+import logging
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
+
+# Loss weight keys are semantic (``w_<component>``). Each entry lists the
+# canonical name and any legacy aliases that should still be accepted with
+# a deprecation warning.
+LOSS_WEIGHT_ALIASES: Dict[str, tuple] = {
+    "w_task":            ("alpha",),
+    "w_logit_kd":        ("beta",),
+    "w_logit_cwd":       ("delta",),
+    "w_feature_cwd":     ("zeta",),
+    "w_reliability_kd":  ("eta",),
+    "w_uncertainty_kd":  ("kd_lambda",),
+}
+
+
+def resolve_loss_weight(method_cfg: Any, canonical: str, default: float = 0.0) -> float:
+    """Read a loss weight from ``method_cfg`` accepting legacy aliases.
+
+    Looks up ``canonical`` first; if absent, falls back to any registered
+    alias (warning once per call) so old yamls keep working. Returns
+    ``default`` when neither is provided.
+    """
+    if canonical in method_cfg:
+        return float(method_cfg.get(canonical))
+    for alias in LOSS_WEIGHT_ALIASES.get(canonical, ()):
+        if alias in method_cfg:
+            logger.warning(
+                "method.%s is deprecated; rename to method.%s", alias, canonical,
+            )
+            return float(method_cfg.get(alias))
+    return float(default)
 
 
 class BaseDistiller(nn.Module, ABC):
@@ -14,9 +48,8 @@ class BaseDistiller(nn.Module, ABC):
         super().__init__()
         self.cfg = cfg
         self.temperature = cfg.method.get("temperature", 4.0)
-        self.alpha = cfg.method.get("alpha", 1.0)
-        self.beta = cfg.method.get("beta", 0.0)
-        self.gamma = cfg.method.get("gamma", 0.0)
+        self.w_task = resolve_loss_weight(cfg.method, "w_task", default=1.0)
+        self.w_logit_kd = resolve_loss_weight(cfg.method, "w_logit_kd", default=0.0)
 
     def prepare(self, student: nn.Module, teacher: nn.Module):
         """
@@ -52,6 +85,5 @@ class BaseDistiller(nn.Module, ABC):
                 'loss': Total combined loss
                 'task_loss': Loss related to ground truth
                 'distill_loss': Loss related to teacher-student alignment
-                'feature_loss': Loss related to feature alignment (optional)
         """
         pass

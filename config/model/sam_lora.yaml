@@ -1,0 +1,37 @@
+# @package _global_
+# SAM teacher adapted with LoRA (rank 4, encoder + decoder).
+# Mirror of model/sam.yaml but with encoder_mode/decoder_mode = lora so the
+# teacher is a LoRA-fine-tuned SAM rather than a fully fine-tuned one.
+#
+# Usable two ways:
+#   * train.py model=sam_lora        -> trains a fresh LoRA SAM
+#   * distill.py teacher=sam_lora    -> uses it as the (frozen) KD teacher
+#
+# The multiclass_checkpoint below is the LoRA checkpoint produced by Phase 1
+# (see docs/reliability_kd_study.md). Copy the best LoRA checkpoint to this
+# stable path after training so the distillation runs find it.
+defaults:
+  - _self_
+  - /training: sam_training
+
+trainer:
+  _target_: trainers.sam_trainer.SAMTrainer
+
+model:
+  name: sam_lora
+  _target_: model.sam_hybrid_adapter.LoRA_Sam
+  sam_type: vit_b
+  img_size: ${data.img_size}
+  num_classes: ${data.num_classes}
+  pixel_mean: [123.675, 116.28, 103.53]
+  pixel_std: [58.395, 57.12, 57.375]
+  encoder_mode: "lora"
+  decoder_mode: "lora"
+  r_e: 4
+  r_d: 4
+  conv_lora_expert_num: 4
+  checkpoint: null
+  # Phase 1 output (copy trained best LoRA ckpt here). Binary slot left as a
+  # placeholder for symmetry; the reliability study uses the multiclass slot.
+  binary_checkpoint: experiment_results/SAM_binary_lora/checkpoints/best.pth
+  multiclass_checkpoint: experiment_results/SAM_multiclass_lora/checkpoints/best.pth

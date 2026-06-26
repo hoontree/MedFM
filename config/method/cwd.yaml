@@ -5,12 +5,12 @@
 #
 # Application points (binary medical segmentation, TinyUSFM → SAM):
 #   - delta: CWD on the final logit map (replaces vanilla per-pixel KL)
-#   - zeta : CWD on intermediate features (replaces MSE feature loss)
+#   - zeta : CWD on intermediate features
 #
 # Recipes:
-#   - logit-only:   beta=0, gamma=0, delta=1, zeta=0
-#   - feature-only: beta=0, gamma=0, delta=0, zeta=1
-#   - combined:     beta=0, gamma=0, delta=1, zeta=1   (paper's "single+whole")
+#   - logit-only:   w_logit_kd=0, w_logit_cwd=1, w_feature_cwd=0
+#   - feature-only: w_logit_kd=0, w_logit_cwd=0, w_feature_cwd=1
+#   - combined:     w_logit_kd=0, w_logit_cwd=1, w_feature_cwd=1   (paper's "single+whole")
 
 _target_: distillers.UnifiedDistiller
 
@@ -18,20 +18,19 @@ name: cwd
 temperature: 4.0
 cwd_temperature: 4.0
 
-# Disable vanilla KL/MSE — CWD takes their place
-alpha: 1.0
-beta: 0.0
-gamma: 0.0
-delta: 1.0   # logit-CWD
-zeta: 0.0    # feature-CWD
+# Disable vanilla KL — CWD takes its place
+w_task:        1.0
+w_logit_kd:    0.0
+w_logit_cwd:   1.0   # logit-CWD
+w_feature_cwd: 0.0   # feature-CWD
 
 # Task loss components
 use_dice: true
 use_ce: true
 
-# Feature pairs for zeta>0 / gamma>0 (auto-resolves block paths/channels per model)
+# Feature pairs for w_feature_cwd>0 (auto-resolves block paths/channels per model)
 feature_pairs: [7, 9, 11]
 
 # Uncertainty-weighted KD off in CWD baseline
 use_uncertainty_weighted_kd: false
-kd_lambda: 0.0
+w_uncertainty_kd: 0.0

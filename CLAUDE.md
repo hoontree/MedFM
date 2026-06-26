@@ -68,23 +68,6 @@ uv run run_distill_experiments.py
 uv run run_distill_experiments.py --debug  # Quick debug run
 ```
 
-### Teacher→Distill Pipeline (Single Command)
-
-```bash
-# Train teacher, then automatically run distillation with the same data/hardware/split context
-uv run train.py pipeline.enabled=true model.encoder_mode=frozen model.decoder_mode=lora
-
-# Example with explicit encoder/decoder modes
-uv run train.py \
-  pipeline.enabled=true \
-  model.encoder_mode=conv_lora \
-  model.decoder_mode=lora
-```
-
-Pipeline behavior:
-- Distillation uses the teacher best checkpoint from the same run.
-- Sweep metric is `final_test/BUID/dice`.
-
 ## Architecture
 
 ### Configuration System (Hydra)
@@ -229,7 +212,6 @@ logs/distillation/{dataset}/{timestamp}/
 - Entity: `hheo`
 - Automatically logs: losses, metrics, learning rate, visualizations
 - Config stored in `.env` file
-- Pipeline sweeps should run with teacher W&B disabled (`wandb.disabled=true`) so one sweep trial maps to one distillation run metric (`final_test/BUID/dice`).
 
 ### GPU Management
 

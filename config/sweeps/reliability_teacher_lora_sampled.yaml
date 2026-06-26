@@ -1,0 +1,61 @@
+# Reliability-aware KD with a LoRA-fine-tuned SAM teacher (rank 4) +
+# BALANCED SAMPLING enabled (config/data/dynamic.yaml `sampling` block).
+#
+# Sampling-on twin of reliability_teacher_lora.yaml. Same methods/knobs, but the
+# train loader uses the dataset-/class-balanced WeightedRandomSampler so the
+# question "does dataset rebalancing change the reliability-KD picture?" can be
+# answered against the matching non-sampled runs.
+#
+# Sampling policy here = dataset rebalance only:
+#   - alpha=0.5  (sqrt tempering; curbs BUSBRA dominance, exposes small B)
+#   - decouple_dataset_class=true  (p_d ∝ N_d^0.5 exactly)
+#   - class_weights uniform, normal_cap null  (isolate the dataset effect)
+#
+# Experiment names are `smpl_*` so run_name=relab_smpl_* stays distinct from the
+# non-sampled relab_* runs (separate W&B run names, separate resume detection).
+#
+# Run (sequential, single worker on the gpu4 node):
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/reliability_teacher_lora_sampled.yaml \
+#       --group reliability_teacher_lora_sampled --workers gpu4:0
+
+base_overrides:
+  - method=unified
+  - teacher=sam_lora
+  - method.w_task=1.0
+  - method.w_reliability_kd=1.0
+  - method.w_logit_kd=0.0
+  - method.w_logit_cwd=0.0
+  - method.w_feature_cwd=0.0
+  - method.w_uncertainty_kd=0.0
+  # --- balanced sampling (dataset rebalance only) ---
+  - data.sampling.enabled=true
+  - data.sampling.alpha=0.5
+  - data.sampling.decouple_dataset_class=true
+  - data.sampling.normal_cap=null
+
+experiments:
+  # GT-only student (no KD) — lower bound.
+  smpl_task_only:
+    - method.w_reliability_kd=0.0
+  # Plain Hinton logit-KD from the LoRA teacher.
+  smpl_logit_kd:
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=1.0
+  # Full reliability map (== unified.yaml default, T=4).
+  smpl_reliability: []
+  # Full reliability map + prediction-aware spatial smoothing.
+  smpl_reliability_sm:
+    - method.reliability_kd.use_reliability_smoothing=true
+
+  # --- Hyperparameter comparison (reliability/KD knobs; not a full ablation) ---
+  smpl_temp_2.0:
+    - method.temperature=2.0
+    - method.reliability_kd.temperature=2.0
+  smpl_temp_8.0:
+    - method.temperature=8.0
+    - method.reliability_kd.temperature=8.0
+  smpl_tg_wrong_0.25:
+    - method.reliability_kd.teacher_correctness_wrong_weight=0.25
+  smpl_sb_weight_0.3:
+    - method.reliability_kd.student_bypass_weight=0.3

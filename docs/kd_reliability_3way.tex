@@ -1,0 +1,18 @@
+\begin{table}[t]
+\centering
+\caption{Does KD help? Best reliability-KD and logit-KD vs.\ the no-KD baseline
+(task-only, full fine-tuning of the student) across teacher/student directions.
+External-mean Dice; $\Delta$ vs.\ task-only in parentheses; gains in \textbf{bold}.
+KD helps only with a strong, well-calibrated teacher distilling into a \emph{smaller}
+student (row 2).}
+\label{tab:kd_threeway}
+\begin{tabular}{l c c c c c}
+\toprule
+Teacher $\to$ Student & Teacher Dice & Task-only & Reliability-KD & Logit-KD & KD \\
+\midrule
+SAM full-FT $\to$ TinyUSFM & 0.57 & 0.642 & 0.631 (-0.011) & 0.554 (-0.088) & hurts \\
+SAM LoRA $\to$ TinyUSFM & 0.71 & 0.648 & \textbf{0.671 (+0.023)} & \textbf{0.672 (+0.024)} & helps \\
+TinyUSFM $\to$ SAM & 0.71 & 0.546 & 0.534 (-0.012) & -- & hurts \\
+\bottomrule
+\end{tabular}
+\end{table}

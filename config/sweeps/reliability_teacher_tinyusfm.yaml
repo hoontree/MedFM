@@ -1,0 +1,44 @@
+# Reliability-aware KD in the TinyUSFM -> SAM direction (teacher = TinyUSFM,
+# student = SAM). This is the project's headline direction (TinyUSFM
+# outperforms SAM), mirrored against the SAM->TinyUSFM sweeps.
+#
+# Lean by design: only target-only vs reliability, plus a small hyperparameter
+# comparison of the reliability/KD knobs. No factor on/off ablation.
+#
+# Teacher TinyUSFM uses its multiclass ft checkpoint (config/model/tinyusfm.yaml,
+# dice 0.7053). Student SAM trains from the pretrained backbone (the trainer
+# nulls the student's fine-tuned checkpoint by default).
+#
+# Run:
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/reliability_teacher_tinyusfm.yaml \
+#       --group reliability_teacher_tinyusfm
+
+base_overrides:
+  - method=unified
+  - teacher=tinyusfm          # reverse direction
+  - student=sam
+  - method.w_task=1.0
+  - method.w_reliability_kd=1.0
+  - method.w_logit_kd=0.0
+  - method.w_logit_cwd=0.0
+  - method.w_feature_cwd=0.0
+  - method.w_uncertainty_kd=0.0
+
+experiments:
+  # --- Core comparison: target-only vs reliability ---
+  task_only:
+    - method.w_reliability_kd=0.0
+  reliability: []             # full reliability map (T=4 default)
+
+  # --- Hyperparameter comparison (reliability/KD knobs; centre = reliability) ---
+  temp_2.0:
+    - method.temperature=2.0
+    - method.reliability_kd.temperature=2.0
+  temp_8.0:
+    - method.temperature=8.0
+    - method.reliability_kd.temperature=8.0
+  tg_wrong_0.25:
+    - method.reliability_kd.teacher_correctness_wrong_weight=0.25
+  sb_weight_0.3:
+    - method.reliability_kd.student_bypass_weight=0.3

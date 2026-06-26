@@ -115,11 +115,24 @@ def get_experiment_tags(cfg: DictConfig) -> list:
             tags.append(f"rd{model_cfg.r_d}")
 
     method_cfg = cfg.get("method", {})
+    # Map cfg.method key → short tag prefix used in log directory names.
+    # New ``w_*`` keys are listed first; legacy greek names follow so old
+    # configs still produce tags.
     coeff_map = {
-        "alpha": "a",
-        "beta": "b",
-        "gamma": "g",
-        "temperature": "T",
+        "w_task":           "task",
+        "w_logit_kd":       "lkd",
+        "w_logit_cwd":      "lcwd",
+        "w_feature_cwd":    "fcwd",
+        "w_reliability_kd": "rkd",
+        "w_uncertainty_kd": "ukd",
+        "temperature":      "T",
+        # legacy aliases (kept until configs migrate)
+        "alpha":     "a",
+        "beta":      "b",
+        "delta":     "d",
+        "zeta":      "z",
+        "eta":       "e",
+        "kd_lambda": "ukd",
     }
     for key, tag in coeff_map.items():
         if (val := method_cfg.get(key)) is not None:
@@ -137,13 +150,18 @@ def create_log_dir(cfg: DictConfig) -> Path:
     tags = get_experiment_tags(cfg)
     tag_suffix = "_" + "_".join(tags) if tags else ""
 
+    # Human label (sweeps set cfg.run_name) goes into the dir so runs are
+    # self-identifying without parsing logs.
+    run_name = cfg.get("run_name")
+    label = f"_{run_name}" if run_name else ""
+
     teacher_name = cfg.get("teacher")
     student_name = cfg.get("student")
     return (
         Path(cfg.output.dir)
         / "distill"
         / f"{teacher_name}_to_{student_name}"
-        / f"{timestamp}{tag_suffix}"
+        / f"{timestamp}{label}{tag_suffix}"
     )
 
 
@@ -187,9 +205,12 @@ def save_experiment_summary(cfg: DictConfig, log_dir: Path):
             "[Distillation Method]",
             f"  Name: {cfg.method.name}",
             f"  Temperature: {cfg.method.get('temperature', 'N/A')}",
-            f"  Alpha (task): {cfg.method.get('alpha', 'N/A')}",
-            f"  Beta (distill): {cfg.method.get('beta', 'N/A')}",
-            f"  Gamma (feature): {cfg.method.get('gamma', 'N/A')}",
+            f"  w_task (task):                   {cfg.method.get('w_task', cfg.method.get('alpha', 'N/A'))}",
+            f"  w_logit_kd (logit-KD):           {cfg.method.get('w_logit_kd', cfg.method.get('beta', 'N/A'))}",
+            f"  w_logit_cwd (logit-CWD):         {cfg.method.get('w_logit_cwd', cfg.method.get('delta', 'N/A'))}",
+            f"  w_feature_cwd (feature-CWD):     {cfg.method.get('w_feature_cwd', cfg.method.get('zeta', 'N/A'))}",
+            f"  w_reliability_kd (reliability):  {cfg.method.get('w_reliability_kd', cfg.method.get('eta', 'N/A'))}",
+            f"  w_uncertainty_kd (uncertainty):  {cfg.method.get('w_uncertainty_kd', cfg.method.get('kd_lambda', 'N/A'))}",
             "",
             "[Dataset]",
             f"  Name: {get_dataset_short_name(cfg)}",

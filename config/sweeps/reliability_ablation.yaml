@@ -1,0 +1,90 @@
+# Reliability-aware KD ablation manifest.
+#
+# Each entry under `experiments` maps an experiment name to a list of Hydra
+# overrides applied on top of the base distill config (config_name in the
+# runner). `tools/run_reliability_ablation.py` reads this file, prepends
+# `method.name=relab_<name>` (so log dirs / W&B runs are distinguishable),
+# and dispatches every experiment across the available GPU workers.
+#
+# Defaults (from config/method/unified.yaml) for reference:
+#   confidence_mode=max_prob, use_entropy_penalty=true,
+#   use_teacher_correctness_gate=true (wrong_weight=0.0),
+#   use_student_bypass=true (bypass_weight=0.1, margin=0.0, wrong_teacher=0.0),
+#   temperature=4.0, training.batch_size=8
+#
+# Group b2_student_bypass / the unmodified unified.yaml is the full default map.
+# entropy_penalty is fixed ON and confidence_mode is fixed to max_prob for
+# every experiment (neither is ablated).
+
+# Applied to every experiment (keep reliability-KD the only active KD).
+base_overrides:
+  - method=unified
+  - method.w_task=1.0
+  - method.w_reliability_kd=1.0
+  - method.w_logit_kd=0.0
+  - method.w_logit_cwd=0.0
+  - method.w_feature_cwd=0.0
+  - method.w_uncertainty_kd=0.0
+
+experiments:
+  # --- A. Baselines (context) ---
+  base_task_only:
+    - method.w_reliability_kd=0.0
+  base_logit_kd:
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=1.0
+  base_uncertainty_kd:
+    - method.w_reliability_kd=0.0
+    - method.w_uncertainty_kd=1.0
+    - method.use_uncertainty_weighted_kd=true
+
+  # --- B. Additive factor build-up (entropy_penalty fixed ON) ---
+  b0_base:                                  # confidence x entropy
+    - method.reliability_kd.use_teacher_correctness_gate=false
+    - method.reliability_kd.use_student_bypass=false
+  b1_teacher_gate:                          # + teacher correctness gate
+    - method.reliability_kd.use_student_bypass=false
+  b2_student_bypass: []   # == unified.yaml default (full map)
+  b3_smoothing:                             # + prediction-aware spatial smoothing
+    - method.reliability_kd.use_reliability_smoothing=true
+
+  # --- B'. Leave-one-out from the full map ---
+  lo_no_teacher_gate:
+    - method.reliability_kd.use_teacher_correctness_gate=false
+  lo_no_student_bypass:
+    - method.reliability_kd.use_student_bypass=false
+
+  # confidence_mode is fixed to max_prob (unified.yaml default) for every run.
+
+  # --- D. Gate weight sensitivity (deviations from the full-map defaults
+  #        teacher wrong_weight=0.0, student bypass_weight=0.1) ---
+  tg_wrong_0.1:
+    - method.reliability_kd.teacher_correctness_wrong_weight=0.1
+  tg_wrong_0.5:
+    - method.reliability_kd.teacher_correctness_wrong_weight=0.5
+  sb_weight_0.0:
+    - method.reliability_kd.student_bypass_weight=0.0
+  sb_weight_0.3:
+    - method.reliability_kd.student_bypass_weight=0.3
+
+  # --- E. Temperature (softens both the KD target and the reliability map) ---
+  temp_2.0:
+    - method.temperature=2.0
+    - method.reliability_kd.temperature=2.0
+  temp_4.0:
+    - method.temperature=4.0
+    - method.reliability_kd.temperature=4.0
+  temp_6.0:
+    - method.temperature=6.0
+    - method.reliability_kd.temperature=6.0
+  temp_8.0:
+    - method.temperature=8.0
+    - method.reliability_kd.temperature=8.0
+
+  # --- F. Batch size ---
+  bs_4:
+    - training.batch_size=4
+  bs_8:
+    - training.batch_size=8
+  bs_16:
+    - training.batch_size=16

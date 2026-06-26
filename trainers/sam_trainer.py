@@ -17,7 +17,8 @@ import wandb
 from hydra.utils import instantiate
 from .base_trainer import BaseTrainer
 from utils.data_processing_seg import SegDatasetProcessor
-from utils.sam_utils import DiceLoss
+from utils.criterion import DiceLoss
+from monai.losses import DiceLoss as MonaiDiceLoss
 
 
 class SAMTrainer(BaseTrainer):
@@ -136,13 +137,25 @@ class SAMTrainer(BaseTrainer):
         """Setup loss functions based on number of classes."""
         num_classes = self.cfg.data.num_classes
 
+        # Targets arrive already one-hot encoded ([B, C, H, W] float), so
+        # to_onehot_y stays False. The activation is fixed at construction time
+        # (MonaiDiceLoss has no per-call `activation` arg): sigmoid for binary,
+        # softmax for multi-class.
         if num_classes == 1:
             pos_weight = torch.tensor([5.0], device=self.device)
             self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            self.dice_loss = MonaiDiceLoss(
+                include_background=True,
+                to_onehot_y=False,
+                sigmoid=True,
+            )
         else:
             self.ce_loss = CrossEntropyLoss()
-
-        self.dice_loss = DiceLoss(num_classes)
+            self.dice_loss = MonaiDiceLoss(
+                include_background=False,  # Exclude background from Dice loss
+                to_onehot_y=False,
+                softmax=True,
+            )
 
     def _calc_loss(self, outputs, label_batch, low_res_label_batch):
         """Calculate loss using unified channel-based approach."""
@@ -174,7 +187,7 @@ class SAMTrainer(BaseTrainer):
             # target is one-hot [B, C, H, W] float; CE expects class index [B, H, W] long
             target_idx = target.argmax(dim=1).long()
             loss_ce = self.ce_loss(logits, target_idx)
-            loss_dice = self.dice_loss(logits, target, softmax=True, sigmoid=False)
+            loss_dice = self.dice_loss(logits, target)
 
         loss_moe = outputs.get("moe_loss", torch.tensor(0.0, device=logits.device))
         if not torch.is_tensor(loss_moe):

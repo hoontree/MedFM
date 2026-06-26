@@ -5,12 +5,16 @@ _target_: distillers.UnifiedDistiller
 name: unified
 temperature: 4.0
 
-# Loss weights (set to 0.0 to disable a component)
-alpha: 1.0   # Task loss (GT Dice/CE)
-beta: 1.0    # Logit KD (KL Divergence)
-gamma: 0     # Feature KD (MSE on intermediate layers)
-delta: 0.0   # Channel-wise distillation on logits  (CWD, ICCV 2021)
-zeta: 0.0    # Channel-wise distillation on features (CWD on intermediate layers)
+# Loss weights (set to 0.0 to disable a component; module is skipped at init)
+w_task:           1.0   # Task loss (GT Dice/CE)
+w_logit_kd:       0.0   # Logit KD (KL divergence)
+w_logit_cwd:      0.0   # Channel-wise distillation on logits  (CWD, ICCV 2021)
+w_feature_cwd:    0.0   # Channel-wise distillation on features (CWD on intermediate layers)
+w_reliability_kd: 1.0   # Reliability-weighted KD (uses build_reliability_map)
+w_uncertainty_kd: 0.0   # Uncertainty-weighted KD (entropy-driven weighting)
+
+# When true, rescale active weights so the total loss is a convex combination.
+normalize_weights: false
 
 # CWD temperature (defaults to `temperature` if unset). Paper recommends τ=4.
 cwd_temperature: 4.0
@@ -18,17 +22,51 @@ cwd_temperature: 4.0
 # Task loss components
 use_dice: true
 use_ce: true
+pos_weight: 5.0  # positive-class BCE weight (binary only; ignored when num_classes>1)
 
-# --- Feature Distillation Settings (gamma > 0 or zeta > 0) ---
+# --- Feature alignment for w_feature_cwd > 0 ---
 # Just list transformer block indices to align between teacher & student.
 # Module paths and channel counts are auto-detected, so the same yaml works
 # regardless of which model is teacher vs student.
 feature_pairs: [7, 9, 11]
 
-# --- Uncertainty-Weighted KD (disabled by default) ---
-use_uncertainty_weighted_kd: true
-kd_lambda: 1.0                   # weight for uncertainty KD term in total loss
-kd_tau: 4.0                      # temperature (defaults to same as `temperature`)
-uncertainty_weight_type: linear  # "linear" or "exp"
-uncertainty_beta: 1.0            # decay rate for exp mode
-uncertainty_eps: 1.0e-8          # log-stability epsilon for entropy
+# --- Reliability-weighted KD (w_reliability_kd > 0 to enable) ---
+# Instantiated as a functools.partial of build_reliability_map; the distiller
+# fills in the runtime tensors (teacher_logits / student_logits / gt) per step.
+# `temperature` / `eps` are also reused to construct ReliabilityWeightedKDLoss.
+reliability_kd:
+  _target_: utils.reliability_kd.build_reliability_map
+  _partial_: true
+  temperature: 4.0
+  confidence_mode: max_prob          # max_prob | foreground | entropy | margin
+  use_entropy_penalty: true
+  # GT-conditioned teacher correctness gate (teacher_correctness_gate)
+  # Only factor that suppresses a confidently-WRONG teacher: looks at
+  # teacher_pred == gt directly, independent of the student.
+  use_teacher_correctness_gate: true        # disable KD where teacher disagrees with GT
+  teacher_correctness_wrong_weight: 0.0      # KD weight where teacher is wrong (0 = off)
+  teacher_correctness_correct_weight: 1.0    # KD weight where teacher is correct
+  teacher_correctness_binary_threshold: 0.5  # foreground threshold (binary)
+  # GT-conditioned student-bypass gate (gt_correct_student_bypass_gate)
+  use_student_bypass: true          # compares student vs teacher vs GT
+  student_bypass_margin: 0.0         # student conf must exceed teacher by this
+  student_bypass_weight: 0.1         # KD weight where student is confidently correct
+  student_bypass_default_weight: 1.0 # KD weight for unmatched pixels
+  student_bypass_wrong_teacher_weight: 0.0  # KD weight where both are wrong
+  student_bypass_binary_threshold: 0.5      # foreground threshold (binary)
+  # Prediction-aware spatial smoothing (prediction_aware_reliability_smoothing)
+  # Bilateral-style averaging of the composed map: reliability is shared among
+  # neighbours the teacher predicts similarly, without bleeding across edges.
+  use_reliability_smoothing: false   # enable post-hoc smoothing of the map
+  smoothing_kernel_size: 5           # odd local window size
+  smoothing_sigma: 0.5               # affinity bandwidth (smaller = sharper edges)
+  confidence_clip: null              # e.g. [0.05, 0.95]
+  ignore_index: null
+  eps: 1.0e-8
+
+# --- Uncertainty-Weighted KD ---
+use_uncertainty_weighted_kd: false   # master switch (false disables w_uncertainty_kd too)
+kd_tau: 4.0                          # temperature (defaults to same as `temperature`)
+uncertainty_weight_type: linear      # "linear" or "exp"
+uncertainty_beta: 1.0                # decay rate for exp mode
+uncertainty_eps: 1.0e-8              # log-stability epsilon for entropy

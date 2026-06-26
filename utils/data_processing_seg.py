@@ -94,6 +94,13 @@ def _build_balanced_sampler(
     normal_cap = sampling_cfg.get("normal_cap", None)
     num_samples_cfg = sampling_cfg.get("num_samples", None)
     replacement = bool(sampling_cfg.get("replacement", True))
+    # Decouple the two effects: when True, each dataset's total sampling mass is
+    # renormalized to exactly N_d^alpha *after* class reweighting, so `alpha`
+    # controls dataset balance and `class_weights` control the class mix *within*
+    # each dataset independently. When False, the legacy multiplicative behaviour
+    # is used (class_weights leak into the dataset draw probability). This is a
+    # no-op when class_weights are uniform, so it is safe to leave on.
+    decouple = bool(sampling_cfg.get("decouple_dataset_class", True))
 
     # Group dataset entries by source name (original + augmented share weight per N_d)
     name_to_total_n: Dict[str, int] = {}
@@ -104,25 +111,32 @@ def _build_balanced_sampler(
         per_ds_meta.append((name, n, labels))
         name_to_total_n[name] = name_to_total_n.get(name, 0) + n
 
-    # Dataset-level weight per sample: (N_d^alpha) / N_d_effective
-    # We use `name_to_total_n` (includes augmented copies) as the effective count.
-    weights: List[float] = []
+    # Step 1: per-sample class weight only. The dataset factor is applied in
+    # step 3 so that `normal_cap` (step 2) and the optional decoupling can reason
+    # about within-dataset class fractions cleanly.
+    total_samples = sum(n for _, n, _ in per_ds_meta)
+    weights_t = torch.zeros(total_samples, dtype=torch.double)
+    block_ranges: Dict[str, List[tuple]] = {}  # name -> [(start, end), ...]
     class_count_by_name: Dict[str, Dict[int, int]] = {}
-    for name, n, labels in per_ds_meta:
-        N_d = max(name_to_total_n[name], 1)
-        ds_weight = (N_d ** alpha) / N_d
+    missing_label_names: List[str] = []
+    idx = 0
+    for ds, (name, n, labels) in zip(train_datasets, per_ds_meta):
+        if getattr(ds, "class_labels", None) is None:
+            missing_label_names.append(name)
         ccount = class_count_by_name.setdefault(name, {})
-        for lbl in labels:
-            ccount[lbl] = ccount.get(lbl, 0) + 1
-            cls_w = class_weights.get(int(lbl), 1.0)
-            weights.append(ds_weight * cls_w)
+        cur = torch.empty(n, dtype=torch.double)
+        for j, lbl in enumerate(labels):
+            ccount[int(lbl)] = ccount.get(int(lbl), 0) + 1
+            cur[j] = class_weights.get(int(lbl), 1.0)
+        weights_t[idx: idx + n] = cur
+        block_ranges.setdefault(name, []).append((idx, idx + n))
+        idx += n
 
-    weights_t = torch.as_tensor(weights, dtype=torch.double)
-
-    # Optional cap on the *expected fraction* of normal-class draws per dataset.
-    # If a dataset has too much normal share relative to `normal_cap`, scale its
-    # normal-class weights down so expected normal fraction within that dataset
-    # equals `normal_cap`.
+    # Step 2: optional cap on the *expected fraction* of normal-class draws per
+    # dataset. If a dataset has too much normal share relative to `normal_cap`,
+    # scale its normal-class weights down so the expected normal fraction within
+    # that dataset equals `normal_cap`. Operates on class weights only; invariant
+    # to the uniform per-dataset factor applied in step 3.
     if normal_cap is not None:
         cap = float(normal_cap)
         idx = 0
@@ -142,6 +156,29 @@ def _build_balanced_sampler(
                     weights_t[idx: idx + n] = cur_w
             idx += n
 
+    # Step 3: apply the dataset factor so dataset draw probability ∝ N_d^alpha.
+    #   decouple=True  -> renormalize each dataset's mass to exactly N_d^alpha,
+    #                     keeping the within-dataset class mix from steps 1-2.
+    #                     => p_d ∝ N_d^alpha regardless of class composition.
+    #   decouple=False -> legacy: multiply every sample by N_d^alpha / N_d, so a
+    #                     skewed class mix leaks into the dataset draw probability.
+    # Both are identical when class_weights are uniform and normal_cap is null.
+    for name, ranges in block_ranges.items():
+        N_d = max(name_to_total_n[name], 1)
+        if decouple:
+            s_d = sum(weights_t[a:b].sum().item() for a, b in ranges)
+            if s_d <= 0:
+                continue
+            scale = (N_d ** alpha) / s_d
+        else:
+            scale = (N_d ** alpha) / N_d
+        for a, b in ranges:
+            weights_t[a:b] *= scale
+
+    if missing_label_names and class_weights != _DEFAULT_CLASS_WEIGHTS:
+        print(f"[sampler]   WARNING: no class_labels for {sorted(set(missing_label_names))}; "
+              f"class_weights treated all their samples as benign (label=1).")
+
     num_samples = int(num_samples_cfg) if num_samples_cfg else int(weights_t.numel())
     generator = None
     seed = sampling_cfg.get("seed", None)
@@ -152,7 +189,8 @@ def _build_balanced_sampler(
     # Diagnostics
     print("[sampler] BalancedSampler enabled")
     print(f"[sampler]   alpha={alpha} class_weights={class_weights} "
-          f"normal_cap={normal_cap} num_samples={num_samples} replacement={replacement}")
+          f"normal_cap={normal_cap} decouple={decouple} "
+          f"num_samples={num_samples} replacement={replacement}")
     all_w_sum = weights_t.sum().item()
     for name, total_n in name_to_total_n.items():
         ccount = class_count_by_name.get(name, {})

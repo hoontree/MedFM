@@ -1,0 +1,49 @@
+# Controlled fine-tuning baselines: SAM and TinyUSFM trained directly on the GT
+# task (NO distillation), with balanced sampling OFF vs ON.
+#
+# CONTROL PROTOCOL (hold everything fixed except the variable under test):
+#   * seed                : 42 (hardware.seed AND data.sampling.seed)
+#   * data / splits       : dynamic (BUSBRA/BUSI/B train, BUID/BUS_UCLM/... ext)
+#   * num_classes         : 3 (multiclass)
+#   * epochs / stopping   : 1000 cap, early-stopping patience 15, min_delta 1e-6
+#   * optimiser / sched   : AdamW lr 1e-4, cosine + warmup, min_lr 1e-6
+#   * checkpoint selection: best validation Dice
+#   * eval                : identical external test sets (BUID, BUS_UCLM, *_filtered)
+#   * sampler (when ON)   : alpha=0.5, class_weights 1/1/1, normal_cap=null
+#
+# The ONLY differences within a model are sampling off/on (and, across models,
+# the architecture + its native batch size — SAM bs32 / TinyUSFM bs8 — which is
+# not cross-controllable, so SAM-vs-TinyUSFM is read as architecture, while
+# off-vs-on is the controlled sampling effect within each model).
+#
+# These are launched with train.py (NOT distill.py); see commands below. Each run
+# auto-evaluates on the external test sets and writes test_results.txt.
+#
+# Runs (model, sampling, gpu):
+#   sam_ft_off      : model=sam   encoder/decoder=ft   sampling=false   gpu4:1
+#   sam_ft_on       : model=sam   encoder/decoder=ft   sampling=true    (done 0624: val 0.682)
+#   tinyusfm_off    : model=tinyusfm                   sampling=false   gpu4:2
+#   tinyusfm_on     : model=tinyusfm                   sampling=true    gpu4:3
+#
+# Reproduce:
+#   uv run train.py model=sam      data.sampling.enabled=false hardware.seed=42 hardware.gpu_ids=[1]
+#   uv run train.py model=sam      data.sampling.enabled=true  hardware.seed=42 hardware.gpu_ids=[0]
+#   uv run train.py model=tinyusfm data.sampling.enabled=false hardware.seed=42 hardware.gpu_ids=[2]
+#   uv run train.py model=tinyusfm data.sampling.enabled=true  hardware.seed=42 hardware.gpu_ids=[3]
+#
+# This file documents the protocol; it is not consumed by a runner (the existing
+# dispatcher targets distill.py). Aggregate results with tools/summarize_baselines.py.
+
+control:
+  seed: 42
+  num_epochs: 1000
+  early_stopping_patience: 15
+  lr: 1.0e-4
+  selection_metric: Dice
+  sampler: {alpha: 0.5, class_weights: {0: 1.0, 1: 1.0, 2: 1.0}, normal_cap: null}
+
+matrix:
+  - {name: sam_ft_off,   model: sam,      sampling: false}
+  - {name: sam_ft_on,    model: sam,      sampling: true}
+  - {name: tinyusfm_off, model: tinyusfm, sampling: false}
+  - {name: tinyusfm_on,  model: tinyusfm, sampling: true}

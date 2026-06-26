@@ -19,7 +19,7 @@ from transformers import (
 from .base_trainer import BaseTrainer
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
-from utils.sam_utils import DiceLoss
+from utils.criterion import DiceLoss
 from utils.schedule import WarmupPolyLR
 
 

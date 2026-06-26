@@ -11,10 +11,8 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from hydra.utils import instantiate
-import wandb
 
 from .base_trainer import BaseTrainer
-from utils.data_processing_seg import SegDatasetProcessor
 from utils.load_model_seg import load_model_seg
 from omegaconf import OmegaConf
 from utils.schedule import build_scheduler, get_lr_decay_param_groups

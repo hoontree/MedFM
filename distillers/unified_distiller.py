@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, List, Optional, Tuple
-from distillers.base_distiller import BaseDistiller
+from distillers.base_distiller import BaseDistiller, resolve_loss_weight
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +12,12 @@ logger = logging.getLogger(__name__)
 from utils.criterion import (
     TaskLoss,
     LogitDistillLoss,
-    FeatureDistillLoss,
     UncertaintyWeightedKDLoss,
     ChannelWiseDistillLoss,
+    ReliabilityWeightedKDLoss,
 )
+from hydra.utils import instantiate
+from monai.losses import DiceLoss, MaskedDiceLoss, FocalLoss, GeneralizedDiceLoss, DiceFocalLoss
 from utils.feature_extractor import FeatureExtractor
 
 
@@ -35,70 +37,148 @@ class FeatureAdapter(nn.Module):
 
 
 class UnifiedDistiller(BaseDistiller):
-    """
-    Unified distillation supporting multiple components controlled by coefficients.
-    1. Task Loss (GT Dice/CE) - alpha
-    2. Logit Distillation (KL Div) - beta
-    3. Feature Distillation (MSE on intermediate layers) - gamma
+    """Unified distillation supporting multiple loss components.
+
+    Each loss is gated by a non-negative weight in ``cfg.method``; setting
+    the weight to 0 disables (and skips constructing) the corresponding
+    module to save memory. Weight keys are semantic ``w_<component>``:
+
+        w_task            - Task loss (GT Dice / CE)
+        w_logit_kd        - Logit KD (KL divergence)
+        w_logit_cwd       - Channel-wise distillation on the final logit map
+        w_feature_cwd     - Channel-wise distillation on intermediate features
+        w_reliability_kd  - Reliability-weighted KD (uses build_reliability_map)
+        w_uncertainty_kd  - Uncertainty-weighted KD (entropy-driven weighting)
+
+    Legacy aliases (``alpha`` / ``beta`` / ``delta`` / ``zeta`` / ``eta`` /
+    ``kd_lambda``) are still accepted with a deprecation warning.
+
+    Optional ``cfg.method.normalize_weights=true`` divides every active
+    weight by their sum so the total loss is a convex combination of
+    components. Disabled by default to preserve the original scale.
     """
 
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg)
         self.num_classes = cfg.data.num_classes
+        m = cfg.method
 
-        # Task Loss components
-        self.use_dice = cfg.method.get("use_dice", True)
-        self.use_ce = cfg.method.get("use_ce", True)
+        # --- Loss weights -------------------------------------------------
+        # (w_task / w_logit_kd come from BaseDistiller; the rest are added here.)
+        self.w_logit_cwd = resolve_loss_weight(m, "w_logit_cwd", 0.0)
+        self.w_feature_cwd = resolve_loss_weight(m, "w_feature_cwd", 0.0)
+        self.w_reliability_kd = resolve_loss_weight(m, "w_reliability_kd", 0.0)
+        self.w_uncertainty_kd = resolve_loss_weight(m, "w_uncertainty_kd", 1.0)
+        self.use_uncertainty_kd = bool(m.get("use_uncertainty_weighted_kd", False))
 
-        self.task_loss_fn = TaskLoss(
-            num_classes=self.num_classes,
-            use_ce=self.use_ce,
-            use_dice=self.use_dice,
-        )
-        self.logit_loss_fn = LogitDistillLoss(
-            num_classes=self.num_classes,
-            temperature=self.temperature,
-        )
-        self.feature_loss_fn = FeatureDistillLoss()
+        # Optional convex-combination normalisation
+        if m.get("normalize_weights", False):
+            self._normalize_weights()
 
-        # Channel-wise distillation (CWD, ICCV 2021) — works on dense
-        # spatial saliency per channel. Two independent application points:
-        #   - logit-CWD  (delta): on the final logit map
-        #   - feature-CWD (zeta): on intermediate features (replaces MSE feat)
-        self.cwd_temperature = cfg.method.get("cwd_temperature", self.temperature)
-        self.delta = float(cfg.method.get("delta", 0.0))  # logit-CWD weight
-        self.zeta = float(cfg.method.get("zeta", 0.0))    # feature-CWD weight
-        self.cwd_loss_fn = ChannelWiseDistillLoss(temperature=self.cwd_temperature)
-
-        # Uncertainty-weighted KD (optional)
-        self.use_uncertainty_kd = cfg.method.get("use_uncertainty_weighted_kd", False)
-        self.kd_lambda = cfg.method.get("kd_lambda", 1.0)
-        if self.use_uncertainty_kd:
-            self.uncertainty_kd_fn = UncertaintyWeightedKDLoss(
-                num_classes=self.num_classes,
-                tau=cfg.method.get("kd_tau", self.temperature),
-                weight_type=cfg.method.get("uncertainty_weight_type", "linear"),
-                beta=cfg.method.get("uncertainty_beta", 1.0),
-                eps=cfg.method.get("uncertainty_eps", 1e-8),
+        # --- Task loss (w_task) ------------------------------------------
+        self.use_dice = m.get("use_dice", True)
+        self.use_ce = m.get("use_ce", True)
+        self.task_loss_fn = (
+            TaskLoss(
+                use_ce=self.use_ce,
+                use_dice=self.use_dice,
+                pos_weight=float(m.get("pos_weight", 5.0)),
             )
+            if self.w_task > 0
+            else None
+        )
 
-        # Feature pairs: list of transformer block indices to align between
-        # student and teacher (e.g. [7, 9, 11]). The actual module path
-        # (`backbone.blocks.7` vs `sam.image_encoder.blocks.7` vs
-        # `image_encoder.blocks.7` etc.) is auto-detected per model in
-        # ``prepare()``, so the same yaml works regardless of teacher/student
-        # role assignment.
-        self.feature_pairs: List[int] = self._parse_feature_pairs(cfg.method)
+        # --- Logit KD (w_logit_kd) ---------------------------------------
+        self.logit_loss_fn = (
+            LogitDistillLoss(temperature=self.temperature)
+            if self.w_logit_kd > 0
+            else None
+        )
+
+        # --- Channel-wise distillation (w_logit_cwd / w_feature_cwd) -----
+        self.cwd_temperature = m.get("cwd_temperature", self.temperature)
+        # CWD module is shared by both logit-CWD and feature-CWD; also used
+        # as the default logit-KD when num_classes >= 2.
+        self.cwd_loss_fn = (
+            ChannelWiseDistillLoss(temperature=self.cwd_temperature)
+            if (
+                self.w_logit_cwd > 0
+                or self.w_feature_cwd > 0
+                or self.num_classes >= 2
+            )
+            else None
+        )
+
+        # --- Reliability-weighted KD (w_reliability_kd) ------------------
+        # `reliability_kd` is a `_partial_` instantiate spec for
+        # build_reliability_map: Hydra binds the static config args here and
+        # the per-step tensors (teacher/student logits, gt) are supplied in
+        # forward. `temperature` / `eps` are reused for the loss module.
+        rkd_cfg = m.get("reliability_kd", {}) or {}
+        self.reliability_kd_fn = (
+            ReliabilityWeightedKDLoss(
+                temperature=float(rkd_cfg.get("temperature", self.temperature)),
+                eps=float(rkd_cfg.get("eps", 1e-8)),
+            )
+            if self.w_reliability_kd > 0
+            else None
+        )
+        self._rkd_use_student_bypass = bool(rkd_cfg.get("use_student_bypass", False))
+        self._build_reliability_map = (
+            instantiate(rkd_cfg) if self.w_reliability_kd > 0 else None
+        )
+
+        # --- Uncertainty-weighted KD (w_uncertainty_kd) ------------------
+        self.uncertainty_kd_fn = (
+            UncertaintyWeightedKDLoss(
+                tau=m.get("kd_tau", self.temperature),
+                weight_type=m.get("uncertainty_weight_type", "linear"),
+                beta=m.get("uncertainty_beta", 1.0),
+                eps=m.get("uncertainty_eps", 1e-8),
+            )
+            if self.use_uncertainty_kd and self.w_uncertainty_kd > 0
+            else None
+        )
+
+        # --- Feature alignment infrastructure ----------------------------
+        self.feature_pairs: List[int] = self._parse_feature_pairs(m)
         self.adapters = nn.ModuleDict()  # lazy-initialized in first forward
         self._adapters_built = False
-
-        # Resolved per-block module paths (filled in by ``prepare``)
         self.student_layers: Dict[int, str] = {}
         self.teacher_layers: Dict[int, str] = {}
-
-        # Extractor placeholders
         self.teacher_extractor: Optional[FeatureExtractor] = None
         self.student_extractor: Optional[FeatureExtractor] = None
+
+    def _normalize_weights(self):
+        """Rescale active loss weights so the components sum to ~1.
+
+        Iterates over the canonical ``w_*`` weights, including the
+        uncertainty-KD weight when enabled. Zero weights are treated as
+        disabled and left untouched. Skipped when no positive weight is
+        configured.
+        """
+        names = [
+            "w_task",
+            "w_logit_kd",
+            "w_logit_cwd",
+            "w_feature_cwd",
+            "w_reliability_kd",
+        ]
+        if self.use_uncertainty_kd:
+            names.append("w_uncertainty_kd")
+
+        active = {n: float(getattr(self, n)) for n in names}
+        total = sum(v for v in active.values() if v > 0)
+        if total <= 0:
+            return
+        for name, val in active.items():
+            setattr(self, name, val / total if val > 0 else val)
+        logger.info(
+            "Normalised loss weights: " + " ".join(
+                f"{n}=%.4f" for n in names
+            ),
+            *[getattr(self, n) for n in names],
+        )
 
     @staticmethod
     def _parse_feature_pairs(method_cfg: Any) -> List[int]:
@@ -149,7 +229,10 @@ class UnifiedDistiller(BaseDistiller):
 
     def prepare(self, student: nn.Module, teacher: nn.Module):
         """Resolve per-model block paths and set up extraction hooks."""
-        if not self.feature_pairs:
+        # Skip all feature-hook setup when feature-CWD is disabled: otherwise the
+        # extractors capture intermediate features every forward step only for
+        # them to be discarded (wasted compute/memory on every non-feature run).
+        if not self.feature_pairs or self.w_feature_cwd <= 0:
             return
 
         self.student_layers = self._resolve_block_paths(student, self.feature_pairs)
@@ -192,13 +275,13 @@ class UnifiedDistiller(BaseDistiller):
         return torch.tensor(0.0, device=device)
 
     def _compute_task_loss(self, student_logits, targets):
-        """Task Loss (GT Dice/CE) - alpha"""
-        if self.alpha <= 0:
+        """Task Loss (GT Dice/CE) - w_task."""
+        if self.task_loss_fn is None:
             return self._zero(student_logits.device)
         return self.task_loss_fn(student_logits, targets)
 
     def _compute_logit_loss(self, student_logits, teacher_logits):
-        """Logit Distillation - beta.
+        """Logit Distillation - w_logit_kd.
 
         Binary segmentation (num_classes == 1): standard Hinton-style KD
         (sigmoid + KL) via LogitDistillLoss.
@@ -207,20 +290,58 @@ class UnifiedDistiller(BaseDistiller):
         channel is a better fit than per-pixel softmax-KL for dense
         segmentation.
         """
-        if self.beta <= 0:
+        if self.w_logit_kd <= 0:
             return self._zero(student_logits.device)
         if self.num_classes >= 2:
             return self.cwd_loss_fn(student_logits, teacher_logits)
         return self.logit_loss_fn(student_logits, teacher_logits)
 
+    def _compute_reliability_kd_loss(self, student_logits, teacher_logits, targets):
+        """Reliability-weighted KD - w_reliability_kd.
+
+        Builds a per-pixel reliability map from the teacher prediction
+        and ground truth, then weights ``ReliabilityWeightedKDLoss`` by
+        it. GT-dependent factors (boundary attenuation / student-bypass)
+        use ``targets`` reduced to a class-index mask when multi-class.
+        The student-bypass gate additionally consumes ``student_logits``.
+        """
+        if self.reliability_kd_fn is None:
+            return self._zero(student_logits.device), {}
+
+        # build_reliability_map expects [B, H, W] GT — convert one-hot.
+        gt = targets
+        if gt.dim() == 4:
+            gt = gt.argmax(dim=1) if gt.shape[1] > 1 else gt[:, 0]
+        gt = gt.long()
+
+        with torch.no_grad():
+            reliability, components = self._build_reliability_map(
+                teacher_logits=teacher_logits,
+                student_logits=student_logits if self._rkd_use_student_bypass else None,
+                gt=gt,
+                return_components=True,
+            )
+
+        loss = self.reliability_kd_fn(
+            student_logits, teacher_logits=teacher_logits, reliability=reliability
+        )
+        diagnostics = {
+            "reliability_kd_loss_weighted": (self.w_reliability_kd * loss).item(),
+            "mean_reliability": reliability.mean().item(),
+        }
+        # Log the scale of each reliability component (mean over pixels) so
+        # the relative contribution of confidence / entropy / gates is visible.
+        for name, factor in components.items():
+            diagnostics[f"reliability/{name}_mean"] = factor.mean().item()
+        return loss, diagnostics
+
     def _compute_uncertainty_kd_loss(self, student_logits, teacher_logits):
-        """Uncertainty-weighted KD loss — weighted by kd_lambda."""
-        if not self.use_uncertainty_kd:
+        """Uncertainty-weighted KD loss - w_uncertainty_kd."""
+        if self.uncertainty_kd_fn is None:
             return self._zero(student_logits.device), {}
         loss, uncertainty, weight = self.uncertainty_kd_fn(student_logits, teacher_logits)
         diagnostics = {
-            "uncertainty_kd_loss_raw": loss.item(),
-            "uncertainty_kd_loss_weighted": (self.kd_lambda * loss).item(),
+            "uncertainty_kd_loss_weighted": (self.w_uncertainty_kd * loss).item(),
             "mean_teacher_uncertainty": uncertainty.mean().item(),
             "mean_kd_weight": weight.mean().item(),
         }
@@ -298,26 +419,9 @@ class UnifiedDistiller(BaseDistiller):
                 s_f = self.adapters[key](s_f)
             yield s_f, t_f
 
-    def _compute_feature_loss(self, device):
-        """Feature Distillation (MSE on intermediate layers) - gamma"""
-        if (
-            self.gamma <= 0
-            or self.teacher_extractor is None
-            or self.student_extractor is None
-        ):
-            return self._zero(device)
-
-        feature_loss = self._zero(device)
-        count = 0
-        for s_f, t_f in self._collect_feature_pairs():
-            feature_loss = feature_loss + self.feature_loss_fn(s_f, t_f)
-            count += 1
-
-        return feature_loss / count if count > 0 else feature_loss
-
     def _compute_logit_cwd_loss(self, student_logits, teacher_logits):
-        """Channel-wise distillation on the final logit map - delta"""
-        if self.delta <= 0:
+        """Channel-wise distillation on the final logit map - w_logit_cwd."""
+        if self.w_logit_cwd <= 0 or self.cwd_loss_fn is None:
             return self._zero(student_logits.device)
         # Binary segmentation produces 1-channel fg logits, which collapses
         # CWD's channel-softmax into a degenerate single-channel signal.
@@ -334,9 +438,10 @@ class UnifiedDistiller(BaseDistiller):
         return logits
 
     def _compute_feature_cwd_loss(self, device):
-        """Channel-wise distillation on intermediate features - zeta"""
+        """Channel-wise distillation on intermediate features - w_feature_cwd."""
         if (
-            self.zeta <= 0
+            self.w_feature_cwd <= 0
+            or self.cwd_loss_fn is None
             or self.teacher_extractor is None
             or self.student_extractor is None
         ):
@@ -370,54 +475,65 @@ class UnifiedDistiller(BaseDistiller):
                 align_corners=False,
             )
 
+        # Compute only the components whose weight is non-zero so that
+        # disabled losses never appear in the returned dict. The total loss
+        # accumulates each active component as it is computed.
+        total_loss = self._zero(device)
+
         # 1. Task Loss
-        losses["task_loss"] = self._compute_task_loss(student_logits, targets)
+        if self.w_task > 0:
+            losses["task_loss"] = self._compute_task_loss(student_logits, targets)
+            total_loss = total_loss + self.w_task * losses["task_loss"]
 
         # 2. Logit Distillation
-        losses["distill_loss"] = self._compute_logit_loss(
-            student_logits, teacher_logits
-        )
+        if self.w_logit_kd > 0:
+            losses["distill_loss"] = self._compute_logit_loss(
+                student_logits, teacher_logits
+            )
+            total_loss = total_loss + self.w_logit_kd * losses["distill_loss"]
 
-        # 3. Feature Distillation
-        losses["feature_loss"] = self._compute_feature_loss(device)
+        # 3. Channel-wise distillation (CWD) on logits and/or features
+        if self.w_logit_cwd > 0:
+            losses["logit_cwd_loss"] = self._compute_logit_cwd_loss(
+                student_logits, teacher_logits
+            )
+            total_loss = total_loss + self.w_logit_cwd * losses["logit_cwd_loss"]
+        if self.w_feature_cwd > 0:
+            losses["feature_cwd_loss"] = self._compute_feature_cwd_loss(device)
+            total_loss = total_loss + self.w_feature_cwd * losses["feature_cwd_loss"]
 
-        # 4. Channel-wise distillation (CWD) on logits and/or features
-        losses["logit_cwd_loss"] = self._compute_logit_cwd_loss(
-            student_logits, teacher_logits
-        )
-        losses["feature_cwd_loss"] = self._compute_feature_cwd_loss(device)
+        # 4. Reliability-weighted KD
+        if self.w_reliability_kd > 0:
+            rkd_loss, rkd_diagnostics = self._compute_reliability_kd_loss(
+                student_logits, teacher_logits, targets
+            )
+            losses["reliability_kd_loss"] = rkd_loss
+            losses.update(rkd_diagnostics)
+            total_loss = total_loss + self.w_reliability_kd * rkd_loss
 
-        # Total Loss (Weighted sum with fixed coefficients from cfg)
-        total_loss = (
-            self.alpha * losses["task_loss"]
-            + self.beta * losses["distill_loss"]
-            + self.gamma * losses["feature_loss"]
-            + self.delta * losses["logit_cwd_loss"]
-            + self.zeta * losses["feature_cwd_loss"]
-        )
-
-        # 4. Uncertainty-weighted KD (optional, disabled by default)
-        unc_kd_loss, unc_diagnostics = self._compute_uncertainty_kd_loss(
-            student_logits, teacher_logits
-        )
-        total_loss = total_loss + self.kd_lambda * unc_kd_loss
-        losses["uncertainty_kd_loss"] = unc_kd_loss
-        losses.update(unc_diagnostics)  # flat floats flow into existing step/epoch logging
+        # 5. Uncertainty-weighted KD
+        if self.w_uncertainty_kd > 0:
+            unc_kd_loss, unc_diagnostics = self._compute_uncertainty_kd_loss(
+                student_logits, teacher_logits
+            )
+            losses["uncertainty_kd_loss"] = unc_kd_loss
+            losses.update(unc_diagnostics)
+            total_loss = total_loss + self.w_uncertainty_kd * unc_kd_loss
 
         losses["loss"] = total_loss
 
-        # Log per-component raw and weighted values
+        # Log per-component weighted values (active components only)
         weights = {
-            "task_loss": self.alpha,
-            "distill_loss": self.beta,
-            "feature_loss": self.gamma,
-            "logit_cwd_loss": self.delta,
-            "feature_cwd_loss": self.zeta,
+            "task_loss": self.w_task,
+            "distill_loss": self.w_logit_kd,
+            "logit_cwd_loss": self.w_logit_cwd,
+            "feature_cwd_loss": self.w_feature_cwd,
+            "reliability_kd_loss": self.w_reliability_kd,
+            "uncertainty_kd_loss": self.w_uncertainty_kd,
         }
         for key, weight_val in weights.items():
             if key in losses:
-                raw_val = losses[key].item()
-                losses[f"{key}_weighted"] = weight_val * raw_val
+                losses[f"{key}_weighted"] = weight_val * losses[key].item()
 
         return losses
 
