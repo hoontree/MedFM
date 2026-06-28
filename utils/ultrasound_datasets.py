@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
 import random
@@ -38,6 +39,39 @@ def _format_mask(mask, num_classes):
         return mask_one_hot.permute(2, 0, 1).float()
 
 
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Flattened, typed view of the dataset-cfg fields shared by every
+    ultrasound dataset.
+
+    Subclass-specific fields whose defaults *differ between datasets*
+    (e.g. ``extensions``, ``image_dir``/``mask_dir``, ``filter_empty_masks``)
+    are intentionally NOT collapsed here — each subclass reads those from its
+    own ``cfg`` so the differing defaults stay explicit and local.
+    """
+
+    num_classes: int
+    img_size: int
+    root: Path
+    seed: int = 42
+    normalization: str = "imagenet"
+    task_type: str = "tumor"
+    usage: str = "external"
+
+    @classmethod
+    def from_cfg(cls, cfg) -> "DatasetConfig":
+        """Build from a Hydra/omegaconf node, applying defaults once."""
+        return cls(
+            num_classes=int(cfg.num_classes),
+            img_size=int(cfg.img_size),
+            root=Path(cfg.path.root),
+            seed=getattr(cfg, "seed", 42),
+            normalization=getattr(cfg, "normalization", "imagenet"),
+            task_type=getattr(cfg, "task_type", "tumor"),
+            usage=getattr(cfg, "usage", "external"),
+        )
+
+
 class BaseUltrasoundDataset(Dataset):
     """
     Base class for ultrasound segmentation datasets.
@@ -56,25 +90,25 @@ class BaseUltrasoundDataset(Dataset):
             split: Dataset split ('train', 'val', 'test')
             transform: Whether to apply data augmentation
         """
-        self.cfg = cfg
-        self.num_classes = cfg.num_classes
+        self.dc = DatasetConfig.from_cfg(cfg)
         self.transform = transform
         self.split = split
+
+        # Flatten the common fields onto self for ergonomic access.
+        self.num_classes = self.dc.num_classes
+        self.root = self.dc.root
+        self.seed = self.dc.seed
+        self.normalization = self.dc.normalization
+        self.task_type = self.dc.task_type  # For conditional transforms
+        self.usage = self.dc.usage
 
         # Multiclass mode is determined solely by num_classes (>1 → multiclass).
         self.multiclass = self.num_classes > 1
 
         # Image and mask sizes
-        img_size = int(cfg.img_size)
+        img_size = self.dc.img_size
         self.image_size = (img_size, img_size)
         self.low_res_size = img_size // 4, img_size // 4
-
-        # Common configuration
-        self.seed = getattr(cfg, "seed", 42)
-        self.normalization = getattr(cfg, "normalization", "imagenet")
-        self.task_type = getattr(
-            cfg, "task_type", "tumor"
-        )  # For conditional transforms
 
     def _load_image(self, path: Path) -> Image.Image:
         """
@@ -281,9 +315,8 @@ class BUID(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root and self.usage are set by BaseUltrasoundDataset.
         self.classes = cfg.classes
-        self.usage = getattr(cfg, "usage", "external")
 
         self.images, self.masks, self.class_labels = self._unzip_triples(
             self._collect_paired_files()
@@ -405,14 +438,14 @@ class BUS_UCLM(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.partition_dir = getattr(cfg, "partition_dir", "partitions")
         self.extensions = getattr(
             cfg, "extensions", (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
         )
         self.filter_empty_masks = getattr(cfg, "filter_empty_masks", False)
 
-        if self.cfg.usage == "train":
+        if self.usage == "train":
             # Support both 'val' and 'valid'
             target_split = "val" if split in ["val", "valid"] else split
 
@@ -647,7 +680,7 @@ class BUS_UCLM_filtered(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.partition_dir = getattr(cfg, "partition_dir", "partitions")
         self.extensions = tuple(
             getattr(cfg, "extensions", (".png", ".jpg", ".jpeg", ".bmp", ".tiff"))
@@ -676,7 +709,7 @@ class BUS_UCLM_filtered(BaseUltrasoundDataset):
         return image_files, mask_files
 
     def _index_path(self) -> Path:
-        usage = getattr(self.cfg, "usage", "external")
+        usage = self.usage
         safe_usage = str(usage).replace("/", "_")
         safe_split = str(self.target_split).replace("/", "_")
         return self.filtered_index_dir / (
@@ -684,7 +717,7 @@ class BUS_UCLM_filtered(BaseUltrasoundDataset):
         )
 
     def _build_pairs_from_source(self) -> Tuple[List[Path], List[Path]]:
-        usage = getattr(self.cfg, "usage", "external")
+        usage = self.usage
 
         if usage == "train":
             if self.target_split in ["train", "val"]:
@@ -734,7 +767,7 @@ class BUS_UCLM_filtered(BaseUltrasoundDataset):
         self, index_path: Path, image_files: List[Path], mask_files: List[Path]
     ) -> None:
         payload = {
-            "usage": getattr(self.cfg, "usage", "external"),
+            "usage": self.usage,
             "split": self.target_split,
             "seed": self.seed,
             "filter_empty_masks": self.filter_empty_masks,
@@ -934,7 +967,7 @@ class BUSI(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.classes = cfg.classes
         self.image_suffix = getattr(cfg, "image_suffix", "")
         self.mask_suffix = getattr(cfg, "mask_suffix", "_mask")
@@ -1104,7 +1137,7 @@ class BUSBRA(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.image_prefix = getattr(cfg, "image_prefix", "bus_")
         self.mask_prefix = getattr(cfg, "mask_prefix", "mask_")
         self.extensions = getattr(cfg, "extensions", [".png"])
@@ -1286,7 +1319,7 @@ class B(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.extensions = getattr(cfg, "extensions", [".png"])
 
         self.image_dir_name = getattr(cfg, "image_dir", "original")
@@ -1396,7 +1429,7 @@ class DDTI(BaseUltrasoundDataset):
     def __init__(self, cfg, split, transform: Optional[bool] = False):
         super().__init__(cfg, split, transform)
 
-        self.root = Path(cfg.path.root)
+        # self.root is set by BaseUltrasoundDataset.
         self.extensions = getattr(cfg, "extensions", [".png"])
 
         # Directory structure from yaml or default
