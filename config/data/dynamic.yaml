@@ -2,6 +2,13 @@
 # Use this to specify datasets at runtime via command line:
 # python distill.py data=dynamic data.train='[BUSI,BUSBRA]' data.test='[BUID,BUS_UCLM]'
 
+# Validate this group against the typed schema (config/schema.py::DataConfig).
+# `_self_` last keeps the yaml below as the source of values; the schema only
+# enforces types and rejects unknown keys at compose time.
+defaults:
+  - base_schema
+  - _self_
+
 name: "dynamic"
 type: "Dynamic"
 train: [BUSBRA, BUSI, B]

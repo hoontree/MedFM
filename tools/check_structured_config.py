@@ -74,6 +74,24 @@ def main():
                 if not ok:
                     failures.append(f"{name}.{group}: {info}")
 
+        # --- wiring tests: dynamic.yaml now references base_schema in its
+        # defaults, so compose itself exercises validation. ---
+        # 1. valid CLI-style override is applied (yaml stays the value source).
+        cfg = compose(config_name="distill_sam_to_usfm_binary",
+                      overrides=["data.num_classes=1"])
+        if cfg.data.num_classes != 1:
+            failures.append("wiring: valid override data.num_classes=1 not applied")
+        else:
+            print("[OK] wiring: valid override applied (data.num_classes=1)")
+
+        # 2. wrong-type override is rejected at compose time by the schema.
+        try:
+            compose(config_name="distill_sam_to_usfm_binary",
+                    overrides=["data.num_classes=notanint"])
+            failures.append("wiring: bad-type override NOT rejected")
+        except Exception as e:
+            print(f"[OK] wiring: bad-type override rejected ({type(e).__name__})")
+
     print("\n" + ("=" * 50))
     if failures:
         print("FAILURES:")

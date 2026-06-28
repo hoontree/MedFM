@@ -11,12 +11,17 @@ import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from config.schema import register_schemas
 from utils.hardware import (
     set_gpu,
     release_trainer,
     stage_banner,
     suppress_teacher_wandb_in_sweep,
 )
+
+# Register structured-config schemas before Hydra composes (validates the
+# `data` group against config/schema.py; yaml remains the source of values).
+register_schemas()
 
 log = logging.getLogger(__name__)
 
