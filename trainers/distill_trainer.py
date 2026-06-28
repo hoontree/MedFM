@@ -22,6 +22,7 @@ from utils.distill_utils import (
 )
 from utils.visualize import visualize_segmentation
 from utils.utils import set_seed
+from utils.wandb_utils import resolve_wandb_identity
 from trainers.base_trainer import BaseTrainer
 from omegaconf import OmegaConf, DictConfig
 
@@ -153,36 +154,19 @@ class DistillTrainer(BaseTrainer):
 
     @override
     def _setup_wandb(self):
-        """Override: initialize a single wandb run for the entire distillation process."""
-        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-        wandb_mode = self.cfg.get("wandb", {}).get("mode", None)
-        if self.cfg.get("debug", False) or self.cfg.get("wandb", {}).get("disabled", False):
-            wandb_mode = "disabled"
+        """Override: initialize a single wandb run for the entire distillation process.
 
-        # Prefer the explicit experiment label (run_name) for the W&B run name;
-        # fall back to the teacher/student/method composite.
-        run_label = self.cfg.get("run_name") or self.cfg.method.name
-        exp_name = (
-            None
-            if is_sweep
-            else f"{self.teacher_name}_{self.student_name}_{run_label}"
-        )
-        # Optional grouping/tagging so sweeps (e.g. the reliability ablation)
-        # cluster together in the W&B UI and stay filterable. Both are read
-        # from cfg.wandb when present; absent keys leave W&B defaults.
-        wandb_cfg = self.cfg.get("wandb", {})
-        group = wandb_cfg.get("group", None)
-        tags = wandb_cfg.get("tags", None)
-        if tags is not None:
-            tags = OmegaConf.to_container(tags, resolve=True)
+        Run identity (project/group/name/tags) comes from the shared helper in
+        ``utils.wandb_utils`` so distillation and supervised runs use one scheme;
+        group defaults to ``distill/{method}/{datasets}`` so related runs cluster.
+        """
+        identity = resolve_wandb_identity(self.cfg, default_job_type="distill")
+        if self.cfg.get("debug", False):
+            identity["mode"] = "disabled"
+
         self.wandb_run = wandb.init(
-            project=self.cfg.wandb.project,
-            entity=self.cfg.wandb.entity,
-            name=exp_name,
-            group=group,
-            tags=tags,
             config=OmegaConf.to_container(self.cfg, resolve=True),
-            mode=wandb_mode,
+            **identity,
         )
         self._define_wandb_metrics()
 
@@ -925,21 +909,11 @@ class DistillTrainer(BaseTrainer):
         self.best_model_path = ckpt_path
 
         if wandb.run is None:
+            identity = resolve_wandb_identity(self.cfg, default_job_type="distill")
+            identity["tags"] = ["test-only", *identity["tags"]]
             self.wandb_run = wandb.init(
-                entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
-                project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
-                name=(
-                    f"{self.teacher_name}_{self.student_name}_"
-                    f"{self.cfg.method.name}_test_only_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                ),
                 config=OmegaConf.to_container(self.cfg, resolve=True),
-                tags=["test-only", "distillation"],
-                mode=(
-                    "disabled"
-                    if self.cfg.get("wandb", {}).get("disabled", False)
-                    else self.cfg.get("wandb", {}).get("mode", None)
-                ),
+                **identity,
             )
 
         test_metrics, predictions_cache = self.test(phase="final_test")

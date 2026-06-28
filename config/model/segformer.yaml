@@ -56,8 +56,4 @@ visualization:
   enabled: true
   num_samples: 10               # Number of samples to visualize during test
 
-# WandB configuration
-wandb:
-  project: TinyUSFM
-  entity: hheo
-  log_model: true
+# W&B settings come from the `wandb` config group (selected by the entrypoint).

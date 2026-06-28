@@ -3,3 +3,4 @@ defaults:
   - _self_
   - data: dynamic
   - model: tinyusfm
+  - wandb: train

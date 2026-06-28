@@ -134,7 +134,7 @@ SMOKE_OVERRIDES = [
     "data.test=[B]",
     "training.num_epochs=1",
     "training.warmup_epochs=0",
-    "+wandb.disabled=true",  # new key -> needs '+' under Hydra struct mode
+    "wandb.disabled=true",  # key now provided by the `wandb` config group
 ]
 
 
@@ -169,7 +169,7 @@ def build_overrides(manifest, name, exp_overrides, gpu, extra, smoke, group, res
     # Systematic W&B bookkeeping: shared group + per-run axis/name tags.
     if group:
         overrides.append(f"wandb.group={group}")
-    overrides.append(f"+wandb.tags=[relab,{name},{_axis_tag(name)}]")
+    overrides.append(f"wandb.tags=[relab,{name},{_axis_tag(name)}]")
     # Continue a partially-trained run from its checkpoints/last.pth (the trainer
     # matches by run_name + hparam signature); a fresh experiment just starts.
     if resume:

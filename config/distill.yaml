@@ -3,6 +3,7 @@ defaults:
   - data: dynamic
   - method: unified
   - training: distillation
+  - wandb: distill
   - _self_
 
 trainer:

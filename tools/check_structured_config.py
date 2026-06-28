@@ -17,17 +17,23 @@ from omegaconf import OmegaConf
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from config.schema import DataConfig, TrainingConfig, register_schemas  # noqa: E402
+from config.schema import (  # noqa: E402
+    DataConfig,
+    TrainingConfig,
+    WandbConfig,
+    register_schemas,
+)
+from utils.wandb_utils import resolve_wandb_identity  # noqa: E402
 
 # entry config name -> which groups it carries
 ENTRY_CONFIGS = {
-    "distill_sam_to_usfm_binary": ("data", "training"),
-    "distill_usfm_to_sam_binary": ("data", "training"),
-    "distill": ("data", "training"),
-    "train_sam": ("data", None),  # train_sam pulls training via model/sam
+    "distill_sam_to_usfm_binary": ("data", "training", "wandb"),
+    "distill_usfm_to_sam_binary": ("data", "training", "wandb"),
+    "distill": ("data", "training", "wandb"),
+    "train_sam": ("data", None, "wandb"),  # train_sam pulls training via model/sam
 }
 
-SCHEMAS = {"data": DataConfig, "training": TrainingConfig}
+SCHEMAS = {"data": DataConfig, "training": TrainingConfig, "wandb": WandbConfig}
 
 
 def _merge_check(group, node):
@@ -91,6 +97,42 @@ def main():
             failures.append("wiring: bad-type override NOT rejected")
         except Exception as e:
             print(f"[OK] wiring: bad-type override rejected ({type(e).__name__})")
+
+        # --- wandb identity + run_reliability_ablation.py override style ---
+        # The runner appends wandb.group / wandb.tags / wandb.disabled as plain
+        # (non-'+') overrides now that the wandb group provides those keys.
+        cfg = compose(
+            config_name="distill_sam_to_usfm_binary",
+            overrides=[
+                "data.train=[B,BUSBRA]",
+                "run_name=relab_smpl_reliability",
+                "wandb.group=reliability_teacher_lora",
+                "wandb.tags=[relab,smpl_reliability]",
+                "wandb.disabled=true",
+            ],
+        )
+        ident = resolve_wandb_identity(cfg, default_job_type="distill")
+        checks = {
+            "project": ident["project"] == "medfm-distill",
+            "explicit group honored": ident["group"] == "reliability_teacher_lora",
+            "run_name in name": "relab_smpl_reliability" in (ident["name"] or ""),
+            "explicit tags kept": "relab" in ident["tags"],
+            "auto tags appended": "distill" in ident["tags"] and "B" in ident["tags"],
+            "disabled->mode": ident["mode"] == "disabled",
+        }
+        for label, ok in checks.items():
+            print(f"[{'OK' if ok else 'FAIL'}] wandb identity: {label}")
+            if not ok:
+                failures.append(f"wandb identity: {label} (got {ident})")
+
+        # auto group when none set: "{job}/{method}/{datasets}"
+        cfg2 = compose(config_name="distill_sam_to_usfm_binary",
+                       overrides=["data.train=[BUSBRA]"])
+        g = resolve_wandb_identity(cfg2, "distill")["group"]
+        ok = g == "distill/unified/BUSBRA"
+        print(f"[{'OK' if ok else 'FAIL'}] wandb identity: auto group = {g}")
+        if not ok:
+            failures.append(f"wandb auto group: got {g}")
 
     print("\n" + ("=" * 50))
     if failures:

@@ -24,6 +24,7 @@ from utils.evaluate import Evaluator_seg
 from utils.utils import set_seed
 from utils.data_processing_seg import SegDatasetProcessor
 from utils.distill_utils import get_experiment_tags
+from utils.wandb_utils import resolve_wandb_identity
 
 _UNSET = object()  # sentinel for "use config default"
 
@@ -177,23 +178,18 @@ class BaseTrainer(ABC):
         self.logger = setup_logger(str(log_file), logger_name="medfm.train")
 
     def _setup_wandb(self):
-        """Setup Weights & Biases logging."""
-        wandb_config = self.cfg.get("wandb", {})
-        wandb_mode = wandb_config.get("mode", None)
-        if wandb_config.get("disabled", False):
-            wandb_mode = "disabled"
+        """Setup Weights & Biases logging.
 
-        # In a sweep, wandb handles the run name. For regular runs, use a custom name.
-        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-        run_name = None if is_sweep else self._get_wandb_run_name()
+        Run identity (project/group/name/tags) is composed by the shared helper
+        in ``utils.wandb_utils`` so supervised and distillation runs follow one
+        consistent scheme. The full resolved config is logged as the run config.
+        """
+        identity = resolve_wandb_identity(self.cfg, default_job_type="train")
 
         self.wandb_run = wandb.init(
-            entity=wandb_config.get("entity", "hheo"),
-            project=wandb_config.get("project", "medical_foundation_models"),
-            name=run_name,
             config=self._build_wandb_config(),
             dir=str(self.exp_dir),
-            mode=wandb_mode,
+            **identity,
         )
 
         self._define_wandb_metrics()
@@ -228,40 +224,15 @@ class BaseTrainer(ABC):
         for pat in ("lr", "lr/*", "distill/lr", "distill/lr/*"):
             wandb.define_metric(pat, step_metric="global_step")
 
-    def _get_wandb_run_name(self) -> str:
-        """Return the W&B run name for non-sweep runs. Subclasses can override."""
-        return (
-            f"{self.cfg.model.get('encoder_mode', 'default')}_encoder"
-            f"_{self.cfg.model.get('decoder_mode', 'default')}_decoder"
-            f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-
     def _build_wandb_config(self) -> Dict[str, Any]:
-        """Build W&B config payload.
+        """Build the W&B run config: the full resolved Hydra config.
 
-        If ``wandb.log_config`` is defined in the config, it is used as-is
-        (subconfigs can reference other keys via Hydra interpolation).
-        Otherwise, falls back to extracting model and training sections.
+        Logging the whole config avoids the drift that hand-maintained
+        ``wandb.log_config`` blocks suffered from; the run identity (name/group/
+        tags) is handled separately by :func:`utils.wandb_utils.resolve_wandb_identity`.
         """
-        wandb_cfg = self.cfg.get("wandb", {})
-
-        # Explicit log_config block takes precedence
-        if "log_config" in wandb_cfg:
-            result = OmegaConf.to_container(wandb_cfg.log_config, resolve=True)
-            if isinstance(result, dict):
-                return result
-
-        # Fallback: extract model and training sections
-        run_config: Dict[str, Any] = {}
-        if "model" in self.cfg:
-            model_cfg = OmegaConf.to_container(self.cfg.model, resolve=True)
-            if isinstance(model_cfg, dict):
-                run_config["model"] = model_cfg
-        if "training" in self.cfg:
-            training_cfg = OmegaConf.to_container(self.cfg.training, resolve=True)
-            if isinstance(training_cfg, dict):
-                run_config["training"] = training_cfg
-        return run_config
+        result = OmegaConf.to_container(self.cfg, resolve=True)
+        return result if isinstance(result, dict) else {}
 
     def _setup_early_stopping(self):
         """Setup early stopping."""
@@ -1087,18 +1058,12 @@ class BaseTrainer(ABC):
 
         self._load_checkpoint(checkpoint_path)
 
-        # Initialize wandb for test-only run
+        # Initialize wandb for test-only run (same identity scheme, eval job).
+        identity = resolve_wandb_identity(self.cfg, default_job_type="eval")
+        identity["tags"] = ["test-only", *identity["tags"]]
         self.wandb_run = wandb.init(
-            entity=self.cfg.get("wandb", {}).get("entity", "hheo"),
-            project=self.cfg.get("wandb", {}).get("project", "TinyUSFM"),
-            name=f"{self.cfg.model.name}_test_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config=self._build_wandb_config(),
-            tags=["test-only"],
-            mode=(
-                "disabled"
-                if self.cfg.get("wandb", {}).get("disabled", False)
-                else self.cfg.get("wandb", {}).get("mode", None)
-            ),
+            **identity,
         )
 
         # Run test

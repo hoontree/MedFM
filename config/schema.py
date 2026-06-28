@@ -83,6 +83,25 @@ class TrainingConfig:
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
 
 
+@dataclass
+class WandbConfig:
+    """W&B run identity + logging behaviour (``wandb`` group).
+
+    ``group``/``name`` are ``None`` by default; the trainer fills them in from
+    the run's hyper-parameters (see ``utils/wandb_utils.py``) unless overridden.
+    """
+
+    entity: str = "hheo"
+    project: str = "medfm"
+    job_type: str = "train"
+    group: Optional[str] = None
+    name: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    mode: Optional[str] = None  # None | online | offline | disabled
+    disabled: bool = False
+    log_model: bool = True
+
+
 def register_schemas(cs: Optional[ConfigStore] = None) -> ConfigStore:
     """Register the schemas under their config groups (name ``base_schema``).
 
@@ -91,4 +110,5 @@ def register_schemas(cs: Optional[ConfigStore] = None) -> ConfigStore:
     cs = cs or ConfigStore.instance()
     cs.store(group="data", name="base_schema", node=DataConfig)
     cs.store(group="training", name="base_schema", node=TrainingConfig)
+    cs.store(group="wandb", name="base_schema", node=WandbConfig)
     return cs

@@ -132,9 +132,6 @@ class TinyUSFMTrainer(BaseTrainer):
         lr = self.cfg.training.get("lr", 0.0001)
         self.logger.info(f"Optimizer: AdamW, LR: {lr}")
 
-    def _get_wandb_run_name(self) -> str:
-        return f"TinyUSFM_{self.exp_dir_name}"
-
     def _create_scheduler(self):
         """Create learning rate scheduler."""
         use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(

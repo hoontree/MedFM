@@ -3,6 +3,7 @@ defaults:
   - data: dynamic
   - method: cwd_feature
   - training: distillation
+  - wandb: distill
   - _self_
 
 trainer:

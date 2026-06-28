@@ -52,18 +52,6 @@ output:
 visualization:
   num_samples: 10                 # Number of samples to visualize during test
 
-# WandB configuration
-wandb:
-  project: TinyUSFM_Seg
-  entity: hheo
-  log_config:
-    model:
-      name: TinyUSFM
-      decoder_type: ${model.decoder_type}
-    training:
-      lr: ${training.lr}
-      batch_size: ${training.batch_size}
-      train_head_only: ${training.train_head_only}
-    data:
-      num_classes: ${data.num_classes}
-  mode: online
+# W&B settings live in the `wandb` config group (config/wandb/train.yaml),
+# selected via the entrypoint's defaults list. Run name/group/tags are
+# auto-composed in utils/wandb_utils.py; the full resolved config is logged.
