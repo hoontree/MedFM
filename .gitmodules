@@ -1,0 +1,4 @@
+[submodule "model/sam3_vendor"]
+	path = model/sam3_vendor
+	url = https://github.com/hoontree/sam3.git
+	branch = medfm-dataset-utils
