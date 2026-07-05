@@ -37,7 +37,6 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST = PROJECT_DIR / "config" / "sweeps" / "reliability_ablation.yaml"
 DEFAULT_WORKERS = ["local:1", "local:2", "gpu4:0", "gpu4:1", "gpu4:2", "gpu4:3"]
 CONFIG_NAME = "distill_sam_to_usfm_binary"
-DEFAULT_GROUP = "reliability_ablation"
 
 # Map an experiment-name prefix to its ablation axis (used as a W&B tag so runs
 # stay filterable by axis in the UI).
@@ -107,8 +106,11 @@ def _completed_experiments(teacher, student):
     done = set()
     direction = f"{teacher}_to_{student}"
 
+    # Recursive: a manifest's group_label nests one extra directory level
+    # under `direction` (see utils.wandb_utils.build_experiment_dir), so a
+    # flat `*/` glob would miss runs launched under a group.
     distill_root = PROJECT_DIR / "logs" / "distill" / direction
-    for fm in distill_root.glob("*/final_metrics.json"):
+    for fm in distill_root.glob("**/final_metrics.json"):
         try:
             rn = json.loads(fm.read_text()).get("_meta", {}).get("run_name") or ""
         except (OSError, json.JSONDecodeError):
@@ -145,8 +147,10 @@ def parse_args():
     p.add_argument("--workers", default=",".join(DEFAULT_WORKERS),
                    help="comma list of host:gpu (host in {local,<ssh-host>})")
     p.add_argument("--only", default=None, help="comma list of experiment names to run")
-    p.add_argument("--group", default=DEFAULT_GROUP,
-                   help="W&B group shared by every run in the sweep")
+    p.add_argument("--group", default=None,
+                   help="W&B group shared by every run in the sweep; defaults to "
+                        "the manifest's top-level `group_label` field (convention: "
+                        "'{topic}/{key_param}', e.g. 'reliability_kd/factor_ablation')")
     p.add_argument("--extra", default="", help="extra Hydra overrides appended to every run")
     p.add_argument("--resume", action="store_true",
                    help="skip already-finished experiments (final_metrics.json present) "
@@ -196,6 +200,13 @@ def main():
     manifest = yaml.safe_load(Path(args.manifest).read_text())
     experiments = manifest["experiments"]
 
+    group = args.group or manifest.get("group_label")
+    if not group:
+        sys.exit(
+            f"No W&B group: add a top-level `group_label: {{topic}}/{{key_param}}` "
+            f"field to {args.manifest}, or pass --group explicitly."
+        )
+
     names = list(experiments.keys())
     if args.only:
         wanted = [n.strip() for n in args.only.split(",")]
@@ -238,7 +249,7 @@ def main():
         # Don't create the log dir for a dry run (avoids littering empty dirs).
         for name, ov in jobs:
             host, gpu = workers[0]
-            overrides = build_overrides(manifest, name, ov, gpu, args.extra, args.smoke, args.group, args.resume)
+            overrides = build_overrides(manifest, name, ov, gpu, args.extra, args.smoke, group, args.resume)
             cmd, _ = build_command(host, gpu, overrides, args.config_name)
             printable = cmd if host == "local" else cmd
             print(f"[{name}] ({host}:{gpu})\n  " + " ".join(shlex.quote(c) for c in printable) + "\n")
@@ -258,7 +269,7 @@ def main():
             widx = free.pop(0)
             host, gpu = workers[widx]
             name, ov = pending.pop(0)
-            overrides = build_overrides(manifest, name, ov, gpu, args.extra, args.smoke, args.group, args.resume)
+            overrides = build_overrides(manifest, name, ov, gpu, args.extra, args.smoke, group, args.resume)
             cmd, _ = build_command(host, gpu, overrides, args.config_name)
             lf = open(log_dir / f"{name}.log", "w")
             lf.write("CMD: " + " ".join(shlex.quote(c) for c in cmd) + "\n\n")

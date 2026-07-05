@@ -14,6 +14,12 @@
 #   logit_kd        <-> reliability_ablation:base_logit_kd
 #   reliability     <-> reliability_ablation:b2_student_bypass
 #   reliability_sm  <-> reliability_ablation:b3_smoothing
+#
+# Run:
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/reliability_teacher_lora.yaml
+
+group_label: reliability_kd/teacher_lora
 
 base_overrides:
   - method=unified

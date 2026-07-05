@@ -1,0 +1,28 @@
+\begin{table*}[t]
+\centering
+\caption{Task-only baseline vs.\ each distillation method, by teacher, under balanced sampling. Internal mean averages the internal-validation sets BUSBRA/BUSI/B; BUID/BUS\_UCLM\_filtered are external (UCLM counted once). Values are Dice (\%); best per column in \textbf{bold}.}
+\label{tab:kd_reliability_by_dataset}
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{ll*{4}{c}}
+\toprule
+ & & \multicolumn{1}{c}{Internal} & \multicolumn{3}{c}{External} \\
+\cmidrule(lr){3-3} \cmidrule(lr){4-6}
+Teacher & Method & Int.\ mean & BUID & BUS\_UCLM\_filtered & Ext.\ mean \\
+\midrule
+\multicolumn{6}{l}{\textit{Reference: models fine-tuned directly (no KD)}}\\
+-- & Task-only (TinyUSFM, no KD) & 76.52 & 66.25 & 59.71 & 62.98 \\
+-- & SAM full-FT (teacher) & 71.82 & 61.36 & 57.78 & 59.57 \\
+-- & SAM LoRA r4 (teacher) & 75.51 & 68.13 & 64.16 & 66.14 \\
+\midrule
+\multirow{3}{*}{SAM full-FT}
+ & Logit-KD       & 73.42 & 65.91 & 63.42 & 64.66 \\
+ & Uncertainty-KD & 71.72 & \textbf{69.28} & 61.85 & 65.56 \\
+ & Reliability-KD & 75.93 & 67.41 & 61.85 & 64.63 \\
+\midrule
+\multirow{3}{*}{SAM LoRA r4}
+ & Logit-KD       & 74.23 & 64.60 & \textbf{68.41} & \textbf{66.50} \\
+ & Uncertainty-KD & 73.90 & 64.50 & 61.15 & 62.82 \\
+ & Reliability-KD & \textbf{77.42} & 63.83 & 64.44 & 64.13 \\
+\bottomrule
+\end{tabular}
+\end{table*}

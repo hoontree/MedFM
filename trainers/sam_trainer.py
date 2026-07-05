@@ -16,7 +16,7 @@ import wandb
 
 from hydra.utils import instantiate
 from .base_trainer import BaseTrainer
-from utils.data_processing_seg import SegDatasetProcessor
+from utils.data_processing import SegDatasetProcessor
 from utils.criterion import DiceLoss
 from monai.losses import DiceLoss as MonaiDiceLoss
 

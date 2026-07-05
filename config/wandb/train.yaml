@@ -1,0 +1,16 @@
+# @package wandb
+# W&B identity for training runs. Validates against config/schema.py::WandbConfig.
+# `_self_` last keeps the values below; the schema only enforces types.
+defaults:
+  - base_schema
+  - _self_
+
+entity: hheo
+project: medfm
+job_type: train
+group: null
+name: null
+tags: []
+mode: null
+disabled: false
+log_model: true

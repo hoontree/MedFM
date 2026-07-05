@@ -7,19 +7,23 @@
 # 1. Simple mode (default): Uses SAM3TrainerAdapter with BaseTrainer interface
 # 2. Native mode: Uses SAM3Orchestrator with full SAM3 capabilities
 #
-# Usage:
+# Usage (same datasets/split as every other model — train_sam.yaml's default
+# `data: dynamic` group, i.e. BUSBRA/BUSI/B — but SAM3's model expects a
+# BatchedDatapoint, not a plain image/mask tensor, so training actually reads
+# the COCO-JSON manifest below, not `data:` directly. Generate it first:
+#   uv run tools/generate_sam3_coco_annotations.py
+#
 #   # Simple training
-#   python main.py model=sam3
+#   uv run train.py model=sam3
 #
 #   # With custom config
-#   python main.py model=sam3 sam3.resolution=1024 training.batch_size=2
+#   uv run train.py model=sam3 sam3.resolution=1024 training.batch_size=2
 #
 #   # Native mode (advanced)
-#   python main.py model=sam3 sam3.use_native_trainer=true
+#   uv run train.py model=sam3 sam3.use_native_trainer=true
 
 defaults:
   - _self_
-  - /data: Standard
 
 trainer:
   _target_: trainers.sam3_adapter.SAM3TrainerAdapter
@@ -63,6 +67,18 @@ sam3:
   norm_mean: [0.5, 0.5, 0.5]
   norm_std: [0.5, 0.5, 0.5]
 
+  # COCO-JSON manifest produced by tools/generate_sam3_coco_annotations.py —
+  # the real, native SAM3 data path (see _create_sam3_coco_dataloaders in
+  # trainers/sam3_adapter.py). Keys index into the generated manifest.json;
+  # train/val entries are concatenated (ConcatDataset), matching the
+  # BUSBRA+BUSI+B combination every other model trains on.
+  coco_manifest: datasets/sam3_coco/manifest.json
+  coco_train_datasets: [BUSBRA_train, BUSI_train, B_train]
+  coco_val_datasets: [BUSBRA_val, BUSI_val, B_val]
+  max_ann_per_img: 100
+  max_train_queries: 50
+  max_val_queries: 50
+
 # Training configuration
 training:
   num_workers: 4
@@ -100,14 +116,22 @@ output:
 visualization:
   num_samples: 10
 
-# WandB configuration
+# WandB configuration (project/entity inherited from config/wandb/*.yaml — the
+# single shared "medfm" project every job_type logs into)
 wandb:
-  project: TinyUSFM
-  entity: hheo
   log_model: false                    # SAM3 checkpoints are large
 
-# Data configuration defaults (can be overridden)
+# Override the resolution + num_classes on top of the inherited `data:
+# dynamic` group (same BUSBRA/BUSI/B datasets, splits, and balanced sampling
+# as every other model) — SAM3's native input resolution is much larger than
+# SAM's 224. `auto_img_size_by_sam_type` only fires when `model.sam_type` is
+# set (SAM vit_b/l/h), so it doesn't touch this override.
+# num_classes is pinned to 1 (binary) because
+# tools/generate_sam3_coco_annotations.py's default run — and
+# SAM3TrainerAdapter._extract_pred_gt_masks, which only ever pulls a single
+# matched mask channel — both assume one "lesion" category, not per-class
+# one-hot channels. dynamic.yaml's own default (3) would silently route
+# Evaluator_seg into its multiclass path and produce all-NaN metrics.
 data:
-  name: custom
-  num_classes: 1
   img_size: 1008
+  num_classes: 1

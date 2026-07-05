@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from project.seg_transmiter_lite.train_tiny_with_sam_prior import AdapterOnBase  # noqa: E402
-from utils.data_processing_seg import SegDatasetProcessor  # noqa: E402
+from utils.data_processing import SegDatasetProcessor  # noqa: E402
 from utils.evaluate import Evaluator_seg  # noqa: E402
 from utils.visualize import visualize_segmentation  # noqa: E402
 

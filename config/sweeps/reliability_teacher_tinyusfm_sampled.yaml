@@ -15,7 +15,9 @@
 # Run (sequential, single worker on the gpu3 node):
 #   uv run tools/run_reliability_ablation.py \
 #       --manifest config/sweeps/reliability_teacher_tinyusfm_sampled.yaml \
-#       --group reliability_teacher_tinyusfm_sampled --workers gpu3:0
+#       --workers gpu3:0
+
+group_label: reliability_kd/teacher_tinyusfm_direction_sampled
 
 base_overrides:
   - method=unified

@@ -45,7 +45,6 @@ from model.sam3.train.utils.train_utils import (
     get_resume_checkpoint,
     human_readable_time,
     is_dist_avail_and_initialized,
-    log_env_variables,
     makedir,
     MemMeter,
     Phase,
@@ -211,7 +210,6 @@ class Trainer:
         )
 
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
-        log_env_variables()
 
         assert (
             is_dist_avail_and_initialized()

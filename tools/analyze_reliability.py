@@ -41,6 +41,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from utils.hardware import set_gpu  # noqa: E402
 from trainers.distill_trainer import DistillTrainer  # noqa: E402
+from config.schema import register_schemas  # noqa: E402
+
+register_schemas()  # wandb/data/training groups default to base_schema
 
 # Factor maps rendered (in order) when present in the components dict.
 _FACTOR_ORDER = [

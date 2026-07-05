@@ -5,13 +5,14 @@
 # Dispatched by tools/run_reliability_ablation.py with this manifest:
 #
 #   uv run tools/run_reliability_ablation.py \
-#       --manifest config/sweeps/meta_reliability.yaml \
-#       --group meta_reliability
+#       --manifest config/sweeps/meta_reliability.yaml
 #
 # Baseline rows use method=unified (+ default DistillTrainer); every meta/learned
 # row swaps in method=meta_reliability and the MetaDistillTrainer. The headline
 # contrast is `learned_pseudo` (θ fit to teacher-correct) vs `meta_scalar`
 # (θ meta-learned from the student's post-update meta loss).
+
+group_label: reliability_kd/meta_predictor
 
 base_overrides:
   - method.w_task=1.0

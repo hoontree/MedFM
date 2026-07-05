@@ -13,7 +13,9 @@ name: "dynamic"
 type: "Dynamic"
 train: [BUSBRA, BUSI, B]
 val: []   # If empty, defaults to same as train (using val split)
-test: [BUID, BUS_UCLM, BUS_UCLM_filtered]  # Each dataset in this list will be evaluated separately
+test: [BUID, BUS_UCLM_filtered]  # external eval sets, evaluated separately. Use the
+                                 # filtered UCLM only — plain BUS_UCLM is the same data,
+                                 # listing both double-counts UCLM in external_mean.
 
 # Canonical location for num_classes and img_size.
 # These are propagated to every individual dataset at load time.
@@ -29,6 +31,7 @@ normalization: "imagenet"
 augment_train: true
 
 # Balanced sampling across datasets and image-level classes.
+# Always ON — only the hyperparameters below are configurable (no enable flag).
 # - Dataset-level: per-dataset draw probability p_d ∝ N_d^alpha.
 #     alpha=1   → uniform per-sample (large datasets dominate).
 #     alpha=0   → uniform per-dataset (each dataset equally likely).
@@ -47,7 +50,6 @@ augment_train: true
 #   * Small dataset (B, 163 samples) overfitting → raise alpha (e.g. 0.7-1.0).
 #   * Want malignant-sensitive model → class_weights.2 > class_weights.1.
 sampling:
-  enabled: false
   alpha: 0.5
   class_weights:
     0: 1.0   # normal

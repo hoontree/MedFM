@@ -1,31 +1,30 @@
 \begin{table*}[t]
 \centering
-\caption{Reliability-aware KD vs.\ baselines on TinyUSFM students, by teacher (SAM fully fine-tuned, dice 0.57; SAM LoRA rank-4, dice 0.71). Per method, the representative is the best-BUID-Dice run over the hyperparameter sweep. Best Dice per row in \textbf{bold}; ``--'' = not run.}
+\caption{Reliability-aware KD vs.\ baselines on TinyUSFM students, per test set, by teacher. Values are Dice/Sens (\%); best Dice per column among student rows in \textbf{bold}.}
 \label{tab:kd_reliability_teacher}
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{l*{8}{c}}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{l*{12}{c}}
 \toprule
- & \multicolumn{2}{c}{Task-only} & \multicolumn{2}{c}{Logit-KD} & \multicolumn{2}{c}{Uncertainty-KD} & \multicolumn{2}{c}{Reliability-KD} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
-Test set & Dice & Sens & Dice & Sens & Dice & Sens & Dice & Sens \\
+ & \multicolumn{6}{c}{Internal validation} & \multicolumn{6}{c}{External} \\
+\cmidrule(lr){2-7} \cmidrule(lr){8-13}
+ & \multicolumn{2}{c}{BUSBRA} & \multicolumn{2}{c}{BUSI} & \multicolumn{2}{c}{B} & \multicolumn{2}{c}{BUID} & \multicolumn{2}{c}{BUS\_UCLM\_filt} & \multicolumn{2}{c}{Ext.\ mean} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9} \cmidrule(lr){10-11} \cmidrule(lr){12-13}
+Method & Dice & Sens & Dice & Sens & Dice & Sens & Dice & Sens & Dice & Sens & Dice & Sens \\
 \midrule
-\multicolumn{9}{l}{\textit{Teacher: SAM (full fine-tune)}}\\
-BUSBRA & \textbf{0.731} & 0.731 & 0.653 & 0.716 & 0.710 & 0.727 & 0.726 & 0.731 \\
-BUSI & 0.653 & 0.663 & 0.592 & 0.616 & 0.674 & 0.681 & \textbf{0.692} & 0.704 \\
-B & \textbf{0.790} & 0.793 & 0.664 & 0.726 & 0.713 & 0.753 & 0.745 & 0.740 \\
-BUID & \textbf{0.674} & 0.674 & 0.597 & 0.598 & 0.634 & 0.620 & 0.663 & 0.656 \\
-BUS\_UCLM & \textbf{0.626} & 0.613 & 0.532 & 0.523 & 0.567 & 0.552 & 0.610 & 0.598 \\
-BUS\_UCLM\_filt & \textbf{0.626} & 0.613 & 0.532 & 0.523 & 0.567 & 0.552 & 0.610 & 0.598 \\
-\textit{External mean} & \textbf{0.642} & 0.633 & 0.554 & 0.548 & 0.589 & 0.575 & 0.628 & 0.617 \\
+\multicolumn{13}{l}{\textit{Reference: direct fine-tuning}}\\
+Task-only (TinyUSFM) & 72.45 & 73.93 & \textbf{72.97} & 75.78 & 84.13 & 88.33 & 66.25 & 68.30 & 59.71 & 60.47 & 62.98 & 64.39 \\
+SAM full-FT (teacher) & 67.27 & 67.61 & 69.98 & 67.98 & 78.20 & 78.25 & 61.36 & 59.72 & 57.78 & 54.23 & 59.57 & 56.98 \\
+SAM LoRA (teacher) & 71.77 & 72.50 & 67.81 & 65.77 & 86.94 & 86.53 & 68.13 & 64.81 & 64.16 & 59.81 & 66.15 & 62.31 \\
 \midrule
-\multicolumn{9}{l}{\textit{Teacher: SAM (LoRA, rank 4)}}\\
-BUSBRA & \textbf{0.741} & 0.760 & 0.737 & 0.772 & -- & -- & 0.729 & 0.720 \\
-BUSI & 0.674 & 0.711 & 0.686 & 0.688 & -- & -- & \textbf{0.692} & 0.681 \\
-B & \textbf{0.864} & 0.895 & 0.844 & 0.867 & -- & -- & 0.803 & 0.759 \\
-BUID & 0.677 & 0.691 & 0.677 & 0.664 & -- & -- & \textbf{0.703} & 0.685 \\
-BUS\_UCLM & 0.634 & 0.640 & \textbf{0.669} & 0.661 & -- & -- & 0.655 & 0.608 \\
-BUS\_UCLM\_filt & 0.634 & 0.640 & \textbf{0.669} & 0.661 & -- & -- & 0.655 & 0.608 \\
-\textit{External mean} & 0.648 & 0.657 & \textbf{0.672} & 0.662 & -- & -- & 0.671 & 0.634 \\
+\multicolumn{13}{l}{\textit{TinyUSFM distilled from SAM full-FT teacher}}\\
+Logit-KD & 69.27 & 74.42 & 70.10 & 72.21 & 80.90 & 89.47 & 65.91 & 65.94 & 63.42 & 64.12 & 64.66 & 65.03 \\
+Uncertainty-KD & 69.10 & 69.07 & 64.95 & 65.72 & 81.12 & 80.97 & \textbf{69.28} & 67.77 & 61.85 & 60.70 & 65.56 & 64.24 \\
+Reliability-KD & 72.47 & 73.57 & 71.47 & 72.24 & 83.84 & 83.96 & 67.41 & 66.76 & 61.85 & 58.83 & 64.63 & 62.80 \\
+\midrule
+\multicolumn{13}{l}{\textit{TinyUSFM distilled from SAM LoRA teacher}}\\
+Logit-KD & 71.28 & 75.51 & 68.47 & 70.48 & 82.93 & 88.23 & 64.60 & 64.06 & \textbf{68.41} & 69.70 & \textbf{66.50} & 66.88 \\
+Uncertainty-KD & 70.41 & 69.92 & 67.47 & 65.56 & 83.82 & 83.54 & 64.50 & 63.55 & 61.15 & 56.79 & 62.83 & 60.17 \\
+Reliability-KD & \textbf{74.30} & 75.18 & 71.94 & 72.34 & \textbf{86.02} & 86.71 & 63.83 & 63.42 & 64.44 & 61.85 & 64.14 & 62.64 \\
 \bottomrule
 \end{tabular}
 \end{table*}

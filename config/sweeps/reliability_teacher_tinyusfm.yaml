@@ -11,8 +11,9 @@
 #
 # Run:
 #   uv run tools/run_reliability_ablation.py \
-#       --manifest config/sweeps/reliability_teacher_tinyusfm.yaml \
-#       --group reliability_teacher_tinyusfm
+#       --manifest config/sweeps/reliability_teacher_tinyusfm.yaml
+
+group_label: reliability_kd/teacher_tinyusfm_direction
 
 base_overrides:
   - method=unified

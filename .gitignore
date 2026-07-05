@@ -52,6 +52,17 @@ splits/
 scripts/
 tests/
 wandb/
+!config/wandb/
 
 # External distillation reference repos (not direct dependencies)
 submodules/
+
+# Symlink model/sam3 -> sam3_vendor/sam3 kept out of index; submodule handles it
+model/sam3
+
+# images, pdfs, and other large files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf

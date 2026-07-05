@@ -175,9 +175,17 @@ def load_from(sam, state_dict, image_size, vit_patch_size):
         pos_embed = F.interpolate(pos_embed, (token_size, token_size), mode='bilinear', align_corners=False)
         pos_embed = pos_embed.permute(0, 2, 3, 1)  # [b, h, w, c]
         new_state_dict['image_encoder.pos_embed'] = pos_embed
-        rel_pos_keys = [k for k in sam_dict.keys() if 'rel_pos' in k]
-        global_rel_pos_keys = [k for k in rel_pos_keys if '2' in k or '5' in  k or '8' in k or '11' in k]
-        for k in global_rel_pos_keys:
+        # Resize the relative-position tables of the global-attention blocks.
+        # Window-attention blocks keep window_size-sized tables that already
+        # match, so we select by actual shape mismatch. This is variant-agnostic
+        # (vit_b/l/h have different global-attn indexes) rather than hardcoding
+        # block numbers.
+        rel_pos_keys = [
+            k for k in sam_dict.keys()
+            if 'rel_pos' in k and k in new_state_dict
+            and new_state_dict[k].shape != sam_dict[k].shape
+        ]
+        for k in rel_pos_keys:
             rel_pos_params = new_state_dict[k]
             h, w = rel_pos_params.shape
             rel_pos_params = rel_pos_params.unsqueeze(0).unsqueeze(0)

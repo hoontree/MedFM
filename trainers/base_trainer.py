@@ -10,7 +10,6 @@ import subprocess
 import numbers
 from abc import ABC, abstractmethod
 from pathlib import Path
-from datetime import datetime
 from typing import Dict, Optional, Any
 
 import numpy as np
@@ -22,9 +21,8 @@ import wandb
 from utils.logger import setup_logger
 from utils.evaluate import Evaluator_seg
 from utils.utils import set_seed
-from utils.data_processing_seg import SegDatasetProcessor
-from utils.distill_utils import get_experiment_tags
-from utils.wandb_utils import resolve_wandb_identity
+from utils.data_processing import SegDatasetProcessor
+from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 
 _UNSET = object()  # sentinel for "use config default"
 
@@ -129,35 +127,19 @@ class BaseTrainer(ABC):
     def _setup_directories(self):
         """
         Setup experiment directories.
-        Structure:
-            logs/
-                train/
-                    {model_name}/
-                        {peft_mode}/ (for SAM)
-                        {timestamp}_{tags}/
-                            or
-                            {timestamp}_{tags}/ (for non-SAM)
+
+        Structure: ``logs/train/{model_name}/[{group}/]{run_name}``. ``run_name``
+        is ``self._identity["dir_name"]`` — the same hyperparameter tags and
+        timestamp used for the W&B run name, so folder and run are
+        self-consistent. ``group`` only appears when a sweep pins an explicit
+        ``wandb.group`` (ad hoc single runs stay flat). See
+        ``utils.wandb_utils`` for the shared identity resolution.
         """
-        # Get model name
         model_name = self.cfg.model.name
-
-        # Create base directory
-        logs_root = Path(self.cfg.get("output", {}).get("dir", "logs")) / "train"
-
-        # Create experiment tags
-        exp_tags = get_experiment_tags(self.cfg)
-
-        # Create timestamp-based experiment directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir_name = timestamp + ("_" + "_".join(exp_tags) if exp_tags else "")
-
-        # Final experiment directory
-        if model_name == "sam":
-            peft_mode = f"e_{self.cfg.model.encoder_mode}_d_{self.cfg.model.decoder_mode}"
-            self.exp_dir = logs_root / model_name / peft_mode / self.exp_dir_name
-
-        else:
-            self.exp_dir = logs_root / model_name / self.exp_dir_name
+        self.exp_dir_name = self._identity["dir_name"]
+        self.exp_dir = build_experiment_dir(
+            self.cfg, root_segment=model_name, identity=self._identity
+        )
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         # Checkpoint directory
@@ -182,9 +164,12 @@ class BaseTrainer(ABC):
 
         Run identity (project/group/name/tags) is composed by the shared helper
         in ``utils.wandb_utils`` so supervised and distillation runs follow one
-        consistent scheme. The full resolved config is logged as the run config.
+        consistent scheme; reuses ``self._identity`` (resolved once in
+        ``setup()``) so the run name matches the directory already created by
+        ``_setup_directories``. The full resolved config is logged as the run
+        config.
         """
-        identity = resolve_wandb_identity(self.cfg, default_job_type="train")
+        identity = {k: v for k, v in self._identity.items() if k != "dir_name"}
 
         self.wandb_run = wandb.init(
             config=self._build_wandb_config(),
@@ -962,6 +947,11 @@ class BaseTrainer(ABC):
         deterministic = self.cfg.get("hardware", {}).get("deterministic", True)
         set_seed(seed, deterministic=deterministic)
 
+        # Resolve run identity once: the W&B name/group/tags and the on-disk
+        # directory name are derived from this single call (one timestamp, one
+        # hparam-tag computation) so they never drift apart.
+        self._identity = resolve_wandb_identity(self.cfg, default_job_type="train")
+
         # Setup directories
         self._setup_directories()
 
@@ -1061,6 +1051,7 @@ class BaseTrainer(ABC):
         # Initialize wandb for test-only run (same identity scheme, eval job).
         identity = resolve_wandb_identity(self.cfg, default_job_type="eval")
         identity["tags"] = ["test-only", *identity["tags"]]
+        identity.pop("dir_name", None)
         self.wandb_run = wandb.init(
             config=self._build_wandb_config(),
             **identity,

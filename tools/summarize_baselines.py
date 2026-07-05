@@ -8,7 +8,7 @@ Auto-detects the latest run per (model, sampling) cell under logs/train/ when no
 dirs are given; or pass explicit run dirs:
 
     uv run tools/summarize_baselines.py
-    uv run tools/summarize_baselines.py logs/train/sam/e_ft_d_ft/<ts>_... logs/train/TinyUSFM/<ts>_...
+    uv run tools/summarize_baselines.py logs/train/sam/<run_dir> logs/train/TinyUSFM/<run_dir>
 """
 
 import re

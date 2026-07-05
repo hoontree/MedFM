@@ -26,9 +26,17 @@ from hydra.core.config_store import ConfigStore
 
 @dataclass
 class SamplingConfig:
-    """Balanced multi-dataset / class-level sampling (``data.sampling``)."""
+    """Balanced multi-dataset / class-level sampling (``data.sampling``).
 
-    enabled: bool = False
+    Balanced sampling is always on — only the hyperparameters below are
+    configurable.
+    """
+
+    # DEPRECATED: sampling is unconditionally enabled and this flag is ignored by
+    # the sampler builder. Retained solely so legacy `data.sampling.enabled=...`
+    # CLI overrides don't crash under Hydra struct mode. Remove once no callers
+    # pass it.
+    enabled: bool = True
     alpha: float = 0.5
     # image-level class -> weight (0=normal, 1=benign, 2=malignant)
     class_weights: Dict[int, float] = field(

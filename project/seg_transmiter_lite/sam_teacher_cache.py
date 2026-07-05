@@ -51,7 +51,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from utils.data_processing_seg import SegDatasetProcessor  # noqa: E402
+from utils.data_processing import SegDatasetProcessor  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 

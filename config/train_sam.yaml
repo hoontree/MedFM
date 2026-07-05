@@ -4,3 +4,14 @@ defaults:
   - data: dynamic
   - model: sam
   - wandb: train
+
+# Load a checkpoint and only run evaluation (BaseTrainer.run_test_only) —
+# skips training entirely. Useful e.g. after a multi-GPU
+# sam3.use_native_trainer=true run, whose own eval is detection-style: point
+# this at the resulting checkpoints/checkpoint.pt to get the project's usual
+# Dice/IoU/HD95/... suite via SAM3TrainerAdapter instead.
+#   uv run train.py model=sam3 test_only.enabled=true \
+#       test_only.checkpoint_path=logs/sam3/dynamic/<ts>/checkpoints/checkpoint.pt
+test_only:
+  enabled: false
+  checkpoint_path: null

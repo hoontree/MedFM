@@ -1,9 +1,10 @@
 \begin{table}[t]
 \centering
-\caption{Reliability-factor ablation (TinyUSFM student, SAM full-FT teacher). Each
-factor multiplies into the per-pixel reliability map; ``confidence'' and ``entropy''
-are always on, the GT-conditioned gates and smoothing are toggled. External = mean
-over BUID/BUS\_UCLM/BUS\_UCLM\_filtered; best external Dice in \textbf{bold}.}
+\caption{Reliability-factor ablation (TinyUSFM student, SAM full-FT teacher; both
+trained with the balanced sampler). Each factor multiplies into the per-pixel
+reliability map; ``confidence'' and ``entropy'' are always on, the GT-conditioned
+gates and smoothing are toggled. External = mean over
+BUID and BUS\_UCLM\_filtered (UCLM counted once); best external Dice in \textbf{bold}.}
 \label{tab:reliability_factor_ablation}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{l ccccc cc c}
@@ -12,11 +13,12 @@ over BUID/BUS\_UCLM/BUS\_UCLM\_filtered; best external Dice in \textbf{bold}.}
 \cmidrule(lr){2-6}\cmidrule(lr){7-8}\cmidrule(lr){9-9}
 Configuration & Conf & Ent & T-gate & S-byp & Smooth & Dice & Sens & Dice \\
 \midrule
-confidence $\times$ entropy & \checkmark & \checkmark & -- & -- & -- & 0.587 & 0.544 & 0.605 \\
-\quad + teacher gate & \checkmark & \checkmark & \checkmark & -- & -- & \textbf{0.630} & 0.622 & 0.652 \\
-\quad + student bypass (full) & \checkmark & \checkmark & \checkmark & \checkmark & -- & 0.614 & 0.591 & 0.648 \\
-\quad + smoothing & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & 0.597 & 0.578 & 0.636 \\
-full $-$ teacher gate & \checkmark & \checkmark & -- & \checkmark & -- & 0.584 & 0.574 & 0.619 \\
+confidence $\times$ entropy & \checkmark & \checkmark & -- & -- & -- & 0.662 & 0.634 & 0.673 \\
+\quad + teacher gate & \checkmark & \checkmark & \checkmark & -- & -- & 0.659 & 0.646 & \textbf{0.686} \\
+\quad + student bypass (full) & \checkmark & \checkmark & \checkmark & \checkmark & -- & \textbf{0.670} & \textbf{0.649} & 0.671 \\
+\quad + smoothing & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & 0.650 & 0.627 & 0.667 \\
+full $-$ teacher gate & \checkmark & \checkmark & -- & \checkmark & -- & 0.639 & 0.621 & 0.661 \\
+full $-$ student bypass & \checkmark & \checkmark & \checkmark & -- & -- & 0.664 & 0.635 & 0.685 \\
 \bottomrule
 \end{tabular}
 \end{table}

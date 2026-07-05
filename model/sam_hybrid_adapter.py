@@ -179,6 +179,15 @@ class LoRA_Sam(nn.Module):
     VALID_ENCODER_MODES = {"lora", "conv_lora", "ft", "frozen"}
     VALID_DECODER_MODES = {"lora", "ft", "frozen"}
 
+    # Per-variant SAM backbone pretrained weights (Meta original ViT-SAM ckpts).
+    # These initialize the frozen/LoRA-adapted backbone; without them vit_l/vit_h
+    # would start from random weights and LoRA would learn on top of noise.
+    DEFAULT_SAM_CHECKPOINTS = {
+        "vit_b": "checkpoints/sam_vit_b_01ec64.pth",
+        "vit_l": "checkpoints/sam_vit_l_0b3195.pth",
+        "vit_h": "checkpoints/sam_vit_h_4b8939.pth",
+    }
+
     def __init__(
         self,
         sam_type: str = "vit_b",
@@ -192,6 +201,7 @@ class LoRA_Sam(nn.Module):
         decoder_mode: Optional[str] = None,
         conv_lora_expert_num: int = 4,
         checkpoint: Optional[str] = None,
+        sam_checkpoint: Optional[str] = None,
         **kwargs,
     ):
         super(LoRA_Sam, self).__init__()
@@ -205,14 +215,37 @@ class LoRA_Sam(nn.Module):
 
         self.sam_type = sam_type
 
-        # 1. Always build SAM with its default pretrained weights from the registry.
+        # 1. Build SAM and load its pretrained backbone weights.
+        #    Resolve the per-variant backbone checkpoint so vit_l/vit_h are
+        #    initialized from the Meta ViT-SAM weights (not random init).
+        if sam_type not in sam_model_registry:
+            raise ValueError(
+                f"Unknown sam_type '{sam_type}'. "
+                f"Expected one of {sorted(self.DEFAULT_SAM_CHECKPOINTS)}."
+            )
+        if sam_checkpoint is None:
+            sam_checkpoint = self.DEFAULT_SAM_CHECKPOINTS.get(sam_type)
+        if sam_checkpoint is not None and not Path(sam_checkpoint).is_absolute():
+            resolved = PROJECT_ROOT / sam_checkpoint
+            if resolved.exists():
+                sam_checkpoint = str(resolved)
+        if sam_checkpoint is None or not Path(sam_checkpoint).exists():
+            raise FileNotFoundError(
+                f"[LoRA_Sam] SAM backbone checkpoint for '{sam_type}' not found: "
+                f"{sam_checkpoint}. Place the Meta ViT-SAM weights under "
+                f"'checkpoints/' or pass model.sam_checkpoint=<path>."
+            )
+
         sam_model = sam_model_registry[sam_type](
             image_size=img_size,
             num_classes=num_classes,
             pixel_mean=pixel_mean,
             pixel_std=pixel_std,
+            checkpoint=sam_checkpoint,
         )
-        LOGGER.info("[LoRA_Sam] Loaded SAM '%s' with default pretrained weights", sam_type)
+        LOGGER.info(
+            "[LoRA_Sam] Loaded SAM '%s' backbone from %s", sam_type, sam_checkpoint
+        )
 
         # Setup lora layers for encoder
         self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))

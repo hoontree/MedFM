@@ -1,5 +1,6 @@
 import os
 import logging as _logging
+from collections import defaultdict
 from hydra.utils import instantiate
 import torch
 import torch.nn as nn
@@ -9,20 +10,19 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Optional, Tuple, override
 
-from utils.data_processing_seg import SegDatasetProcessor
+from utils.data_processing import SegDatasetProcessor
 from utils.logger import setup_logger
 from utils.schedule import build_scheduler
 from distillers import create_distiller
 from utils.distill_utils import (
     get_dataset_short_name,
-    create_log_dir,
     get_experiment_tags,
     save_experiment_summary,
     load_model_cfg,
 )
 from utils.visualize import visualize_segmentation
 from utils.utils import set_seed
-from utils.wandb_utils import resolve_wandb_identity
+from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 from trainers.base_trainer import BaseTrainer
 from omegaconf import OmegaConf, DictConfig
 
@@ -61,6 +61,11 @@ class DistillTrainer(BaseTrainer):
         # creating directories — "auto" reuses the latest prior run dir whose
         # signature (run_name + hparam tags) matches and that holds a last.pth.
         self._resume_ckpt_path = self._resolve_resume_path()
+
+        # Resolve run identity once: the W&B name/group/tags and the on-disk
+        # directory name are derived from this single call (one timestamp, one
+        # hparam-tag computation) so they never drift apart.
+        self._identity = resolve_wandb_identity(cfg, default_job_type="distill")
 
         self._setup_directories()
         save_experiment_summary(self.cfg, self.exp_dir)
@@ -108,11 +113,18 @@ class DistillTrainer(BaseTrainer):
         teacher_cfg = load_model_cfg(self.teacher_name, num_classes)
         student_cfg = load_model_cfg(self.student_name, num_classes)
 
+        # Explicit checkpoint override (e.g. picking a specific trained
+        # artifact for the teacher without a dedicated model yaml).
+        if (ckpt := self.cfg.get("teacher_checkpoint")) is not None:
+            teacher_cfg.checkpoint = ckpt
+
         # Student should not inherit the teacher's fine-tuned checkpoint by
         # default — students typically train from a pretrained backbone or
         # from scratch. The user can re-enable via student_cfg.checkpoint=...
         if self.cfg.get("use_student_finetuned_ckpt", False) is False:
             student_cfg.checkpoint = None
+        if (ckpt := self.cfg.get("student_checkpoint")) is not None:
+            student_cfg.checkpoint = ckpt
 
         OmegaConf.set_struct(self.cfg, False)
         self.cfg.teacher_cfg = teacher_cfg
@@ -123,7 +135,12 @@ class DistillTrainer(BaseTrainer):
     # Setup (directories / logging / wandb)
     @override
     def _setup_directories(self):
-        """Setup experiment directories using the standardized create_log_dir structure.
+        """Setup experiment directories.
+
+        Structure: ``logs/distill/{teacher}_to_{student}/[{group}/]{run_name}``,
+        built by the shared ``utils.wandb_utils.build_experiment_dir`` from
+        ``self._identity`` so the folder name matches the W&B run name exactly
+        (same timestamp, same hparam tags — resolved once in ``__init__``).
 
         When resuming, reuse the previous run's directory (the parent of the
         located ``checkpoints/last.pth``) so logs/checkpoints continue in place
@@ -132,7 +149,10 @@ class DistillTrainer(BaseTrainer):
         if self._resume_ckpt_path is not None:
             self.exp_dir = self._resume_ckpt_path.parent.parent
         else:
-            self.exp_dir = create_log_dir(self.cfg)
+            root_segment = f"{self.teacher_name}_to_{self.student_name}"
+            self.exp_dir = build_experiment_dir(
+                self.cfg, root_segment=root_segment, identity=self._identity
+            )
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
         self.ckpt_dir = self.exp_dir / "checkpoints"
@@ -156,16 +176,31 @@ class DistillTrainer(BaseTrainer):
     def _setup_wandb(self):
         """Override: initialize a single wandb run for the entire distillation process.
 
-        Run identity (project/group/name/tags) comes from the shared helper in
-        ``utils.wandb_utils`` so distillation and supervised runs use one scheme;
-        group defaults to ``distill/{method}/{datasets}`` so related runs cluster.
+        Run identity (project/group/name/tags) comes from ``self._identity``
+        (resolved once in ``__init__``) so distillation and supervised runs
+        use one scheme and the run name matches the exp_dir already created by
+        ``_setup_directories``; group defaults to ``distill/{method}/{datasets}``
+        so related runs cluster.
         """
-        identity = resolve_wandb_identity(self.cfg, default_job_type="distill")
+        identity = {k: v for k, v in self._identity.items() if k != "dir_name"}
         if self.cfg.get("debug", False):
             identity["mode"] = "disabled"
 
+        # Persist a stable run id in the exp_dir so a resumed run (which reuses
+        # the same exp_dir) re-attaches to the *same* W&B run and continues its
+        # history instead of starting a fresh one.
+        run_id_file = self.exp_dir / "wandb_run_id"
+        resuming = self._resume_ckpt_path is not None and run_id_file.exists()
+        if resuming:
+            run_id = run_id_file.read_text().strip()
+        else:
+            run_id = wandb.util.generate_id()
+            run_id_file.write_text(run_id)
+
         self.wandb_run = wandb.init(
             config=OmegaConf.to_container(self.cfg, resolve=True),
+            id=run_id,
+            resume="allow" if resuming else "never",
             **identity,
         )
         self._define_wandb_metrics()
@@ -412,12 +447,44 @@ class DistillTrainer(BaseTrainer):
             return val_metrics, {"__val__": (images_l, preds_l, masks_l, fnames_l)}
         return val_metrics
 
+    @staticmethod
+    def _group_summary(dicts: list) -> Dict[str, float]:
+        """Aggregate per-dataset metric dicts into a group mean + overall std.
+
+        Datasets are weighted equally. For a base metric `X`, the group mean is
+        the mean of per-dataset means; the overall std combines within-dataset
+        variance (`X_std`) and between-dataset variance via the law of total
+        variance: std = sqrt(mean(std_i^2) + var(mean_i)).
+        """
+        import numpy as np
+
+        base_metrics = [k for k in dicts[0] if not k.endswith("_std")]
+        out: Dict[str, float] = {}
+        for k in base_metrics:
+            means = np.array([d[k] for d in dicts if k in d], dtype=float)
+            if means.size == 0:
+                continue
+            out[k] = float(means.mean())
+            std_key = f"{k}_std"
+            within = np.array(
+                [d[std_key] for d in dicts if std_key in d], dtype=float
+            )
+            if within.size == means.size:
+                total_var = float((within ** 2).mean() + means.var())
+                out[std_key] = float(np.sqrt(total_var))
+        return out
+
     @override
     def test(self, phase="test") -> Dict[str, float]:
         self.student.eval()
         all_metrics = {}
         predictions_cache = {}
         is_multi = isinstance(self.test_loader, dict)
+
+        # Collect per-dataset metric dicts grouped by internal (held-out *_test
+        # splits) vs external validation sets, so we can report a per-group mean
+        # and an overall std across the group.
+        group_metrics = {"internal": [], "external": []}
 
         for ds_name, loader in self._iter_test_loaders():
             result = self._evaluate_model(self.student, loader, return_predictions=True)
@@ -426,14 +493,27 @@ class DistillTrainer(BaseTrainer):
             if is_multi:
                 self.logger.info(f"--- {phase} ({ds_name}) ---")
                 self.evaluator.print_metrics(metrics, phase=f"{phase}_{ds_name}")
-                for k, v in self._numeric_items(metrics).items():
+                numeric = self._numeric_items(metrics)
+                for k, v in numeric.items():
                     all_metrics[f"{ds_name}/{k}"] = v
+                group = "internal" if ds_name.endswith("_test") else "external"
+                group_metrics[group].append(numeric)
             else:
                 self.logger.info(f"--- {phase} ---")
                 self.evaluator.print_metrics(metrics, phase=phase)
                 all_metrics.update(self._numeric_items(metrics))
 
             predictions_cache[ds_name] = (images_list, preds_list, masks_list, fnames_list, per_sample)
+
+        if is_multi:
+            for group, dicts in group_metrics.items():
+                if not dicts:
+                    continue
+                summary = self._group_summary(dicts)
+                self.logger.info(f"--- {phase} ({group}_mean) ---")
+                self.evaluator.print_metrics(summary, phase=f"{phase}_{group}_mean")
+                for k, v in summary.items():
+                    all_metrics[f"{group}_mean/{k}"] = v
 
         if phase == "final_test":
             return all_metrics, predictions_cache
@@ -574,9 +654,12 @@ class DistillTrainer(BaseTrainer):
         ``cfg.resume`` may be:
             * ``null`` / unset / ``false`` → no resume (default).
             * ``"auto"`` → reuse the most recent prior run dir under
-              ``logs/distill/<teacher>_to_<student>/`` whose name ends with this
-              run's signature (``_<run_name>`` + hparam tags) and contains
-              ``checkpoints/last.pth``.
+              ``logs/distill/<teacher>_to_<student>/[<group>/]`` whose name ends
+              with this run's signature (``_<run_name>`` + hparam tags) and
+              contains ``checkpoints/last.pth``. The optional ``<group>``
+              segment mirrors ``build_experiment_dir`` — a re-launched sweep
+              passes the same explicit ``wandb.group`` it used originally, so
+              the search stays scoped to the same directory it wrote to.
             * an explicit path to a ``last.pth`` (or a run dir holding one).
 
         Returns the checkpoint path, or ``None`` when nothing resumable is found.
@@ -596,6 +679,9 @@ class DistillTrainer(BaseTrainer):
             / "distill"
             / f"{self.teacher_name}_to_{self.student_name}"
         )
+        explicit_group = self.cfg.get("wandb", {}).get("group")
+        if explicit_group:
+            base = base / str(explicit_group)
         if not base.exists():
             return None
         label = f"_{self.cfg.get('run_name')}" if self.cfg.get("run_name") else ""
@@ -911,6 +997,9 @@ class DistillTrainer(BaseTrainer):
         if wandb.run is None:
             identity = resolve_wandb_identity(self.cfg, default_job_type="distill")
             identity["tags"] = ["test-only", *identity["tags"]]
+            identity.pop("dir_name", None)
+            if self.cfg.get("debug", False):
+                identity["mode"] = "disabled"
             self.wandb_run = wandb.init(
                 config=OmegaConf.to_container(self.cfg, resolve=True),
                 **identity,

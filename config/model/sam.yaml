@@ -9,7 +9,10 @@ trainer:
 model:
   name: sam
   _target_: model.sam_hybrid_adapter.LoRA_Sam
+  # SAM backbone variant: vit_b | vit_l | vit_h (override: model.sam_type=vit_l).
+  # Backbone ckpt auto-resolved per variant; override with model.sam_checkpoint=<path>.
   sam_type: vit_b
+  sam_checkpoint: null
   img_size: ${data.img_size}
   num_classes: ${data.num_classes}
   pixel_mean: [123.675, 116.28, 103.53]

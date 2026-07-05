@@ -208,8 +208,9 @@ logs/distillation/{dataset}/{timestamp}/
 
 ### WandB Integration
 
-- Project: `TinyUSFM`
+- Project: `medfm` (single shared project for every job_type — train, distill, eval)
 - Entity: `hheo`
+- Run identity (project/group/name/tags) is composed by `utils/wandb_utils.py::resolve_wandb_identity()`, the single source of truth also used to build the on-disk experiment directory
 - Automatically logs: losses, metrics, learning rate, visualizations
 - Config stored in `.env` file
 

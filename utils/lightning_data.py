@@ -6,7 +6,7 @@ import torch
 import lightning as L
 from torch.utils.data import DataLoader, Dataset
 
-from utils.data_processing_seg import SegDatasetProcessor
+from utils.data_processing import SegDatasetProcessor
 
 
 class SegmentationDataModule(L.LightningDataModule):

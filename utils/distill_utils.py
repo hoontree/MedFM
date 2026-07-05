@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -139,30 +138,6 @@ def get_experiment_tags(cfg: DictConfig) -> list:
             tags.append(f"{tag}{val}")
 
     return tags
-
-
-def create_log_dir(cfg: DictConfig) -> Path:
-    """Create hierarchical log directory structure with hyperparameter tags.
-
-    Structure: logs/distill/{teacher}_to_{student}/{timestamp}_{tags}/
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tags = get_experiment_tags(cfg)
-    tag_suffix = "_" + "_".join(tags) if tags else ""
-
-    # Human label (sweeps set cfg.run_name) goes into the dir so runs are
-    # self-identifying without parsing logs.
-    run_name = cfg.get("run_name")
-    label = f"_{run_name}" if run_name else ""
-
-    teacher_name = cfg.get("teacher")
-    student_name = cfg.get("student")
-    return (
-        Path(cfg.output.dir)
-        / "distill"
-        / f"{teacher_name}_to_{student_name}"
-        / f"{timestamp}{label}{tag_suffix}"
-    )
 
 
 def save_experiment_summary(cfg: DictConfig, log_dir: Path):

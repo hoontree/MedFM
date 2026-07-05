@@ -12,6 +12,13 @@ trainer:
 teacher: sam
 student: tinyusfm
 
+# Optional checkpoint override applied on top of the resolved teacher/student
+# model config (e.g. to pick a specific trained artifact — a balanced-sampler
+# run, a particular ablation — without needing a dedicated model yaml just to
+# swap one path).
+teacher_checkpoint: null
+student_checkpoint: null
+
 # Human-readable experiment label (sweeps set this). Kept separate from
 # method.name (which is semantic: unified/online) so the label can never
 # accidentally flip distiller behaviour (e.g. method.name=="online").

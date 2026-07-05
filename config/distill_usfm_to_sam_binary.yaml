@@ -12,6 +12,13 @@ trainer:
 teacher: tinyusfm
 student: sam
 
+# Optional checkpoint override applied on top of the resolved teacher/student
+# model config (e.g. to pick a specific trained artifact — a balanced-sampler
+# run, a particular ablation — without needing a dedicated model yaml just to
+# swap one path).
+teacher_checkpoint: null
+student_checkpoint: null
+
 # Hardware Configuration (Global Overrides)
 hardware:
   gpu_ids: [2]

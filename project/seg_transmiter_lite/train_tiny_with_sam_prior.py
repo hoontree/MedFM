@@ -41,7 +41,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from model.seg_transmiter.adapters import ResidualConvAdapter, FeatureProjector  # noqa: E402
 from project.seg_transmiter_lite.sam_cache_dataset import SAMCacheDataset  # noqa: E402
-from utils.data_processing_seg import SegDatasetProcessor  # noqa: E402
+from utils.data_processing import SegDatasetProcessor  # noqa: E402
 from utils.evaluate import Evaluator_seg  # noqa: E402
 from utils.seg_transmiter_losses import (  # noqa: E402
     bce_dice_loss,

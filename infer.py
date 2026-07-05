@@ -48,7 +48,7 @@ from medpy.metric.binary import dc, hd95
 from medpy.metric.binary import recall as medpy_recall
 
 from config.schema import register_schemas
-from utils.data_processing_seg import SegDatasetProcessor
+from utils.data_processing import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
 from utils.hardware import set_gpu
 from utils.visualize import (

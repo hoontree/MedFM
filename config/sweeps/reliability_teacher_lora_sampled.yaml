@@ -17,7 +17,9 @@
 # Run (sequential, single worker on the gpu4 node):
 #   uv run tools/run_reliability_ablation.py \
 #       --manifest config/sweeps/reliability_teacher_lora_sampled.yaml \
-#       --group reliability_teacher_lora_sampled --workers gpu4:0
+#       --workers gpu4:0
+
+group_label: reliability_kd/teacher_lora_sampled
 
 base_overrides:
   - method=unified

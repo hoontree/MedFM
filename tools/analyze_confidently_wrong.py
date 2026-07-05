@@ -40,6 +40,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from utils.hardware import set_gpu  # noqa: E402
 from trainers.distill_trainer import DistillTrainer  # noqa: E402
 from utils.reliability_kd import probs_from_logits, pixel_confidence_from_probs  # noqa: E402
+from config.schema import register_schemas  # noqa: E402
+
+register_schemas()  # wandb/data/training groups default to base_schema
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225])

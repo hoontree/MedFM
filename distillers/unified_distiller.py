@@ -3,7 +3,7 @@ import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
 from distillers.base_distiller import BaseDistiller, resolve_loss_weight
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class UnifiedDistiller(BaseDistiller):
             if (
                 self.w_logit_cwd > 0
                 or self.w_feature_cwd > 0
-                or self.num_classes >= 2
+                or (self.num_classes >= 2 and self.w_logit_kd > 0)
             )
             else None
         )
@@ -124,7 +124,7 @@ class UnifiedDistiller(BaseDistiller):
             else None
         )
         self._rkd_use_student_bypass = bool(rkd_cfg.get("use_student_bypass", False))
-        self._build_reliability_map = (
+        self._build_reliability_map: Optional[Callable] = (
             instantiate(rkd_cfg) if self.w_reliability_kd > 0 else None
         )
 
@@ -167,17 +167,18 @@ class UnifiedDistiller(BaseDistiller):
         if self.use_uncertainty_kd:
             names.append("w_uncertainty_kd")
 
-        active = {n: float(getattr(self, n)) for n in names}
-        total = sum(v for v in active.values() if v > 0)
+        pairs = [(n, float(getattr(self, n))) for n in names]
+        total = sum(v for _, v in pairs if v > 0)
         if total <= 0:
             return
-        for name, val in active.items():
-            setattr(self, name, val / total if val > 0 else val)
+        normalized = []
+        for n, v in pairs:
+            new_v = v / total if v > 0 else v
+            setattr(self, n, new_v)
+            normalized.append(new_v)
         logger.info(
-            "Normalised loss weights: " + " ".join(
-                f"{n}=%.4f" for n in names
-            ),
-            *[getattr(self, n) for n in names],
+            "Normalised loss weights: " + " ".join(f"{n}=%.4f" for n in names),
+            *normalized,
         )
 
     @staticmethod
@@ -305,9 +306,6 @@ class UnifiedDistiller(BaseDistiller):
         use ``targets`` reduced to a class-index mask when multi-class.
         The student-bypass gate additionally consumes ``student_logits``.
         """
-        if self.reliability_kd_fn is None:
-            return self._zero(student_logits.device), {}
-
         # build_reliability_map expects [B, H, W] GT — convert one-hot.
         gt = targets
         if gt.dim() == 4:

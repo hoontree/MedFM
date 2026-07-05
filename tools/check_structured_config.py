@@ -113,7 +113,10 @@ def main():
         )
         ident = resolve_wandb_identity(cfg, default_job_type="distill")
         checks = {
-            "project": ident["project"] == "medfm-distill",
+            # config/wandb/*.yaml pins a single shared "medfm" project for every
+            # job_type on purpose (job_type/group/tags already separate runs
+            # within it) — see utils.wandb_utils module docstring.
+            "project": ident["project"] == "medfm",
             "explicit group honored": ident["group"] == "reliability_teacher_lora",
             "run_name in name": "relab_smpl_reliability" in (ident["name"] or ""),
             "explicit tags kept": "relab" in ident["tags"],
