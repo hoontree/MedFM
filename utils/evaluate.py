@@ -156,6 +156,20 @@ class Evaluator:
         print(f"Prediction save to {save_path}")
 
 
+def _align_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Resize model logits to the GT mask's spatial size when they disagree.
+
+    The model output and the loaded mask can differ in resolution (e.g. a SAM
+    postprocess size vs. the dataset's mask size). Both the loss and the metrics
+    are then computed at the GT resolution. A no-op when the sizes already match.
+    """
+    if logits.shape[-2:] == labels.shape[-2:]:
+        return logits
+    return torch.nn.functional.interpolate(
+        logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+    )
+
+
 class Evaluator_seg:
     @staticmethod
     def evaluate_batch(
@@ -514,6 +528,8 @@ class Evaluator_seg:
                     if logits.shape[1] != 1:
                         raise ValueError("Only binary segmentation supported.")
 
+                logits = _align_logits(logits, labels)
+
                 if criterion is not None:
                     loss = criterion(logits, labels.float())
                     total_loss += loss.item() * images.size(0)
@@ -657,10 +673,11 @@ class Evaluator_seg:
                 if img_size is not None:
                     raw_out = model(images, True, img_size)
                     output_masks = raw_out["masks"]
-                    preds = torch.argmax(output_masks, dim=1)
                 else:
                     output_masks = model(images)  # [B, num_classes, H, W]
-                    preds = torch.argmax(output_masks, dim=1)  # [B, H, W]
+
+                output_masks = _align_logits(output_masks, gt_indices)
+                preds = torch.argmax(output_masks, dim=1)  # [B, H, W]
 
                 if criterion is not None:
                     loss = criterion(output_masks, gt_indices.long())

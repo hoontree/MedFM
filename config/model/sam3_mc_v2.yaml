@@ -1,0 +1,20 @@
+# @package _global_
+# SAM3 MULTICLASS fine-tune, v2 PROMPTS. Identical to sam3_mc.yaml except it points
+# at datasets/sam3_coco_mc_v2, whose COCO categories carry the "v2" *visually
+# grounded* names instead of the bare diagnostic adjectives. Both prompt sets are
+# defined in model/sam3_prompts.py (the shared FT-manifest ↔ Sam3Teacher contract);
+# build the manifest with:
+#
+#   uv run tools/make_sam3_mc_prompt_manifest.py --prompt-set v2
+#
+# A Sam3Teacher fine-tuned on this manifest must be given the matching prompt set at
+# KD time (`model.prompt_set=v2`, or explicit `class_prompts`) — SAM3's text encoder
+# is frozen during FT, so grounding text it never saw silently distills garbage.
+#
+#   uv run train.py model=sam3_mc_v2                    # gpu6
+defaults:
+  - sam3
+  - _self_
+
+sam3:
+  coco_manifest: datasets/sam3_coco_mc_v2/manifest.json

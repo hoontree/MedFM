@@ -49,6 +49,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from hydra import compose, initialize_config_dir  # noqa: E402
 from config.schema import register_schemas  # noqa: E402
+from model import sam3_prompts  # noqa: E402
 from utils.data_processing import SegDatasetProcessor  # noqa: E402
 
 DEFAULT_OUT = PROJECT_DIR / "datasets" / "sam3_coco"
@@ -130,11 +131,13 @@ def generate_split(
         annotations.extend(anns)
         next_ann_id += len(anns)
 
-    if num_classes == 1:
-        categories = [{"id": 1, "name": "lesion"}]
-    else:
-        # Matches DIAGNOSIS_LABEL_MAP convention used elsewhere (1=benign, 2=malignant, ...).
-        categories = [{"id": c, "name": f"class_{c}"} for c in range(1, num_classes)]
+    # Category names double as SAM3's grounding query text, so they come from the
+    # shared prompt contract (model/sam3_prompts.py) that Sam3Teacher also reads —
+    # the FT text and the KD teacher text cannot drift apart.
+    categories = [
+        {"id": c, "name": name}
+        for c, name in enumerate(sam3_prompts.class_prompts(num_classes), start=1)
+    ]
 
     ann_path = split_dir / "_annotations.coco.json"
     with open(ann_path, "w") as f:

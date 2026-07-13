@@ -1229,6 +1229,18 @@ class SAM3TrainerAdapter(BaseTrainer):
 
         return 0.2 * bce + 0.8 * dice
 
+    def _visualize_validation(self, epoch: int, predictions_cache=None):
+        """No-op: SAM3 dataloaders yield dict-structured batches
+        ({dict_key: BatchedDatapoint}) that the generic tuple-batch
+        visualization path (BaseTrainer._run_vis_inference does ``batch[0]``)
+        cannot consume — it raises ``KeyError: 0``. SAM3 validate() also never
+        returns a predictions cache, so BaseTrainer.train() would re-run that
+        incompatible inference on every 5th (visualization) epoch and crash.
+        Qualitative SAM3 rendering lives in the native orchestrator trainer.
+        """
+        _ = (epoch, predictions_cache)
+        return
+
     def validate(self, epoch: int, return_predictions: bool = False) -> Dict[str, float]:  # noqa: ARG002
         """Validate model."""
         _ = epoch  # Required by BaseTrainer interface but not used here

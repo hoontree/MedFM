@@ -22,6 +22,12 @@ model:
   r_e: 4
   r_d: 4
   conv_lora_expert_num: 4
+  # Activation checkpointing on the ViT blocks (training only). Set true for
+  # full fine-tuning vit_h at img_size 1024 to avoid OOM.
+  use_grad_checkpoint: false
   checkpoint: null
   binary_checkpoint: experiment_results/SAM_binary_ft/checkpoints/best_epoch_43_dice_0.7637.pth
-  multiclass_checkpoint: experiment_results/SAM_multiclass_ft/checkpoints/best_epoch_52_dice_0.5694.pth
+  # vit_b full-FT @224, 3-class (bg/benign/malignant), val Dice 0.7155 (2026-07-13, unified
+  # recipe: AMP + backbone_lr_scale=0.1). Replaces the old 0.5694 (legacy recipe) for
+  # recipe-consistency across the multiclass teacher-strength spectrum.
+  multiclass_checkpoint: logs/train/sam/20260713_050019_vit_b_mc224_bs32_lr0.0001_encoder_ft_re4/checkpoints/best_epoch_23_dice_0.7155.pth

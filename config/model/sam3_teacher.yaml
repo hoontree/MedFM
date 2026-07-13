@@ -1,0 +1,54 @@
+# @package _global_
+# SAM3 wrapped as a frozen dense-logit KD teacher (model/sam3_teacher.py).
+# SAM3's native output is matcher-selected instance masks; Sam3Teacher bridges
+# the student's imagenet-normalized 224 input up to SAM3's 1008 pipeline, runs
+# text-prompted grounding, and aggregates instances into a dense
+# [B,num_classes,H,W] logit map the distiller consumes as teacher_outputs["masks"].
+#   - binary (num_classes=1): single "lesion" prompt → 1 fg log-odds channel.
+#   - multiclass (num_classes=3): one prompt per foreground class (benign,
+#     malignant) grounded independently → [bg, benign, malignant] log-probs.
+#
+# The prompts must match the COCO manifest category names the teacher was
+# fine-tuned on; both sides read them from model/sam3_prompts.py, so set
+# `prompt_set` to whichever set built the manifest (v1 = bare adjectives,
+# v2 = BI-RADS noun phrases, i.e. model=sam3_mc_v2).
+#
+# Only used as a teacher via `teacher=sam3_teacher` (no standalone trainer here;
+# SAM3 itself is fine-tuned with `train.py model=sam3` (binary) / `model=sam3_mc`
+# (multiclass)).
+model:
+  name: sam3_teacher
+  _target_: model.sam3_teacher.Sam3Teacher
+  num_classes: ${data.num_classes}
+  resolution: 1008
+  # Named prompt set (model/sam3_prompts.py) used when class_prompts is null.
+  # v2 = the BI-RADS noun phrases the multiclass_checkpoint below was fine-tuned on.
+  # (Binary ignores this — class_prompts(1) is always ["lesion"].)
+  prompt_set: v2
+  # Explicit per-foreground-class grounding prompts; null → derived from
+  # num_classes + prompt_set: ["lesion"] (binary) or the set's names (3-class).
+  class_prompts: null
+  score_threshold: 0.2
+  # auto → "max" for binary (as the §8 spectrum used), "top1" for multiclass.
+  # A broad prompt like "benign" spawns many spurious instances that "max" unions
+  # into a flooded map; top1 measured per-class Dice 0.270 → 0.354.
+  aggregate: auto
+  bpe_path: model/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  load_from_hf: true
+  # SAM3 fine-tune @1008, val Dice 0.8558 (converged 2026-07-12). Strongest
+  # teacher on the spectrum. Sam3Teacher._load_finetuned handles the sam3_adapter
+  # save format ({"model": state_dict}).
+  binary_checkpoint: logs/train/sam3/20260711_161827_bs1_lr0.0001/checkpoints/best_epoch_9_dice_0.8558.pth
+  # SAM3 multiclass FT @1008 with the v2 (BI-RADS) prompt manifest — MUST be paired
+  # with prompt_set: v2 above (frozen text encoder: prompts it never saw = garbage).
+  #
+  # Binary-foreground val Dice 0.842 — i.e. it *segments* lesions as well as the
+  # binary teacher (0.856). But per-class (benign/malignant) Dice is only 0.377:
+  # a strong lesion segmenter and a weak diagnostic classifier. Two rounds of fixes
+  # (max→top1 aggregation 0.270→0.354; v1→v2 visual prompts 0.354→0.377) recovered
+  # +40% relative but could not close the gap — class information cannot be carried
+  # through SAM3's frozen text encoder the way SAM's free output channels carry it
+  # (vit_b/l/h reach 0.72–0.75 on the same data). So SAM3 is the *strongest* binary
+  # teacher and the *weakest* multiclass one — it anchors the weak (teacher ≪ student)
+  # end of the multiclass spectrum.
+  multiclass_checkpoint: logs/train/sam3/20260713_111233_bs1_lr0.0001/checkpoints/epoch_10.pth

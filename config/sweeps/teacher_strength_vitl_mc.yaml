@@ -1,0 +1,15 @@
+# Multiclass (3-class) teacher-strength sweep — teacher = SAM vit_l full-FT,
+# student = TinyUSFM. `teacher=sam_vit_l` + num_classes=3 → sam_vit_l.yaml
+# multiclass_checkpoint (Phase A artifact). Run AFTER the vit_l MC teacher exists.
+# Method set + shared overrides: _teacher_strength_base.yaml.
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/teacher_strength_vitl_mc.yaml \
+#       --workers gpu2:1,gpu2:2,gpu2:3,gpu6:0,gpu6:1
+
+extends: _teacher_strength_base.yaml
+group_label: teacher_strength_mc/vit_l
+
+base_overrides:
+  - teacher=sam_vit_l
+  - data.num_classes=3

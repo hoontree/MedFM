@@ -202,6 +202,7 @@ class LoRA_Sam(nn.Module):
         conv_lora_expert_num: int = 4,
         checkpoint: Optional[str] = None,
         sam_checkpoint: Optional[str] = None,
+        use_grad_checkpoint: bool = False,
         **kwargs,
     ):
         super(LoRA_Sam, self).__init__()
@@ -246,6 +247,13 @@ class LoRA_Sam(nn.Module):
         LOGGER.info(
             "[LoRA_Sam] Loaded SAM '%s' backbone from %s", sam_type, sam_checkpoint
         )
+
+        # Enable activation checkpointing on the ViT blocks when requested
+        # (only affects the forward path during training). Essential for
+        # full fine-tuning vit_l/vit_h at large img_size without OOM.
+        sam_model.image_encoder.use_checkpoint = use_grad_checkpoint
+        if use_grad_checkpoint:
+            LOGGER.info("[LoRA_Sam] Gradient checkpointing enabled on image encoder")
 
         # Setup lora layers for encoder
         self.lora_layer = list(range(len(sam_model.image_encoder.blocks)))

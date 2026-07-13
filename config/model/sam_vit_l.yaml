@@ -1,0 +1,15 @@
+# @package _global_
+# SAM vit_l full-FT teacher, trained at 224 to match the KD/student resolution.
+# Used as a "teacher strength" point via `teacher=sam_vit_l` in the
+# teacher_strength sweeps. Inherits everything from config/model/sam.yaml and
+# only pins the backbone variant + its fine-tuned checkpoints.
+defaults:
+  - sam
+  - _self_
+
+model:
+  sam_type: vit_l
+  # vit_l full-FT @224 teacher, val Dice 0.8216 (trained 2026-07-11).
+  binary_checkpoint: logs/train/sam/20260711_142806_vit_l_ft224_bs32_lr0.0001_encoder_ft_re4/checkpoints/best_epoch_18_dice_0.8216.pth
+  # vit_l full-FT @224, 3-class (bg/benign/malignant), val Dice 0.7221 (2026-07-13, unified recipe).
+  multiclass_checkpoint: logs/train/sam/20260713_044542_bs32_lr0.0001_encoder_ft_re4/checkpoints/best_epoch_11_dice_0.7221.pth

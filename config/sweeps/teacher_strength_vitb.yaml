@@ -1,0 +1,18 @@
+# Teacher-strength sweep — teacher = SAM vit_b full-FT (weakest SAM, ~0.76),
+# student = TinyUSFM. The low-strength anchor of the axis.
+# `teacher=sam` resolves config/model/sam.yaml (sam_type=vit_b, the existing
+# SAM_binary_ft checkpoint). Method set + shared overrides: _teacher_strength_base.yaml.
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/teacher_strength_vitb.yaml \
+#       --workers local:1,local:2,local:3,gpu2:1,gpu2:2
+
+extends: _teacher_strength_base.yaml
+group_label: teacher_strength/vit_b
+
+base_overrides:
+  - teacher=sam
+  # Binary task. dynamic.yaml defaults to 3; without this the binary teacher
+  # checkpoint is not selected (load_model_cfg picks the null multiclass_checkpoint)
+  # and the teacher loads only its base backbone.
+  - data.num_classes=1

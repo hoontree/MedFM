@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from icecream import ic
 
 from typing import Optional, Tuple, Type
@@ -55,6 +56,12 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
+
+        # When True, wrap each transformer block in gradient checkpointing during
+        # training to trade compute for activation memory (needed for full
+        # fine-tuning of the larger backbones — vit_h at img_size 1024 — without
+        # OOM). Toggled at build time by LoRA_Sam via `use_grad_checkpoint`.
+        self.use_checkpoint = False
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -110,7 +117,13 @@ class ImageEncoderViT(nn.Module):
             x = x + self.pos_embed
 
         for blk in self.blocks:
-            x = blk(x)
+            if self.use_checkpoint and self.training:
+                # use_reentrant=False handles inputs that don't require grad
+                # (e.g. the patch embedding) without silently disabling the
+                # backward recomputation.
+                x = cp.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
 
         x = self.neck(x.permute(0, 3, 1, 2))  # [b, c, h, w], [1, 256, 64, 64]
 

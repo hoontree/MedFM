@@ -8,6 +8,13 @@ training:
   num_workers: 4
   dice_weight: 0.8
   moe_loss_weight: 100
+  # Mixed precision (bf16 default; needs no loss scaling). Enables full
+  # fine-tuning of vit_l/vit_h at img_size 1024 within memory.
+  amp: true
+  amp_dtype: bfloat16          # bfloat16 | float16
+  # LR multiplier for the ViT image encoder relative to decoder/prompt head.
+  # 1.0 = single-LR (previous behavior); 0.1 = SAM3-style discriminative FT.
+  backbone_lr_scale: 1.0
   warmup:
     enabled: true
     steps: 200

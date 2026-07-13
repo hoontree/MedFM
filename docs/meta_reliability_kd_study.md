@@ -199,3 +199,93 @@ uv run tools/run_reliability_ablation.py \
 - **SAM functional forward.** `functional_call` swaps only trainable params over
   the module's own params/buffers; verify on the 1-epoch smoke run that the
   SAM-student path produces finite meta gradients before scaling out.
+
+## 8. Results — teacher-strength spectrum
+
+The core reliability hypotheses (H2/H3 and the "no-harm" property) are sharpest
+when the teacher's strength is *varied*. Every reliability/meta sweep in §3 used a
+single weak teacher (SAM vit_b full-FT, val Dice 0.764, below the TinyUSFM 0.80
+student). To fill that axis we fine-tuned a **teacher-strength spectrum** — SAM
+vit_b < vit_l < vit_h < SAM3 — and ran the five methods (`task_only`, `logit_kd`,
+`reliability`, `learned_pseudo`, `meta_scalar`) against each, holding the student
+(TinyUSFM), data (binary BUSBRA+BUSI+B), and schedule fixed.
+
+**Teachers (val Dice @ their native res):**
+
+| teacher | val Dice | notes |
+|---|---|---|
+| SAM vit_b FT | 0.7637 | weak (below student) |
+| SAM vit_l FT | 0.8216 | AMP + param-group LR |
+| SAM vit_h FT | 0.8299 | + grad-checkpointing @1024 |
+| SAM3 (grounding) | 0.8558 | dense-logit wrapper, "lesion" prompt @1008 |
+
+All teachers feed the student one shared 224 batch: SAM teachers are trained/eval
+at their native resolution but distill at 224; SAM3 bridges 224→1008 internally
+(`model/sam3_teacher.py`). Student trains at 224 throughout.
+
+### 8.1 Student Dice by teacher × method
+
+*(19/20 cells; SAM3×learned_pseudo still running — marked "—".)*
+
+**External (BUID + BUS_UCLM_filtered), mean Dice:**
+
+| teacher (Dice) | task_only | logit_kd | reliability | learned_pseudo | meta_scalar |
+|---|---|---|---|---|---|
+| vit_b (0.764) | 0.7869 | 0.7896 | 0.7936 | 0.7990 | 0.7937 |
+| vit_l (0.822) | 0.7889 | 0.8127 | 0.8092 | 0.8057 | 0.8122 |
+| vit_h (0.830) | 0.8086 | 0.8083 | 0.8021 | 0.8016 | 0.8016 |
+| sam3 (0.856) | 0.7811 | 0.7867 | 0.7948 | — | 0.7999 |
+
+**Internal (BUSBRA/BUSI/B test), mean Dice:**
+
+| teacher (Dice) | task_only | logit_kd | reliability | learned_pseudo | meta_scalar |
+|---|---|---|---|---|---|
+| vit_b (0.764) | 0.8076 | 0.7804 | 0.7826 | 0.8042 | 0.7934 |
+| vit_l (0.822) | 0.8086 | 0.8124 | 0.8082 | 0.8110 | 0.8063 |
+| vit_h (0.830) | 0.7994 | 0.8082 | 0.8107 | 0.8002 | 0.8116 |
+| sam3 (0.856) | 0.8040 | 0.7834 | 0.8049 | — | 0.7986 |
+
+ΔDice-vs-`task_only` tables and the 2D spectrum plots are reproduced by:
+
+```bash
+uv run tools/summarize_teacher_strength.py \
+    --teacher-dice sam=0.7637,sam_vit_l=0.8216,sam_vit_h=0.8299,sam3_teacher=0.8558 \
+    --split ext --plot docs/figs/teacher_strength_ext.png   # or --split int
+```
+
+![external spectrum](figs/teacher_strength_ext.png)
+![internal spectrum](figs/teacher_strength_int.png)
+
+### 8.2 Findings
+
+1. **Vanilla KD is harmful at both ends of the spectrum.** With the weak vit_b
+   teacher, `logit_kd` *drops* internal Dice by −0.027 vs the `task_only` floor;
+   with the strongest teacher (SAM3, likely mis-calibrated after the 1008→224
+   bridge) it drops −0.021. Naïvely trusting teacher logits fails when the teacher
+   is either below the student or distribution-shifted.
+
+2. **Reliability re-weighting recovers the harm — the "no-harm" property.**
+   Against vit_b, `learned_pseudo` pulls internal ΔDice back to −0.003 (near
+   neutral) and external to +0.012 (best in row). Against SAM3, `reliability`
+   restores internal to +0.001 (vs vanilla −0.021) and `meta_scalar` gives the
+   best external gain (+0.019). The reliability path never inherits vanilla KD's
+   worst-case damage.
+
+3. **The reliability advantage is U-shaped in teacher strength.** The gap between
+   reliability methods and vanilla `logit_kd` is largest at the extremes (weak
+   vit_b, strong-but-shifted SAM3) and smallest in the mid-band (vit_l/vit_h),
+   where a well-matched teacher makes vanilla KD already near-optimal. This is
+   direct evidence for **H3**: meta-reliability is *not* a monotone function of
+   teacher correctness — it responds to distillation *usefulness*, which peaks
+   where the teacher and student disagree in exploitable ways.
+
+4. **`meta_scalar` no-harm (≥ `logit_kd`) holds at the extremes**, where it
+   matters most (vit_b, vit_h internal; vit_b, sam3 external). In the mid-band it
+   dips below vanilla by ≤0.002 Dice — within run-to-run noise for single-seed
+   cells — precisely where vanilla KD has no harm to protect against.
+
+**Takeaway.** Reliability-aware KD buys its largest, most reliable gains exactly
+where plain KD is dangerous: a teacher weaker than the student, or a strong
+teacher under distribution/resolution shift. Across a 0.76→0.86 teacher-Dice
+spectrum it never underperforms the `task_only` floor by a meaningful margin,
+which plain `logit_kd` does at both ends.

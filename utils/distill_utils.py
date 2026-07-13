@@ -9,6 +9,37 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 _MODEL_CFG_DIR = Path(__file__).resolve().parent.parent / "config" / "model"
 
 
+def _load_model_yaml(name: str, _seen: Optional[set] = None) -> DictConfig:
+    """Load ``config/model/{name}.yaml``, resolving sibling ``defaults:`` inheritance.
+
+    Teacher/student configs are addressed by bare name (``teacher=sam_vit_h``) and
+    read straight off disk, so Hydra's composition never runs on them. Without this,
+    a variant config could not say ``defaults: [sam]`` and would have to copy every
+    field of its parent. Only sibling entries in the ``model`` group are merged;
+    cross-group entries (``- /training: sam_training``) are Hydra's business and are
+    ignored here, as is ``_self_`` (this config always wins over its parents).
+    """
+    cfg_path = _MODEL_CFG_DIR / f"{name}.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Model config not found: {cfg_path}")
+
+    _seen = _seen or set()
+    if name in _seen:
+        raise ValueError(f"Circular `defaults:` in config/model: {name} revisited.")
+    _seen.add(name)
+
+    cfg = OmegaConf.load(cfg_path)
+    parents = [
+        entry
+        for entry in cfg.pop("defaults", []) or []
+        if isinstance(entry, str) and entry != "_self_"
+    ]
+    if not parents:
+        return cfg
+    merged = OmegaConf.merge(*[_load_model_yaml(p, _seen) for p in parents], cfg)
+    return merged
+
+
 def load_model_cfg(name: str, num_classes: int) -> DictConfig:
     """Load ``config/model/{name}.yaml`` and extract the ``model:`` section.
 
@@ -21,15 +52,11 @@ def load_model_cfg(name: str, num_classes: int) -> DictConfig:
     unresolved here — the caller is responsible for merging this into a parent
     config so interpolations resolve correctly.
     """
-    cfg_path = _MODEL_CFG_DIR / f"{name}.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Model config not found: {cfg_path}")
-
-    full_cfg = OmegaConf.load(cfg_path)
+    full_cfg = _load_model_yaml(name)
     model_cfg = full_cfg.get("model")
     if model_cfg is None:
         raise ValueError(
-            f"{cfg_path} does not contain a 'model:' section."
+            f"{_MODEL_CFG_DIR / f'{name}.yaml'} does not contain a 'model:' section."
         )
 
     OmegaConf.set_struct(model_cfg, False)

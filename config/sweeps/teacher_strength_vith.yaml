@@ -1,0 +1,14 @@
+# Teacher-strength sweep — teacher = SAM vit_h full-FT (strong SAM), student = TinyUSFM.
+# The high-strength SAM point of the axis. Method set + shared overrides:
+# _teacher_strength_base.yaml.
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/teacher_strength_vith.yaml \
+#       --workers gpu6:0,gpu6:1,gpu2:1,gpu2:2,gpu2:3
+
+extends: _teacher_strength_base.yaml
+group_label: teacher_strength/vit_h
+
+base_overrides:
+  - teacher=sam_vit_h
+  - data.num_classes=1

@@ -1,0 +1,18 @@
+# Teacher-strength sweep — teacher = SAM3 (wrapped, model/sam3_teacher.py),
+# student = TinyUSFM. The strongest / distinct-architecture point of the axis.
+# Method set + shared overrides: _teacher_strength_base.yaml.
+#
+# Sam3Teacher takes the student's 224 input and bridges it up to SAM3's 1008
+# grounding pipeline internally, so data stays at 224. SAM3 inference is heavy —
+# prefer high-VRAM workers.
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/teacher_strength_sam3.yaml \
+#       --workers gpu6:0,gpu6:1,gpu2:1,gpu2:2
+
+extends: _teacher_strength_base.yaml
+group_label: teacher_strength/sam3
+
+base_overrides:
+  - teacher=sam3_teacher
+  - data.num_classes=1

@@ -46,9 +46,31 @@ class SAMTrainer(BaseTrainer):
             "warmup", {"enabled": False, "steps": 0}
         )
 
+        # Mixed precision. bf16 (default) needs no loss scaling; fp16 does.
+        # Enables full fine-tuning of the larger backbones (vit_l/vit_h at
+        # img_size 1024) within memory. Disabled → exact fp32 behavior as before.
+        self.amp_enabled = bool(self.cfg.training.get("amp", False))
+        amp_dtype_str = str(self.cfg.training.get("amp_dtype", "bfloat16")).lower()
+        self.amp_dtype = torch.float16 if amp_dtype_str in ("float16", "fp16", "half") else torch.bfloat16
+        # GradScaler is a no-op passthrough unless enabled (fp16 only).
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        # Down-scale the backbone (image encoder) LR relative to the decoder/
+        # prompt head. 1.0 preserves the previous single-LR behavior.
+        self.backbone_lr_scale = float(self.cfg.training.get("backbone_lr_scale", 1.0))
+
     @override
     def _create_model(self):
         """Create SAM model using ModelBuilder."""
+        # Refresh img_size from the (now synced) data config. __init__ cached
+        # cfg.model.img_size before _create_dataloaders ran
+        # _sync_img_size_with_sam_type, so for vit_l/vit_h it was stale at the
+        # 224 default; the sync bumped data/model img_size to 1024. Using the
+        # stale value made the eval forward postprocess masks to 224 while GT
+        # labels are 1024 → shape-mismatch crash in the evaluator.
+        self.img_size = int(self.cfg.data.img_size)
+
         # Keep trainer runtime img_size aligned with any pre-dataloader sync.
         self.model = instantiate(self.cfg.model).to(self.device)
 
@@ -62,14 +84,45 @@ class SAMTrainer(BaseTrainer):
 
     @override
     def _create_optimizer(self):
-        """Create optimizer."""
+        """Create optimizer with separate LR for backbone vs decoder/prompt.
+
+        The ViT image encoder ("backbone") is trained at ``base_lr *
+        backbone_lr_scale`` (default 1.0 → identical to a single-group AdamW),
+        while the mask decoder / prompt encoder use the full ``base_lr``. This
+        discriminative schedule stabilizes full fine-tuning of the large
+        backbones, mirroring the SAM3 recipe.
+        """
+        weight_decay = self.cfg.optimizer.get("weight_decay", 0.1)
+        base_model = self._get_base_model()
+
+        backbone_params, other_params = [], []
+        for name, p in base_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "image_encoder" in name:
+                backbone_params.append(p)
+            else:
+                other_params.append(p)
+
+        param_groups = [
+            {"params": other_params, "lr": self.base_lr},
+            {"params": backbone_params, "lr": self.base_lr * self.backbone_lr_scale},
+        ]
+        param_groups = [g for g in param_groups if g["params"]]
+
         self.optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=self.base_lr,
-            weight_decay=self.cfg.optimizer.get("weight_decay", 0.1),
+            param_groups, lr=self.base_lr, weight_decay=weight_decay
         )
 
-        self.logger.info(f"Optimizer: AdamW, Base LR: {self.base_lr}")
+        self.logger.info(
+            "Optimizer: AdamW, decoder/prompt LR=%s, backbone LR=%s (scale=%s), "
+            "backbone params=%d, other params=%d",
+            self.base_lr,
+            self.base_lr * self.backbone_lr_scale,
+            self.backbone_lr_scale,
+            len(backbone_params),
+            len(other_params),
+        )
 
     @override
     def _create_scheduler(self):
@@ -222,23 +275,29 @@ class SAMTrainer(BaseTrainer):
 
             # Forward pass: use multimask output when num_classes > 1
             multimask_output = self.cfg.data.num_classes > 1
-            outputs = self.model(image_batch, multimask_output, self.img_size)
 
-            # Calculate loss
-            loss, loss_ce, loss_dice, loss_moe = self._calc_loss(
-                outputs, label_batch, low_res_label_batch
-            )
-
-            # Backward pass
             self.optimizer.zero_grad()
-            loss.backward()
+            with torch.amp.autocast(
+                device_type=self.device.type,
+                enabled=self.amp_enabled,
+                dtype=self.amp_dtype,
+            ):
+                outputs = self.model(image_batch, multimask_output, self.img_size)
+                loss, loss_ce, loss_dice, loss_moe = self._calc_loss(
+                    outputs, label_batch, low_res_label_batch
+                )
+
+            # Backward pass (scaler is a no-op unless fp16 AMP is active)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.gradient_clip_max_norm
             )
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
             # Get current learning rate

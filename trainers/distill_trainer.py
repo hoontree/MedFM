@@ -255,6 +255,16 @@ class DistillTrainer(BaseTrainer):
 
         OmegaConf.set_struct(self.cfg.method, False)
 
+        # Re-seed before building the student. The teacher is instantiated first and
+        # its random init consumes a teacher-size-dependent amount of the global RNG
+        # (SAM vit_b 90M vs vit_l 308M vs vit_h 636M params), so without this the
+        # student's init — and therefore its whole training trajectory — silently
+        # differs per teacher. That made the teacher-independent `task_only` floor
+        # vary by ~4 Dice points across teacher directions, i.e. as much as the KD
+        # effects being measured. Re-seeding pins the student init identical for
+        # every teacher, so cross-teacher comparisons are apples-to-apples.
+        set_seed(self.cfg.hardware.seed)
+
         self.student = instantiate(self.cfg.student_cfg)
         self.student = self.student.to(self.device)
         self.model = self.student  # base-class compatibility

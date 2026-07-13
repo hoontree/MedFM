@@ -1,0 +1,46 @@
+# Shared base for the teacher-strength sweeps (extended via `extends:`; not
+# runnable on its own — it has no group_label or teacher).
+#
+# The axis is teacher strength {vit_b < vit_l < vit_h < sam3}, crossed with a
+# FIXED method set (task-only / vanilla-KD / hand-crafted-reliability / learned-
+# pseudo / meta-scalar). The method set lives here, once, so every teacher runs
+# exactly the same five cells and the §8 results table stays comparable — adding
+# or reweighting a method is a single edit, not eight.
+#
+# Each child pins `group_label`, the `teacher=` override, and data.num_classes
+# (1 = binary, 3 = multiclass).
+#
+# All teachers/students run at 224 (the shared KD input resolution; TinyUSFM is
+# fixed at 224). auto_img_size_by_sam_type is disabled so a vit_l/vit_h teacher
+# does not force data.img_size to 1024 and break the student.
+
+base_overrides:
+  - student=tinyusfm
+  - data.auto_img_size_by_sam_type=false
+  - data.img_size=224
+  - resume=auto
+
+experiments:
+  task_only:                                  # floor (no KD)
+    - method=unified
+    - method.w_task=1.0
+    - method.w_reliability_kd=0.0
+    - method.w_logit_kd=0.0
+  logit_kd:                                   # vanilla Hinton KD
+    - method=unified
+    - method.w_task=1.0
+    - method.w_logit_kd=1.0
+    - method.w_reliability_kd=0.0
+  reliability:                                # hand-crafted reliability-weighted KD
+    - method=unified
+    - method.w_task=1.0
+    - method.w_reliability_kd=1.0
+    - method.w_logit_kd=0.0
+  learned_pseudo:                             # θ fit to teacher_correct×conf (pseudo-label)
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.mode=learned
+  meta_scalar:                                # HEADLINE: meta-learned scalar reliability
+    - method=meta_reliability
+    - trainer._target_=trainers.meta_distill_trainer.MetaDistillTrainer
+    - method.meta_reliability.mode=meta

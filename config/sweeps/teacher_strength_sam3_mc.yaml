@@ -1,0 +1,22 @@
+# Multiclass (3-class) teacher-strength sweep — teacher = SAM3 (wrapped,
+# model/sam3_teacher.py, per-class grounding), student = TinyUSFM. Strongest /
+# distinct-architecture point of the MULTICLASS spectrum: Sam3Teacher grounds one
+# prompt per foreground class (benign, malignant — see model/sam3_prompts.py) and
+# emits [bg,c1,c2] logits. `teacher=sam3_teacher` + num_classes=3 →
+# sam3_teacher.yaml multiclass_checkpoint (Phase B SAM3 MC-FT artifact).
+#
+# SAM3 inference is heavy — prefer high-VRAM workers. Run AFTER the SAM3 MC teacher
+# exists AND passes the val-Dice sanity check (tools/sanity_sam3_mc_teacher.py); else
+# fall back to the SAM-only 3-teacher spectrum.
+# Method set + shared overrides: _teacher_strength_base.yaml.
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/teacher_strength_sam3_mc.yaml \
+#       --workers gpu6:0,gpu6:1,gpu2:1,gpu2:2
+
+extends: _teacher_strength_base.yaml
+group_label: teacher_strength_mc/sam3
+
+base_overrides:
+  - teacher=sam3_teacher
+  - data.num_classes=3

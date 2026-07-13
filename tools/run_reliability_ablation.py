@@ -195,9 +195,37 @@ def build_command(host, gpu, overrides, config_name=CONFIG_NAME):
     return ["ssh", host, f"bash -lc {shlex.quote(remote)}"], True
 
 
+def load_manifest(path):
+    """Read a sweep manifest, merging in its `extends:` parent if it has one.
+
+    Sweeps that vary one axis (e.g. the teacher) while holding the method set
+    fixed declare `extends: <sibling>.yaml` and state only what differs. Without
+    this, comparing N teachers means N copies of the same `experiments:` block,
+    and a method added to only N-1 of them silently yields a non-comparable cell
+    in the results table.
+
+    Merge rules: `base_overrides` is the parent's list followed by the child's
+    (Hydra takes the last occurrence, so the child wins on any repeated key);
+    `experiments` is a dict update; any other key the child sets wins outright.
+    """
+    path = Path(path)
+    manifest = yaml.safe_load(path.read_text())
+    parent = manifest.pop("extends", None)
+    if not parent:
+        return manifest
+
+    merged = load_manifest(path.parent / parent)
+    overrides = list(merged.get("base_overrides", [])) + list(manifest.pop("base_overrides", []))
+    experiments = {**merged.get("experiments", {}), **manifest.pop("experiments", {})}
+    merged.update(manifest)
+    merged["base_overrides"] = overrides
+    merged["experiments"] = experiments
+    return merged
+
+
 def main():
     args = parse_args()
-    manifest = yaml.safe_load(Path(args.manifest).read_text())
+    manifest = load_manifest(args.manifest)
     experiments = manifest["experiments"]
 
     group = args.group or manifest.get("group_label")
