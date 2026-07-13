@@ -1,0 +1,53 @@
+# Shared scaffolding for the distill.py entry configs (distill.yaml and the
+# direction-specific distill_*_binary.yaml). Not runnable on its own — it sets
+# no teacher/student. Each entry does `defaults: [_distill_base, _self_]` and
+# states only what differs (teacher/student names, method group, gpu_ids, and
+# any entry-specific block).
+defaults:
+  - data: dynamic
+  - method: unified
+  - training: distillation
+  - wandb: distill
+  - _self_
+
+trainer:
+  _target_: trainers.distill_trainer.DistillTrainer
+
+# Teacher / Student model names — resolved against config/model/{name}.yaml.
+# Each model yaml is expected to expose `binary_checkpoint` and
+# `multiclass_checkpoint`; the appropriate one is selected from data.num_classes.
+# (Entries set the concrete names.)
+
+# Optional checkpoint override applied on top of the resolved teacher/student
+# model config (e.g. to pick a specific trained artifact — a balanced-sampler
+# run, a particular ablation — without needing a dedicated model yaml just to
+# swap one path).
+teacher_checkpoint: null
+student_checkpoint: null
+
+# Human-readable experiment label (sweeps set this). Kept separate from
+# method.name (which is semantic: unified/online) so the label can never
+# accidentally flip distiller behaviour (e.g. method.name=="online").
+# Used in the log-dir name and the W&B run name when set.
+run_name: null
+
+# Hardware Configuration (Global Overrides)
+hardware:
+  gpu_ids: [0]
+  seed: 42
+
+# Global Flags
+debug: false
+use_gradnorm: false
+
+# Resume: null/false = fresh run (default); "auto" = reuse the latest prior run
+# dir matching this run's signature (run_name + hparam tags) that holds a
+# checkpoints/last.pth; or an explicit path to a last.pth / run dir.
+resume: null
+
+# Output & Visualization
+output:
+  dir: logs
+
+visualization:
+  num_samples: 10

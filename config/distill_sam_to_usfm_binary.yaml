@@ -1,50 +1,15 @@
-# Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student) — binary
+# Knowledge Distillation Configuration: SAM (teacher) -> TinyUSFM (student) — binary.
+# Shared scaffolding: config/_distill_base.yaml. Only the direction, gpu, and the
+# reliability-analysis block below are specific to this entry.
 defaults:
-  - data: dynamic
-  - method: unified
-  - training: distillation
-  - wandb: distill
+  - _distill_base
   - _self_
-
-trainer:
-  _target_: trainers.distill_trainer.DistillTrainer
 
 teacher: sam
 student: tinyusfm
 
-# Optional checkpoint override applied on top of the resolved teacher/student
-# model config (e.g. to pick a specific trained artifact — a balanced-sampler
-# run, a particular ablation — without needing a dedicated model yaml just to
-# swap one path).
-teacher_checkpoint: null
-student_checkpoint: null
-
-# Human-readable experiment label (sweeps set this). Kept separate from
-# method.name (which is semantic: unified/online) so the label can never
-# accidentally flip distiller behaviour (e.g. method.name=="online").
-# Used in the log-dir name and the W&B run name when set.
-run_name: null
-
-# Hardware Configuration (Global Overrides)
 hardware:
   gpu_ids: [3]
-  seed: 42
-
-# Global Flags
-debug: false
-use_gradnorm: false
-
-# Resume: null/false = fresh run (default); "auto" = reuse the latest prior run
-# dir matching this run's signature (run_name + hparam tags) that holds a
-# checkpoints/last.pth; or an explicit path to a last.pth / run dir.
-resume: null
-
-# Output & Visualization
-output:
-  dir: logs
-
-visualization:
-  num_samples: 10
 
 # Reliability-map analysis (tools/analyze_reliability.py only; unused by distill.py).
 analysis:
