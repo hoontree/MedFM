@@ -232,12 +232,30 @@ class Sam3Teacher(nn.Module):
         # which map_location=device would needlessly materialize in VRAM before
         # being discarded. load_state_dict copies into the CUDA params regardless.
         sd = torch.load(path, map_location="cpu")
-        # SAM3TrainerAdapter._save_model may wrap under a key; normalize.
+        # Normalize any wrapper key our savers use before load. SAM3TrainerAdapter
+        # ._save_model wraps under "model"; DistillTrainer._save_distill_model under
+        # "model_state_dict"; some checkpoints under "state_dict". Missing any of
+        # these (the old code omitted "model_state_dict") makes a distill-trained
+        # SAM3 student reused as a teacher match *nothing* under strict=False and
+        # silently revert to base weights.
         if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
             sd = sd["model"]
+        if isinstance(sd, dict) and "model_state_dict" in sd and isinstance(sd["model_state_dict"], dict):
+            sd = sd["model_state_dict"]
         if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
             sd = sd["state_dict"]
         missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        # A checkpoint whose schema we failed to unwrap loads zero parameters under
+        # strict=False and quietly falls back to the base/HF weights — an invisible
+        # wrong-checkpoint. Treat "matched no parameters" as a hard error.
+        n_model_keys = len(self.model.state_dict())
+        if len(missing) >= n_model_keys:
+            raise RuntimeError(
+                f"[Sam3Teacher] checkpoint {path} matched no model parameters "
+                f"(missing={len(missing)}/{n_model_keys}, unexpected={len(unexpected)}). "
+                "The checkpoint schema is likely unrecognized — expected a raw "
+                "state_dict or one wrapped under 'model'/'model_state_dict'/'state_dict'."
+            )
         LOGGER.info(
             "[Sam3Teacher] loaded fine-tuned weights from %s (missing=%d, unexpected=%d)",
             path, len(missing), len(unexpected),
@@ -352,7 +370,13 @@ class Sam3Teacher(nn.Module):
         b, _, h, w = images.shape
         x01 = (images * self.inet_std + self.inet_mean).clamp(0.0, 1.0)
 
-        with torch.set_grad_enabled(self.trainable):
+        # Enable autograd only when this module is trainable AND grad is not already
+        # disabled by an enclosing context. Without the second clause a trainable
+        # student (trainable=True always) would re-enable autograd inside an outer
+        # ``torch.no_grad()`` — so validation would build a full 1008² ViT graph
+        # (OOM / slow, "eval" not actually grad-free). Training still graphs normally
+        # because train_epoch calls the student outside any no_grad.
+        with torch.set_grad_enabled(self.trainable and torch.is_grad_enabled()):
             # SAM3 input transform (resize 1008 → [0.5] normalize), then batch.
             img = torch.stack([proc.transform(x01[i]) for i in range(b)]).to(proc.device)
 

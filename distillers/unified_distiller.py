@@ -241,17 +241,23 @@ class UnifiedDistiller(BaseDistiller):
 
         missing_s = [i for i in self.feature_pairs if i not in self.student_layers]
         missing_t = [i for i in self.feature_pairs if i not in self.teacher_layers]
-        if missing_s:
-            logger.warning("Student has no `*.blocks.%s` modules", missing_s)
-        if missing_t:
-            logger.warning("Teacher has no `*.blocks.%s` modules", missing_t)
 
         usable = [i for i in self.feature_pairs
                   if i in self.student_layers and i in self.teacher_layers]
+        # Feature-CWD was explicitly requested (w_feature_cwd > 0, checked above),
+        # so unresolvable block paths are a misconfiguration, not something to warn
+        # past: silently returning here leaves feature_cwd_loss == 0 for the whole
+        # run (e.g. a SAM3 student, which exposes no `*.blocks.N` modules), i.e. a
+        # loss term that is enabled in the config but distills nothing. Fail loud.
         if not usable:
-            logger.warning("No usable feature pairs after resolution; "
-                           "feature distillation will be skipped.")
-            return
+            raise ValueError(
+                f"w_feature_cwd={self.w_feature_cwd} > 0 but no feature pairs resolved "
+                f"from feature_pairs={self.feature_pairs} "
+                f"(student missing blocks {missing_s}, teacher missing blocks {missing_t}). "
+                "The chosen student/teacher expose no matching `*.blocks.N` modules for "
+                "these indices — fix method.feature_pairs, or set w_feature_cwd=0 to "
+                "disable feature distillation for this model pair."
+            )
 
         logger.info("Feature pairs resolved (block_idx → student / teacher):")
         for i in usable:

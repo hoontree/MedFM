@@ -118,13 +118,25 @@ class DistillTrainer(BaseTrainer):
         if (ckpt := self.cfg.get("teacher_checkpoint")) is not None:
             teacher_cfg.checkpoint = ckpt
 
-        # Student should not inherit the teacher's fine-tuned checkpoint by
-        # default — students typically train from a pretrained backbone or
-        # from scratch. The user can re-enable via student_cfg.checkpoint=...
-        if self.cfg.get("use_student_finetuned_ckpt", False) is False:
+        # A student may ship a task fine-tuned checkpoint (binary/multiclass_checkpoint
+        # in its model yaml, folded into `checkpoint` by load_model_cfg) as an optional
+        # warm-start. By default the student trains from base/scratch and that checkpoint
+        # is DROPPED — every current sweep relies on this. Dropping it *silently* once
+        # invalidated the SAM3-student experiment, whose whole premise is starting from
+        # the multiclass FT ("it already localizes; only the label distinction is
+        # missing"). We record the decision here (logger not yet set up) and log it
+        # loudly in _create_model so the choice is always visible, never silent.
+        use_ft = bool(self.cfg.get("use_student_finetuned_ckpt", False))
+        configured_student_ckpt = student_cfg.get("checkpoint")
+        explicit_override = self.cfg.get("student_checkpoint")
+        if explicit_override is not None:
+            student_cfg.checkpoint = explicit_override
+            self._student_ckpt_decision = ("override", explicit_override)
+        elif use_ft:
+            self._student_ckpt_decision = ("finetuned", configured_student_ckpt)
+        else:
+            self._student_ckpt_decision = ("dropped", configured_student_ckpt)
             student_cfg.checkpoint = None
-        if (ckpt := self.cfg.get("student_checkpoint")) is not None:
-            student_cfg.checkpoint = ckpt
 
         OmegaConf.set_struct(self.cfg, False)
         self.cfg.teacher_cfg = teacher_cfg
@@ -244,9 +256,29 @@ class DistillTrainer(BaseTrainer):
         self.teacher = self.teacher.to(self.device)
 
         if self._is_online:
+            # Online KD jointly updates the teacher, so it must actually carry
+            # gradient. A SAM3 teacher is built frozen (trainable=False) and both its
+            # forward (gated on `self.trainable`) and its train() are no-ops in that
+            # state — flipping the flag AND unfreezing params here is what makes online
+            # work for it; for other teachers unfreezing the parameters is enough.
+            if hasattr(self.teacher, "trainable"):
+                self.teacher.trainable = True
+            for param in self.teacher.parameters():
+                param.requires_grad_(True)
             self.teacher.train()
+            n_teacher_trainable = sum(
+                p.numel() for p in self.teacher.parameters() if p.requires_grad
+            )
+            if n_teacher_trainable == 0:
+                raise RuntimeError(
+                    "Online distillation (method.name=='online') requires a trainable "
+                    f"teacher, but teacher '{self.teacher_name}' has 0 trainable params "
+                    "after unfreezing — the teacher would never update. Check the "
+                    "teacher wrapper."
+                )
             self.logger.info(
-                "[Online Distillation] Teacher is trainable (jointly updated with student)."
+                "[Online Distillation] Teacher trainable: %d params (jointly updated).",
+                n_teacher_trainable,
             )
         else:
             self.teacher.eval()
@@ -265,11 +297,56 @@ class DistillTrainer(BaseTrainer):
         # every teacher, so cross-teacher comparisons are apples-to-apples.
         set_seed(self.cfg.hardware.seed)
 
+        # Log the student-checkpoint decision loudly (recorded in _resolve_model_cfgs,
+        # before the logger existed) so a run never silently starts from the wrong
+        # weights — the failure mode that invalidated the SAM3-student experiment.
+        kind, path = getattr(self, "_student_ckpt_decision", ("dropped", None))
+        if kind == "finetuned":
+            self.logger.info(
+                "[student ckpt] Student '%s' STARTS from fine-tuned checkpoint: %s "
+                "(use_student_finetuned_ckpt=true)", self.student_name, path,
+            )
+        elif kind == "override":
+            self.logger.info(
+                "[student ckpt] Student '%s' STARTS from student_checkpoint override: %s",
+                self.student_name, path,
+            )
+        elif path is not None:
+            self.logger.warning(
+                "[student ckpt] DROPPING the fine-tuned start checkpoint configured for "
+                "student '%s' (%s): use_student_finetuned_ckpt is false, so the student "
+                "trains from its base/pretrained weights. Set use_student_finetuned_ckpt="
+                "true to start from that checkpoint.", self.student_name, path,
+            )
+        else:
+            self.logger.info(
+                "[student ckpt] Student '%s' trains from base/pretrained weights "
+                "(no fine-tuned start checkpoint configured).", self.student_name,
+            )
+
         self.student = instantiate(self.cfg.student_cfg)
         self.student = self.student.to(self.device)
         self.model = self.student  # base-class compatibility
 
         self.distiller = create_distiller(self.cfg).to(self.device)
+
+        # Single source of truth for "online": the trainer decides online-ness from
+        # method.name (self._is_online) while the distiller identity comes from
+        # method._target_. They are configured independently, so a hand-edited config
+        # could freeze the teacher while an OnlineDistiller still computes a teacher-task
+        # term (or the reverse — pay to keep the teacher trainable but drop that term).
+        # Assert they agree.
+        from distillers.online_distiller import OnlineDistiller
+        is_online_distiller = isinstance(self.distiller, OnlineDistiller)
+        if self._is_online != is_online_distiller:
+            raise ValueError(
+                f"Inconsistent online config: method.name="
+                f"{self.cfg.method.get('name')!r} (=> _is_online={self._is_online}) but "
+                f"distiller is {type(self.distiller).__name__} "
+                f"(OnlineDistiller={is_online_distiller}). Set method.name='online' iff "
+                "method._target_ is distillers.OnlineDistiller."
+            )
+
         self.distiller.prepare(self.student, self.teacher)
 
         self._log_model_info()

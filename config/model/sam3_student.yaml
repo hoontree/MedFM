@@ -22,7 +22,9 @@ model:
   prompt_set: v2
   class_prompts: null
   score_threshold: 0.2
-  aggregate: auto          # top1 for multiclass (see Sam3Teacher)
+  aggregate: auto          # trainable student → resolves to `soft` (see Sam3Teacher);
+                           # soft is the only differentiable-through-score aggregation,
+                           # required so the classification head gets gradient.
   freeze_text_encoder: true
   bpe_path: model/sam3/assets/bpe_simple_vocab_16e6.txt.gz
   load_from_hf: true
