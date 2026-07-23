@@ -147,9 +147,13 @@ def _completed_experiments(teacher, student, group):
     return done
 
 # Overrides forced on every run in --smoke mode for a fast end-to-end check.
+# train and test must be DISJOINT datasets — the train/test leakage guard
+# (utils.data_processing.build_dataset) rejects overlap, and a smoke that reused
+# B for both now fails at construction. B (train) + BUID (external test) are both
+# small, so the wiring check stays fast.
 SMOKE_OVERRIDES = [
     "data.train=[B]",
-    "data.test=[B]",
+    "data.test=[BUID]",
     "training.num_epochs=1",
     "training.warmup_epochs=0",
     "wandb.disabled=true",  # key now provided by the `wandb` config group
