@@ -35,7 +35,13 @@ class DistillTrainer(BaseTrainer):
     Trainer for Knowledge Distillation.
     Inherits common infrastructure from BaseTrainer and overrides distillation-specific logic.
     """
-    
+
+    # When a recipe exists for the student, compute the task loss here (train_epoch)
+    # instead of inside the distiller, so it can use the full student output + batch
+    # (e.g. SAM's low-res loss). Subclasses that own the task loss in their own loop
+    # (MetaDistillTrainer's meta inner/outer loops) set this False to opt out.
+    _task_loss_in_trainer = True
+
     # Construction
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)  # initializes cfg, device, evaluator, base attrs
@@ -370,20 +376,47 @@ class DistillTrainer(BaseTrainer):
 
         self.distiller.prepare(self.student, self.teacher)
 
-        # "distillation = normal training + KD": make the student's task loss /
-        # optimizer / scheduler identical to its normal trainer's, so a run with
+        # "distillation = normal training + KD": route the student's task loss /
+        # optimizer / scheduler through its normal-training recipe, so a run with
         # every KD weight = 0 reduces exactly to normal supervised training. The
-        # recipe's task loss replaces the distiller's generic TaskLoss for the
-        # student's task term (KD terms are unaffected). Optimizer/scheduler are
-        # applied in _create_optimizer/_create_scheduler, which run next.
+        # task loss is computed in train_epoch (not the distiller) so it can use the
+        # full student output + batch — needed for SAM, whose supervised loss is on
+        # the low-res logits vs a low-res label the KD pipeline doesn't carry. The
+        # distiller then computes KD terms only (w_task forced to 0).
+        # Not applied to subclasses that own the task loss themselves
+        # (MetaDistillTrainer: _task_loss_in_trainer = False).
         self._student_recipe = get_recipe(self.student_name, self.cfg)
         self._sched_cadence = "epoch"
-        if self._student_recipe is not None:
-            self.distiller.task_loss_fn = self._student_recipe.task_loss
+        self._use_recipe = self._student_recipe is not None and self._task_loss_in_trainer
+        self._task_weight = 0.0
+        # Any active KD term means the teacher is needed each step; if none is active
+        # (a pure task_only run) we skip the teacher forward entirely, so a recipe
+        # student's task_only run is literally its normal training (no teacher).
+        self._kd_active = any(
+            float(getattr(self.distiller, w, 0.0)) > 0
+            for w in ("w_logit_kd", "w_logit_cwd", "w_feature_cwd",
+                      "w_reliability_kd", "w_uncertainty_kd")
+        )
+        if self._use_recipe:
+            self._task_weight = float(self.cfg.method.get("w_task", 1.0))
+            self.distiller.w_task = 0.0
             self.logger.info(
-                "[recipe] Student '%s' task loss/optimizer/scheduler routed through its "
-                "normal-training recipe (task_only ≡ normal training).", self.student_name,
+                "[recipe] Student '%s': task loss computed in trainer (weight=%s), "
+                "distiller does KD only — task_only ≡ normal training.",
+                self.student_name, self._task_weight,
             )
+
+        # AMP: match the student's normal-training precision (e.g. SAM trains under
+        # bf16 autocast). Disabled → exact fp32, a no-op for models like TinyUSFM
+        # whose training config sets no `amp` (preserves their fp32 behavior).
+        self.amp_enabled = bool(self.cfg.training.get("amp", False))
+        amp_dtype_str = str(self.cfg.training.get("amp_dtype", "bfloat16")).lower()
+        self.amp_dtype = torch.float16 if amp_dtype_str in ("float16", "fp16", "half") else torch.bfloat16
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        if self.amp_enabled:
+            self.logger.info("[recipe] AMP enabled: dtype=%s", self.amp_dtype)
 
         self._log_model_info()
 
@@ -411,7 +444,7 @@ class DistillTrainer(BaseTrainer):
         # With a recipe, build the student's optimizer exactly as its normal trainer
         # does (e.g. TinyUSFM's layer-wise LR decay) so task_only ≡ normal training,
         # then add the KD-side groups on top.
-        if self._student_recipe is not None:
+        if self._use_recipe:
             self.optimizer = self._student_recipe.build_optimizer(self.student, self.cfg)
             self._add_kd_param_groups()
             return
@@ -442,11 +475,12 @@ class DistillTrainer(BaseTrainer):
     @override
     def _create_scheduler(self):
         # With a recipe, build the student's scheduler as its normal trainer does
-        # (incl. honoring use_reduce_on_plateau) and record its step cadence so the
-        # train loop steps it at the right time.
-        if self._student_recipe is not None:
+        # (incl. honoring use_reduce_on_plateau / per-batch poly) and record its step
+        # cadence so the train loop steps it at the right time.
+        if self._use_recipe:
+            total_iters = int(self.cfg.training.num_epochs) * len(self.train_loader)
             self.scheduler, self._sched_cadence = self._student_recipe.build_scheduler(
-                self.optimizer, self.cfg
+                self.optimizer, self.cfg, total_iters
             )
             self.logger.info("[recipe] scheduler cadence: %s", self._sched_cadence)
             return
@@ -496,31 +530,63 @@ class DistillTrainer(BaseTrainer):
             self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
         )
 
-        for i, (images, masks, *_) in enumerate(pbar):
-            images = images.to(self.device)
-            masks = masks.to(self.device)
+        for i, batch in enumerate(pbar):
+            images = batch[0].to(self.device)
+            masks = batch[1].to(self.device)
 
             self.distiller.on_step_begin()
 
-            if self._is_online:
-                teacher_outputs = self._call_teacher(images)
-            else:
-                with torch.no_grad():
+            pure_task_only = self._use_recipe and not self._kd_active
+            teacher_outputs = None
+            if not pure_task_only:
+                if self._is_online:
                     teacher_outputs = self._call_teacher(images)
-
-            student_outputs = self._call_student(images)
-
-            loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
-            loss = loss_dict["loss"]
+                else:
+                    with torch.no_grad():
+                        teacher_outputs = self._call_teacher(images)
 
             self.optimizer.zero_grad()
-            loss.backward()
+            # autocast/GradScaler match the student's normal precision (bf16 for SAM,
+            # fp32 no-op otherwise), so task_only ≡ normal training numerically.
+            with torch.amp.autocast(
+                device_type=self.device.type, enabled=self.amp_enabled, dtype=self.amp_dtype
+            ):
+                student_outputs = self._call_student(images)
+                if pure_task_only:
+                    # No KD term active: this is exactly the student's normal training.
+                    task = self._student_recipe.task_loss(student_outputs, batch, self.device)
+                    loss = self._task_weight * task
+                    loss_dict = {"task_loss": task, "loss": loss}
+                else:
+                    loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
+                    if self._use_recipe:
+                        # Task loss owned by the trainer via the student's recipe
+                        # (distiller ran with w_task=0, so loss_dict holds KD terms only).
+                        # Uses the full student output + batch, so it reproduces the
+                        # student's normal supervised loss exactly (e.g. SAM's low-res
+                        # loss on batch[2]).
+                        task = self._student_recipe.task_loss(student_outputs, batch, self.device)
+                        loss = self._task_weight * task + loss_dict["loss"]
+                        loss_dict = dict(loss_dict)
+                        loss_dict["task_loss"] = task
+                        loss_dict["loss"] = loss
+                    else:
+                        loss = loss_dict["loss"]
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
 
             max_norm = self.cfg.optimizer.gradient_clip.get("max_norm", 1.0)
             all_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
             nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Per-batch LR schedulers (SAM / SegFormer) step here; epoch / plateau
+            # schedulers step once per epoch in the train() loop.
+            if self._sched_cadence == "batch" and self.scheduler is not None:
+                self.scheduler.step()
 
             for k, v in loss_dict.items():
                 val = v.item() if hasattr(v, "item") else v
