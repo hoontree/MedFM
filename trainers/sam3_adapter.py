@@ -72,40 +72,11 @@ _SAM3_VENDOR_ROOT = Path(__file__).resolve().parent.parent / "model" / "sam3_ven
 if str(_SAM3_VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(_SAM3_VENDOR_ROOT))
 
-_fused_mlp_patched = False
-
-
-def _patch_fused_mlp_for_training():
-    """SAM3's ViT-Det ``Mlp.forward`` (model/sam3/model/vitdet.py) always
-    calls a fused ``addmm_act`` kernel that explicitly detaches the
-    linear-layer weights and raises ``ValueError`` whenever autograd is
-    enabled — it's an inference-only optimization with no training fallback
-    upstream. Fine-tuning the vision backbone (which ``_create_optimizer``
-    already gives its own, lower LR) requires a differentiable equivalent, so
-    swap in a plain ``F.linear`` + activation implementation whenever grad is
-    enabled; the fast fused path still runs under ``torch.no_grad()`` (eval).
-    Idempotent — safe to call more than once (e.g. across repeated dry runs).
-    """
-    global _fused_mlp_patched
-    if _fused_mlp_patched:
-        return
-    import torch.nn.functional as F
-    from sam3.model import vitdet as _vitdet
-
-    original_addmm_act = _vitdet.addmm_act
-
-    def _trainable_addmm_act(activation, linear, mat1):
-        if not torch.is_grad_enabled():
-            return original_addmm_act(activation, linear, mat1)
-        x = linear(mat1)
-        if activation in (F.relu, torch.nn.ReLU):
-            return F.relu(x)
-        if activation in (F.gelu, torch.nn.GELU):
-            return F.gelu(x)
-        raise ValueError(f"Unexpected activation {activation}")
-
-    _vitdet.addmm_act = _trainable_addmm_act
-    _fused_mlp_patched = True
+# SAM3's ViT-Det MLP calls an inference-only fused kernel that raises whenever
+# autograd is on, so every path that back-propagates through the vision backbone
+# must patch it. The patch is shared with model/sam3_student.py (SAM3 as a KD
+# student) so the two cannot drift — see model/sam3_patches.py.
+from model.sam3_patches import patch_fused_mlp_for_training as _patch_fused_mlp_for_training
 
 
 class Sam3WandbWriter:

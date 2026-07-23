@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -101,6 +102,15 @@ def main():
     ap.add_argument("--group", default="teacher_strength",
                     help="study bucket segment: teacher_strength (binary) | "
                          "teacher_strength_mc (multiclass)")
+    ap.add_argument("--pooled-floor", action="store_true",
+                    help="measure every gain against the POOLED task_only mean instead "
+                         "of each teacher's own task_only run, and flag gains that do "
+                         "not clear 2 sigma. task_only carries no KD term at all "
+                         "(w_logit_kd=w_reliability_kd=0), so it is teacher-independent "
+                         "by construction: its runs are repeat samples of one number. "
+                         "Using each teacher's own noisy copy as that row's baseline "
+                         "injects that noise into every gain in the row; pooling both "
+                         "removes it and yields a free estimate of the run-to-run sigma.")
     args = ap.parse_args()
 
     tdice = parse_teacher_dice(args.teacher_dice)
@@ -112,6 +122,11 @@ def main():
         """Student Dice for one (teacher, method) cell; None if the run is missing."""
         return (data[teacher].get(method) or {}).get(args.split)
 
+    # Repeat samples of the (teacher-independent) no-KD floor → shared baseline + sigma.
+    floors = [v for v in (dice(t, BASELINE) for t in TEACHERS) if v is not None]
+    pooled = sum(floors) / len(floors) if floors else None
+    sigma = statistics.stdev(floors) if len(floors) > 1 else None
+
     # --- markdown table: rows = teacher (weak→strong), cols = method ---
     print(f"\nStudent={STUDENT}  |  split={args.split}-mean Dice\n")
     print("| teacher (Dice) | " + " | ".join(METHODS) + " |")
@@ -121,20 +136,28 @@ def main():
         print(f"| {label} | " + " | ".join(_f(dice(t, m)) for m in METHODS) + " |")
 
     # --- gain over the no-KD floor + "no-harm" check for meta_scalar ---
-    print(f"\nΔDice vs {BASELINE}  (meta_scalar 'no-harm' = meta_scalar ≥ logit_kd)\n")
+    if args.pooled_floor and pooled is not None:
+        print(f"\nΔDice vs POOLED {BASELINE} = {pooled:.4f}  (n={len(floors)} repeat samples"
+              + (f", sd={sigma:.4f} → 2σ={2 * sigma:.4f}" if sigma else "") + ")")
+        print("* = clears 2σ, i.e. larger than run-to-run noise.  "
+              "meta_scalar 'no-harm' = meta_scalar ≥ logit_kd\n")
+    else:
+        print(f"\nΔDice vs {BASELINE}  (meta_scalar 'no-harm' = meta_scalar ≥ logit_kd)\n")
     print("| teacher | " + " | ".join(KD_METHODS) + " | meta≥logit? |")
     print("|" + "---|" * (len(KD_METHODS) + 2))
+    thresh = 2 * sigma if (args.pooled_floor and sigma) else None
     for t in order:
-        base = dice(t, BASELINE)
-        row = [
-            f"{v - base:+.4f}" if v is not None and base is not None else "  -  "
-            for v in (dice(t, m) for m in KD_METHODS)
-        ]
+        base = pooled if (args.pooled_floor and pooled is not None) else dice(t, BASELINE)
+        row = []
+        for v in (dice(t, m) for m in KD_METHODS):
+            if v is None or base is None:
+                row.append("  -  ")
+                continue
+            d = v - base
+            star = "*" if (thresh is not None and abs(d) > thresh) else ""
+            row.append(f"{d:+.4f}{star}")
         lk, ms = dice(t, "logit_kd"), dice(t, "meta_scalar")
-        if lk is None or ms is None:
-            noharm = "-"
-        else:
-            noharm = "yes" if ms >= lk else "NO"
+        noharm = "-" if (lk is None or ms is None) else ("yes" if ms >= lk else "NO")
         print(f"| {TEACHERS[t]} | " + " | ".join(row) + f" | {noharm} |")
 
     if args.plot:

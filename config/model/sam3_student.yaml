@@ -1,0 +1,31 @@
+# @package _global_
+# SAM3 as a TRAINABLE dense-logit KD student (model/sam3_student.py).
+#
+# Motivation (see the class docstring): SAM3 segments lesions better than anything else
+# we have (binary foreground Dice 0.856) but is the *worst* diagnostic classifier
+# (per-class benign/malignant Dice 0.377 vs SAM's 0.72-0.75 on identical data), because
+# class identity has to travel through its frozen text encoder — the class *is* the
+# prompt. So: distill the class knowledge in from a teacher that has it
+# (`teacher=sam_vit_h`, multiclass 0.755).
+#
+# The student therefore starts from the SAM3 multiclass FT checkpoint — it already
+# localizes; only the label distinction is missing. `prompt_set` MUST match the manifest
+# that checkpoint was fine-tuned on (model/sam3_prompts.py contract).
+#
+#   uv run tools/run_reliability_ablation.py \
+#       --manifest config/sweeps/sam3_student_mc.yaml --workers gpu6:0,gpu6:1
+model:
+  name: sam3_student
+  _target_: model.sam3_student.Sam3Student
+  num_classes: ${data.num_classes}
+  resolution: 1008
+  prompt_set: v2
+  class_prompts: null
+  score_threshold: 0.2
+  aggregate: auto          # top1 for multiclass (see Sam3Teacher)
+  freeze_text_encoder: true
+  bpe_path: model/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  load_from_hf: true
+  # Start from the SAM3 multiclass FT (v2 prompts): foreground 0.842, per-class 0.377.
+  binary_checkpoint: logs/train/sam3/20260711_161827_bs1_lr0.0001/checkpoints/best_epoch_9_dice_0.8558.pth
+  multiclass_checkpoint: logs/train/sam3/20260713_111233_bs1_lr0.0001/checkpoints/epoch_10.pth
