@@ -25,6 +25,7 @@ from utils.utils import set_seed
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 from trainers.base_trainer import BaseTrainer
 from trainers.model_adapters import make_adapter
+from trainers.recipes import get_recipe
 from utils.checkpoint import unwrap_state_dict
 from omegaconf import OmegaConf, DictConfig
 
@@ -369,28 +370,63 @@ class DistillTrainer(BaseTrainer):
 
         self.distiller.prepare(self.student, self.teacher)
 
+        # "distillation = normal training + KD": make the student's task loss /
+        # optimizer / scheduler identical to its normal trainer's, so a run with
+        # every KD weight = 0 reduces exactly to normal supervised training. The
+        # recipe's task loss replaces the distiller's generic TaskLoss for the
+        # student's task term (KD terms are unaffected). Optimizer/scheduler are
+        # applied in _create_optimizer/_create_scheduler, which run next.
+        self._student_recipe = get_recipe(self.student_name, self.cfg)
+        self._sched_cadence = "epoch"
+        if self._student_recipe is not None:
+            self.distiller.task_loss_fn = self._student_recipe.task_loss
+            self.logger.info(
+                "[recipe] Student '%s' task loss/optimizer/scheduler routed through its "
+                "normal-training recipe (task_only ≡ normal training).", self.student_name,
+            )
+
         self._log_model_info()
+
+    def _add_kd_param_groups(self):
+        """Append online-teacher and distiller param groups to self.optimizer."""
+        if self._is_online:
+            teacher_trainable = [p for p in self.teacher.parameters() if p.requires_grad]
+            if teacher_trainable:
+                teacher_lr = self.cfg.training.get("teacher_lr", self.cfg.training.lr)
+                self.optimizer.add_param_group(
+                    {"params": teacher_trainable, "lr": teacher_lr}
+                )
+                self.logger.info(
+                    f"[Online Distillation] Teacher trainable params: "
+                    f"{sum(p.numel() for p in teacher_trainable):,}  lr={teacher_lr}"
+                )
+        distiller_params = list(self.distiller.parameters())
+        if distiller_params:
+            self.optimizer.add_param_group(
+                {"params": distiller_params, "lr": self.cfg.training.lr}
+            )
 
     @override
     def _create_optimizer(self):
-        # Only hand the optimizer parameters it can actually update. AdamW allocates
-        # exp_avg + exp_avg_sq per parameter, so passing frozen weights costs 2x their
-        # size in VRAM for nothing — which is free for an all-trainable student like
-        # TinyUSFM but very much not for a LoRA student or the SAM3 student (whose text
-        # tower is frozen by design, model/sam3_student.py).
+        # With a recipe, build the student's optimizer exactly as its normal trainer
+        # does (e.g. TinyUSFM's layer-wise LR decay) so task_only ≡ normal training,
+        # then add the KD-side groups on top.
+        if self._student_recipe is not None:
+            self.optimizer = self._student_recipe.build_optimizer(self.student, self.cfg)
+            self._add_kd_param_groups()
+            return
+
+        # Fallback (models without a recipe): single-group AdamW over trainable
+        # student params. AdamW allocates exp_avg + exp_avg_sq per parameter, so
+        # passing frozen weights costs 2x their size in VRAM for nothing — matters
+        # for a LoRA / SAM3 student whose parts are frozen by design.
         student_trainable = [p for p in self.student.parameters() if p.requires_grad]
         param_groups = [{"params": student_trainable, "lr": self.cfg.training.lr}]
         if self._is_online:
-            teacher_trainable = [
-                p for p in self.teacher.parameters() if p.requires_grad
-            ]
+            teacher_trainable = [p for p in self.teacher.parameters() if p.requires_grad]
             if teacher_trainable:
-                teacher_lr = self.cfg.training.get(
-                    "teacher_lr", self.cfg.training.lr
-                )
-                param_groups.append(
-                    {"params": teacher_trainable, "lr": teacher_lr}
-                )
+                teacher_lr = self.cfg.training.get("teacher_lr", self.cfg.training.lr)
+                param_groups.append({"params": teacher_trainable, "lr": teacher_lr})
                 self.logger.info(
                     f"[Online Distillation] Teacher trainable params: "
                     f"{sum(p.numel() for p in teacher_trainable):,}  lr={teacher_lr}"
@@ -405,7 +441,17 @@ class DistillTrainer(BaseTrainer):
 
     @override
     def _create_scheduler(self):
+        # With a recipe, build the student's scheduler as its normal trainer does
+        # (incl. honoring use_reduce_on_plateau) and record its step cadence so the
+        # train loop steps it at the right time.
+        if self._student_recipe is not None:
+            self.scheduler, self._sched_cadence = self._student_recipe.build_scheduler(
+                self.optimizer, self.cfg
+            )
+            self.logger.info("[recipe] scheduler cadence: %s", self._sched_cadence)
+            return
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
+        self._sched_cadence = "epoch"
 
     @override
     def _log_model_info(self):
@@ -982,7 +1028,13 @@ class DistillTrainer(BaseTrainer):
                     self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                     break
 
-            self.scheduler.step()
+            # Step the LR scheduler at the recipe's cadence (a plateau scheduler
+            # needs the val metric; an epoch scheduler steps once per epoch; a
+            # per-batch scheduler was already stepped inside train_epoch).
+            if self._sched_cadence == "plateau":
+                self.scheduler.step(val_metrics.get("Dice", val_metrics.get("dice", 0.0)))
+            elif self._sched_cadence == "epoch":
+                self.scheduler.step()
             # Persist full training state so an interrupted run resumes here.
             self._save_resume_checkpoint(epoch)
 
