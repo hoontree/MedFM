@@ -39,6 +39,12 @@ class Recipe:
     task_loss: Callable          # (student_output: dict, batch: tuple, device) -> scalar
     build_optimizer: Callable    # (model, cfg) -> optim.Optimizer
     build_scheduler: Callable    # (optimizer, cfg, total_iters) -> (scheduler, cadence:str)
+    # (model, batch, device) -> (loss, loss_dict): the model's FULL per-batch
+    # forward + supervised loss, run by BOTH the normal trainer and the distill
+    # task_only path through the one shared BaseTrainer._supervised_epoch loop, so
+    # the two are bit-identical (task_only ≡ normal training). task_loss above is
+    # the loss-only variant used when a KD run has already forwarded the student.
+    compute_batch_loss: Callable
 
 
 # --------------------------------------------------------------------------- #
@@ -53,9 +59,15 @@ def _tinyusfm_recipe(cfg) -> Recipe:
     criterion = _build_criterion(num_classes)
 
     def task_loss(student_output, batch, device):
-        logits = student_output["masks"]
-        masks = batch[1].to(device)
-        return _compute_loss(criterion, logits, masks, num_classes)
+        return _compute_loss(criterion, student_output["masks"], batch[1].to(device), num_classes)
+
+    def compute_batch_loss(model, batch, device):
+        # Exactly TinyUSFMTrainer.train_epoch's per-batch compute: model(images)
+        # (no return_features) → _compute_loss.
+        images = batch[0].to(device)
+        masks = batch[1].to(device).float()
+        loss = _compute_loss(criterion, model(images), masks, num_classes)
+        return loss, {"loss": loss}
 
     def build_optimizer(model, c):
         return _build_optimizer(model, c)
@@ -72,7 +84,8 @@ def _tinyusfm_recipe(cfg) -> Recipe:
             return sched, "plateau"
         return _build_scheduler(optimizer, c), "epoch"
 
-    return Recipe(task_loss=task_loss, build_optimizer=build_optimizer, build_scheduler=build_scheduler)
+    return Recipe(task_loss=task_loss, compute_batch_loss=compute_batch_loss,
+                  build_optimizer=build_optimizer, build_scheduler=build_scheduler)
 
 
 # --------------------------------------------------------------------------- #
@@ -97,23 +110,38 @@ def _sam_recipe(cfg) -> Recipe:
     else:
         dice = MonaiDiceLoss(include_background=False, to_onehot_y=False, softmax=True)
 
-    def task_loss(student_output, batch, device):
-        logits = student_output["low_res_logits"]        # SAM's native mask resolution
-        target = batch[2].to(device)                     # low-res label (3rd batch element)
-        if logits.shape[-2:] != target.shape[-2:]:
-            target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
+    def _loss(low_res_logits, low_res_target, moe):
+        # SamTrainer._calc_loss on the LOW-RES logits vs low-res label.
+        target = low_res_target
+        if low_res_logits.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(target, size=low_res_logits.shape[-2:], mode="nearest")
         if num_classes == 1:
-            loss_ce = F.binary_cross_entropy_with_logits(
-                logits, target, pos_weight=torch.tensor([5.0], device=logits.device)
+            ce = F.binary_cross_entropy_with_logits(
+                low_res_logits, target, pos_weight=torch.tensor([5.0], device=low_res_logits.device)
             )
-            loss_dice = dice(logits, target)
+            dl = dice(low_res_logits, target)
         else:
-            loss_ce = F.cross_entropy(logits, target.argmax(dim=1).long())
-            loss_dice = dice(logits, target)
-        moe = student_output.get("moe_loss", torch.tensor(0.0, device=logits.device))
+            ce = F.cross_entropy(low_res_logits, target.argmax(dim=1).long())
+            dl = dice(low_res_logits, target)
         if not torch.is_tensor(moe):
-            moe = torch.tensor(float(moe), device=logits.device)
-        return (1 - dice_weight) * loss_ce + dice_weight * loss_dice + moe_weight * moe
+            moe = torch.tensor(float(moe), device=low_res_logits.device)
+        loss = (1 - dice_weight) * ce + dice_weight * dl + moe_weight * moe
+        return loss, ce, dl, moe
+
+    def task_loss(student_output, batch, device):
+        moe = student_output.get("moe_loss", 0.0)
+        loss, _, _, _ = _loss(student_output["low_res_logits"], batch[2].to(device), moe)
+        return loss
+
+    def compute_batch_loss(model, batch, device):
+        # Exactly SamTrainer.train_epoch's per-batch compute: forward at img_size
+        # with multimask, then _calc_loss on the low-res output.
+        images = batch[0].to(device)
+        low_res = batch[2].to(device)
+        multimask = num_classes > 1
+        outputs = model(images, multimask, int(cfg.data.img_size))
+        loss, ce, dl, moe = _loss(outputs["low_res_logits"], low_res, outputs.get("moe_loss", 0.0))
+        return loss, {"loss": loss, "loss_ce": ce, "loss_dice": dl, "loss_moe": moe}
 
     def build_optimizer(model, c):
         # backbone (image_encoder) vs other, per SamTrainer._create_optimizer.
@@ -148,7 +176,8 @@ def _sam_recipe(cfg) -> Recipe:
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda), "batch"
 
-    return Recipe(task_loss=task_loss, build_optimizer=build_optimizer, build_scheduler=build_scheduler)
+    return Recipe(task_loss=task_loss, compute_batch_loss=compute_batch_loss,
+                  build_optimizer=build_optimizer, build_scheduler=build_scheduler)
 
 
 # --------------------------------------------------------------------------- #
@@ -169,12 +198,25 @@ def _segformer_recipe(cfg) -> Recipe:
     bce = nn.BCEWithLogitsLoss()
     dice = DiceLoss(num_classes)  # matches SegformerTrainer exactly (num_classes as first arg)
 
-    def task_loss(student_output, batch, device):
-        logits = student_output["masks"]
-        target = batch[1].to(device).float()
+    def _loss(logits, target):
+        target = target.float()
         if logits.shape[-2:] != target.shape[-2:]:
             target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
         return (1 - dice_weight) * bce(logits, target) + dice_weight * dice(logits, target)
+
+    def task_loss(student_output, batch, device):
+        return _loss(student_output["masks"], batch[1].to(device))
+
+    def compute_batch_loss(model, batch, device):
+        # SegformerTrainer.train_epoch: model(images).logits, bilinear-resize to
+        # label size, then the BCE/Dice loss.
+        images = batch[0].to(device)
+        label = batch[1].to(device)
+        logits = model(images).logits
+        if logits.shape[-2:] != label.shape[-2:]:
+            logits = F.interpolate(logits, size=label.shape[-2:], mode="bilinear", align_corners=False)
+        loss = _loss(logits, label)
+        return loss, {"loss": loss}
 
     def build_optimizer(model, c):
         return optim.AdamW(
@@ -191,7 +233,8 @@ def _segformer_recipe(cfg) -> Recipe:
             base_lr=base_lr, power=0.9,
         ), "batch"
 
-    return Recipe(task_loss=task_loss, build_optimizer=build_optimizer, build_scheduler=build_scheduler)
+    return Recipe(task_loss=task_loss, compute_batch_loss=compute_batch_loss,
+                  build_optimizer=build_optimizer, build_scheduler=build_scheduler)
 
 
 # model name (config/model/<name>.yaml) -> recipe factory

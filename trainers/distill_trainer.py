@@ -522,6 +522,16 @@ class DistillTrainer(BaseTrainer):
     def train_epoch(self, epoch) -> Dict[str, float]:
         self.student.train()
         self.distiller.train()
+
+        # Pure task_only (recipe student, no KD term active): run the ONE shared
+        # supervised loop + the SAME per-batch compute the student's normal trainer
+        # uses, so it is bit-identical to normal training. No teacher, no distiller.
+        if self._use_recipe and not self._kd_active:
+            return self._supervised_epoch(
+                self.student, self._student_recipe.compute_batch_loss,
+                self.student.parameters, self._sched_cadence, epoch,
+            )
+
         if self._is_online:
             self.teacher.train()
 
@@ -536,42 +546,30 @@ class DistillTrainer(BaseTrainer):
 
             self.distiller.on_step_begin()
 
-            pure_task_only = self._use_recipe and not self._kd_active
-            teacher_outputs = None
-            if not pure_task_only:
-                if self._is_online:
+            if self._is_online:
+                teacher_outputs = self._call_teacher(images)
+            else:
+                with torch.no_grad():
                     teacher_outputs = self._call_teacher(images)
-                else:
-                    with torch.no_grad():
-                        teacher_outputs = self._call_teacher(images)
 
             self.optimizer.zero_grad()
             # autocast/GradScaler match the student's normal precision (bf16 for SAM,
-            # fp32 no-op otherwise), so task_only ≡ normal training numerically.
+            # fp32 no-op otherwise).
             with torch.amp.autocast(
                 device_type=self.device.type, enabled=self.amp_enabled, dtype=self.amp_dtype
             ):
                 student_outputs = self._call_student(images)
-                if pure_task_only:
-                    # No KD term active: this is exactly the student's normal training.
+                loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
+                if self._use_recipe:
+                    # KD run with a recipe student: task loss owned by the trainer
+                    # (distiller ran with w_task=0, so loss_dict holds KD terms only).
                     task = self._student_recipe.task_loss(student_outputs, batch, self.device)
-                    loss = self._task_weight * task
-                    loss_dict = {"task_loss": task, "loss": loss}
+                    loss = self._task_weight * task + loss_dict["loss"]
+                    loss_dict = dict(loss_dict)
+                    loss_dict["task_loss"] = task
+                    loss_dict["loss"] = loss
                 else:
-                    loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
-                    if self._use_recipe:
-                        # Task loss owned by the trainer via the student's recipe
-                        # (distiller ran with w_task=0, so loss_dict holds KD terms only).
-                        # Uses the full student output + batch, so it reproduces the
-                        # student's normal supervised loss exactly (e.g. SAM's low-res
-                        # loss on batch[2]).
-                        task = self._student_recipe.task_loss(student_outputs, batch, self.device)
-                        loss = self._task_weight * task + loss_dict["loss"]
-                        loss_dict = dict(loss_dict)
-                        loss_dict["task_loss"] = task
-                        loss_dict["loss"] = loss
-                    else:
-                        loss = loss_dict["loss"]
+                    loss = loss_dict["loss"]
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)

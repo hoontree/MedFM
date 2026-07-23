@@ -256,87 +256,17 @@ class SAMTrainer(BaseTrainer):
 
     @override
     def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Train for one epoch."""
-        self.model.train()
-
-        total_loss = 0.0
-        total_ce_loss = 0.0
-        total_dice_loss = 0.0
-        total_moe_loss = 0.0
-
-        train_pbar = tqdm(
-            self.train_loader, desc=f"Epoch {epoch + 1}/{self.num_epochs}"
+        """One epoch via the shared BaseTrainer._supervised_epoch loop, using the
+        SAM recipe's per-batch compute. This is the SAME loop + SAME per-batch
+        compute a distillation task_only run of a SAM student uses, so the two are
+        bit-identical (task_only ≡ normal training)."""
+        if getattr(self, "_recipe", None) is None:
+            from trainers.recipes import get_recipe
+            self._recipe = get_recipe("sam", self.cfg)
+        return self._supervised_epoch(
+            self.model, self._recipe.compute_batch_loss,
+            self.model.parameters, "batch", epoch,
         )
-
-        for image_batch, label_batch, low_res_label_batch, *_ in train_pbar:
-            image_batch = image_batch.to(self.device)
-            label_batch = label_batch.to(self.device)
-            low_res_label_batch = low_res_label_batch.to(self.device)
-
-            # Forward pass: use multimask output when num_classes > 1
-            multimask_output = self.cfg.data.num_classes > 1
-
-            self.optimizer.zero_grad()
-            with torch.amp.autocast(
-                device_type=self.device.type,
-                enabled=self.amp_enabled,
-                dtype=self.amp_dtype,
-            ):
-                outputs = self.model(image_batch, multimask_output, self.img_size)
-                loss, loss_ce, loss_dice, loss_moe = self._calc_loss(
-                    outputs, label_batch, low_res_label_batch
-                )
-
-            # Backward pass (scaler is a no-op unless fp16 AMP is active)
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.gradient_clip_max_norm
-            )
-
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
-
-            # Get current learning rate
-            lr = self.optimizer.param_groups[0]["lr"]
-
-            # Update metrics
-            total_loss += loss.item()
-            total_ce_loss += loss_ce.item()
-            total_dice_loss += loss_dice.item()
-            total_moe_loss += loss_moe.item()
-
-            # Update progress bar
-            train_pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr:.6f}"})
-
-            # Log to wandb (step-level metrics)
-            if self.global_step % self.step_log_interval == 0:
-                self._log_step_metrics(
-                    {
-                        "loss": loss.item(),
-                        "loss_ce": loss_ce.item(),
-                        "loss_dice": loss_dice.item(),
-                        "loss_moe": loss_moe.item(),
-                        "lr": lr,
-                    },
-                    self.global_step,
-                )
-
-            self.global_step += 1
-
-        # Calculate average losses
-        num_batches = len(self.train_loader)
-        metrics = {
-            "loss": total_loss / num_batches,
-            "loss_ce": total_ce_loss / num_batches,
-            "loss_dice": total_dice_loss / num_batches,
-            "loss_moe": total_moe_loss / num_batches,
-        }
-
-        return metrics
 
     @override
     def validate(self, epoch: int, return_predictions: bool = False):
