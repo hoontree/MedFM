@@ -24,6 +24,7 @@ from utils.visualize import visualize_segmentation
 from utils.utils import set_seed
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 from trainers.base_trainer import BaseTrainer
+from trainers.model_adapters import make_adapter
 from omegaconf import OmegaConf, DictConfig
 
 
@@ -337,6 +338,15 @@ class DistillTrainer(BaseTrainer):
         self.student = self.student.to(self.device)
         self.model = self.student  # base-class compatibility
 
+        # One uniform seam for calling/evaluating each model, replacing the
+        # scattered isinstance(LoRA_Sam) branches (trainers/model_adapters.py).
+        self.teacher_adapter = make_adapter(
+            self.teacher, self.cfg, self.cfg.teacher_cfg, is_student=False
+        )
+        self.student_adapter = make_adapter(
+            self.student, self.cfg, self.cfg.student_cfg, is_student=True
+        )
+
         self.distiller = create_distiller(self.cfg).to(self.device)
 
         # Single source of truth for "online": the trainer decides online-ness from
@@ -415,42 +425,16 @@ class DistillTrainer(BaseTrainer):
             }
         )
 
-    # Forward helpers (teacher / student calls)
-    @staticmethod
-    def _is_sam_model(model) -> bool:
-        """Return True if *model* is a SAM-based model (LoRA_Sam)."""
-        try:
-            from model.sam_hybrid_adapter import LoRA_Sam
-            return isinstance(model, LoRA_Sam)
-        except ImportError:
-            return False
-
+    # Forward helpers (teacher / student calls) — thin delegators to the
+    # per-model adapters built in _create_model. Signatures unchanged so every
+    # caller (incl. MetaDistillTrainer) is unaffected.
     def _call_teacher(self, images):
-        """Call teacher model with the appropriate forward signature."""
-        if self._is_sam_model(self.teacher):
-            img_size = self.cfg.teacher_cfg.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            return self.teacher(images, multimask, img_size)
-        else:
-            raw = self.teacher(images)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
+        """Call the teacher, returning ``{"masks", ...}``."""
+        return self.teacher_adapter.forward_kd(images)
 
     def _call_student(self, images):
-        """Call student model and normalise its output to a dict."""
-        if self._is_sam_model(self.student):
-            img_size = self.cfg.student_cfg.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            raw = self.student(images, multimask, img_size)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
-        else:
-            raw = self.student(images, return_features=True)
-            if isinstance(raw, (list, tuple)):
-                return {"masks": raw[0], "features": raw[1]}
-            return {"masks": raw}
+        """Call the student, returning ``{"masks", ["features"]}``."""
+        return self.student_adapter.forward_kd(images)
 
     # Training step
     @override
@@ -517,17 +501,11 @@ class DistillTrainer(BaseTrainer):
         return self.test_loader
 
     def _evaluate_model(self, model, loader, return_predictions=False):
-        """Call the appropriate evaluate_model variant depending on model type."""
+        """Evaluate via the model's adapter (teacher or student)."""
         num_classes = self.cfg.data.num_classes
-        if self._is_sam_model(model):
-            img_size = self.cfg.data.img_size
-            return self.evaluator.evaluate_model_sam(
-                model, loader, self.device, num_classes,
-                img_size=img_size, return_predictions=return_predictions,
-            )
-        return self.evaluator.evaluate_model(
-            model, loader, self.device, num_classes,
-            return_predictions=return_predictions,
+        adapter = self.teacher_adapter if model is self.teacher else self.student_adapter
+        return adapter.evaluate(
+            self.evaluator, loader, self.device, num_classes, return_predictions
         )
 
     @override

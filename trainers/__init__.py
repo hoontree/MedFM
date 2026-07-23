@@ -27,4 +27,12 @@ def __getattr__(name):
         from .sam3_adapter import SAM3Orchestrator
 
         return SAM3Orchestrator
+    elif name == "DistillTrainer":
+        from .distill_trainer import DistillTrainer
+
+        return DistillTrainer
+    elif name == "MetaDistillTrainer":
+        from .meta_distill_trainer import MetaDistillTrainer
+
+        return MetaDistillTrainer
     raise AttributeError(f"module 'trainers' has no attribute '{name}'")
