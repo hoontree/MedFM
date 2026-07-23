@@ -1,36 +1,13 @@
-# Knowledge Distillation Configuration: TinyUSFM (teacher) -> SAM (student) — binary
+# Knowledge Distillation Configuration: TinyUSFM (teacher) -> SAM (student) — binary.
+# Shared scaffolding: config/_distill_base.yaml. This direction uses feature-CWD
+# distillation instead of the base's `unified` method.
 defaults:
-  - data: dynamic
-  - method: cwd_feature
-  - training: distillation
-  - wandb: distill
+  - _distill_base
+  - override /method: cwd_feature
   - _self_
-
-trainer:
-  _target_: trainers.distill_trainer.DistillTrainer
 
 teacher: tinyusfm
 student: sam
 
-# Optional checkpoint override applied on top of the resolved teacher/student
-# model config (e.g. to pick a specific trained artifact — a balanced-sampler
-# run, a particular ablation — without needing a dedicated model yaml just to
-# swap one path).
-teacher_checkpoint: null
-student_checkpoint: null
-
-# Hardware Configuration (Global Overrides)
 hardware:
   gpu_ids: [2]
-  seed: 42
-
-# Global Flags
-debug: false
-use_gradnorm: false
-
-# Output & Visualization
-output:
-  dir: logs
-
-visualization:
-  num_samples: 10
