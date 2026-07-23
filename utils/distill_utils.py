@@ -83,29 +83,6 @@ def get_dataset_short_name(cfg: DictConfig) -> str:
     return dataset_name
 
 
-def resolve_distillation_split_path(
-    cfg: DictConfig,
-    adaptation_ratio: float = 0.5,
-    seed: int = 42,
-    split_file: Optional[str] = None,
-) -> Path:
-    """Resolve split file path for adaptation/distillation split.
-
-    Priority:
-    1) Explicit split_file
-    2) Deterministic auto path based on dataset names, ratio, and seed
-       -> splits/distill_{train_names}_r{adaptation_ratio}_s{seed}.json
-    """
-    if split_file:
-        return Path(split_file)
-
-    train_names = cfg.data.train
-    if isinstance(train_names, (list, ListConfig)):
-        data_name = "_".join(train_names)
-    else:
-        data_name = cfg.data.name
-
-    return Path(f"splits/distill_{data_name}_r{adaptation_ratio}_s{seed}.json")
 
 
 def _model_cfg_for_tags(cfg: DictConfig) -> Optional[DictConfig]:
