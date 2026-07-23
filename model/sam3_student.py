@@ -33,9 +33,17 @@ subclass only flips that flag and decides what is frozen.
 
 Frozen: the text encoder (SAM3's own FT recipe keeps it frozen, and the prompt strings
 are fixed by the manifest contract in ``model/sam3_prompts.py``). Trainable: everything
-else. Gradients reach SAM3 through the grounding head and the mask logits; the top1
-instance *selection* is a hard, non-differentiable pick (like max-pooling), but the
-gradient flows through the selected instance's mask.
+else.
+
+Aggregation: a trainable student MUST use ``soft`` (score-weighted max) — ``Sam3Teacher``
+resolves ``aggregate="auto"`` to ``soft`` when ``trainable=True`` for exactly this reason.
+``top1``/``max`` feed the instance score in only through an argmax / a ``> threshold``
+boolean (both non-differentiable), so gradient reaches ``pred_masks`` and nothing else —
+and SAM3's *class* decision **is** the instance score (which prompt wins), so under those
+aggregations the classification head gets exactly zero gradient and the student could
+never learn the benign/malignant distinction, with a loss that still goes down. ``soft``
+multiplies mask prob by score, keeping that whole path live. ``tools/smoke_sam3_student.py``
+asserts the classification head actually receives gradient.
 """
 
 from __future__ import annotations
@@ -116,24 +124,42 @@ class Sam3Student(Sam3Teacher):
         self.model.train(mode)
         self.model.training = False
 
+    # Dotted-path *segments* identifying SAM3's language tower. Matched against
+    # whole `.`-separated name components (not raw substrings) so a bare "text"
+    # does not also catch unrelated params like "...context...", "...next..." or
+    # "...pretext...". The frozen-text-encoder invariant is load-bearing for the
+    # KD premise, so a zero-match is a hard error, not a warning.
+    _TEXT_TOWER_SEGMENTS = frozenset(
+        {"text", "text_encoder", "language", "language_model", "token_embed", "token_embedding"}
+    )
+
     def _freeze_text_tower(self) -> None:
-        """Freeze the language tower. Named-prefix match so it degrades to a no-op
-        (with a warning) rather than silently training the text encoder if the
-        vendored module layout changes."""
+        """Freeze SAM3's language tower by segment-exact name match.
+
+        Raises ``RuntimeError`` if nothing matches: silently training the text
+        encoder would violate the invariant the whole class rests on, and the old
+        warn-and-continue path let that happen invisibly whenever the vendored
+        module names drifted.
+        """
         frozen = 0
+        matched_names = []
         for name, p in self.model.named_parameters():
-            low = name.lower()
-            if "text" in low or "language" in low or "token_embed" in low:
+            segments = {s.lower() for s in name.split(".")}
+            if segments & self._TEXT_TOWER_SEGMENTS:
                 p.requires_grad_(False)
                 frozen += p.numel()
+                matched_names.append(name)
         if frozen == 0:
-            LOGGER.warning(
-                "[Sam3Student] freeze_text_encoder=True but no text/language params "
-                "matched — the language tower may now be training. Check the vendored "
-                "SAM3 parameter names."
+            raise RuntimeError(
+                "[Sam3Student] freeze_text_encoder=True but no language-tower params "
+                f"matched segments {sorted(self._TEXT_TOWER_SEGMENTS)}. The vendored "
+                "SAM3 parameter names likely changed; refusing to run rather than "
+                "silently train the text encoder. Update _TEXT_TOWER_SEGMENTS."
             )
-        else:
-            LOGGER.info("[Sam3Student] froze %d text-tower params", frozen)
+        LOGGER.info(
+            "[Sam3Student] froze %d text-tower params across %d tensors",
+            frozen, len(matched_names),
+        )
 
     def train(self, mode: bool = True):  # noqa: D401
         """Keep the matcher-off / checkpointing-on invariant across every .train()/.eval()
