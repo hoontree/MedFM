@@ -16,8 +16,9 @@ w_uncertainty_kd: 0.0   # Uncertainty-weighted KD (entropy-driven weighting)
 # When true, rescale active weights so the total loss is a convex combination.
 normalize_weights: false
 
-# CWD temperature (defaults to `temperature` if unset). Paper recommends τ=4.
-cwd_temperature: 4.0
+# CWD temperature — follows the top-level `temperature` (paper recommends τ=4).
+# Override with an explicit value to decouple it.
+cwd_temperature: ${method.temperature}
 
 # Task loss components
 use_dice: true
@@ -37,7 +38,7 @@ feature_pairs: [7, 9, 11]
 reliability_kd:
   _target_: utils.reliability_kd.build_reliability_map
   _partial_: true
-  temperature: 4.0
+  temperature: ${method.temperature}   # follows top-level temperature
   confidence_mode: max_prob          # max_prob | foreground | entropy | margin
   use_entropy_penalty: true
   # GT-conditioned teacher correctness gate (teacher_correctness_gate)
@@ -66,7 +67,7 @@ reliability_kd:
 
 # --- Uncertainty-Weighted KD ---
 use_uncertainty_weighted_kd: false   # master switch (false disables w_uncertainty_kd too)
-kd_tau: 4.0                          # temperature (defaults to same as `temperature`)
+kd_tau: ${method.temperature}        # follows top-level temperature
 uncertainty_weight_type: linear      # "linear" or "exp"
 uncertainty_beta: 1.0                # decay rate for exp mode
 uncertainty_eps: 1.0e-8              # log-stability epsilon for entropy

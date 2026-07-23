@@ -46,7 +46,10 @@ class SamplingConfig:
     decouple_dataset_class: bool = True
     num_samples: Optional[int] = None
     replacement: bool = True
-    seed: int = 42
+    # None → follows the single run seed (hardware.seed, default 42) so a seed
+    # sweep also moves sampler order. Set explicitly to decouple. See
+    # utils.data_processing._resolve_sampling_cfg.
+    seed: Optional[int] = None
 
 
 @dataclass

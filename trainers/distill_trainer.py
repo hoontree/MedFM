@@ -46,7 +46,13 @@ class DistillTrainer(BaseTrainer):
         self.final_metrics: Dict[str, float] = {}
 
 
-        set_seed(cfg.hardware.seed)
+        # Honour the configured determinism policy instead of always forcing True,
+        # so distill runs share the train path's policy (BaseTrainer) and can be
+        # made non-deterministic for speed when desired.
+        set_seed(
+            cfg.hardware.seed,
+            deterministic=cfg.get("hardware", {}).get("deterministic", True),
+        )
 
         # Resume bookkeeping (set before directory setup so a resumed run can
         # reuse its previous exp_dir instead of spawning a fresh timestamp).
@@ -295,7 +301,10 @@ class DistillTrainer(BaseTrainer):
         # vary by ~4 Dice points across teacher directions, i.e. as much as the KD
         # effects being measured. Re-seeding pins the student init identical for
         # every teacher, so cross-teacher comparisons are apples-to-apples.
-        set_seed(self.cfg.hardware.seed)
+        set_seed(
+            self.cfg.hardware.seed,
+            deterministic=self.cfg.get("hardware", {}).get("deterministic", True),
+        )
 
         # Log the student-checkpoint decision loudly (recorded in _resolve_model_cfgs,
         # before the logger existed) so a run never silently starts from the wrong

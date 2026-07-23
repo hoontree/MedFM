@@ -741,7 +741,11 @@ class BaseTrainer(ABC):
             "teacher": self.cfg.get("teacher"),
             "student": self.cfg.get("student"),
             "num_classes": self.cfg.get("data", {}).get("num_classes"),
-            "seed": self.cfg.get("hardware", {}).get("seed"),
+            # Record the EFFECTIVE seed actually used (same default as the setup()
+            # set_seed call, base_trainer.py). The bare .get() logged null when a
+            # config omitted hardware.seed even though the run ran at 42 —
+            # misrepresenting the run in final_metrics.json.
+            "seed": self.cfg.get("hardware", {}).get("seed", 42),
             "best_checkpoint": (
                 self.best_model_path.name if self.best_model_path else None
             ),

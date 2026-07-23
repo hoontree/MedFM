@@ -338,7 +338,17 @@ class SAM3Orchestrator:
                 "_target_": "trainers.sam3_trainer.Trainer",
                 "max_epochs": training_cfg.get("max_epochs", 20),
                 "accelerator": "cuda",
-                "seed_value": self.cfg.get("hardware", {}).get("seed", 123),
+                # Aligned to the project-wide policy: seed 42 (matching every other
+                # model) and cudnn determinism driven by hardware.deterministic
+                # (default True) instead of the native trainer's hardcoded
+                # non-deterministic default — SAM3 runs are now seed-comparable with
+                # the rest. Set hardware.deterministic=false to restore SAM3's faster
+                # non-deterministic kernels.
+                "seed_value": self.cfg.get("hardware", {}).get("seed", 42),
+                "cuda": {
+                    "cudnn_deterministic": self.cfg.get("hardware", {}).get("deterministic", True),
+                    "cudnn_benchmark": not self.cfg.get("hardware", {}).get("deterministic", True),
+                },
                 "val_epoch_freq": sam3_cfg.get("val_epoch_freq", 1),
                 # "train_only" by default: the native trainer's own eval is
                 # detection-style, and this project reports metrics by loading

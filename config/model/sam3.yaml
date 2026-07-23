@@ -103,8 +103,11 @@ optimizer:
 # Hardware configuration
 hardware:
   n_gpu: 1
-  deterministic: false                # SAM3 benefits from non-deterministic for speed
-  seed: 123
+  # Aligned to the project-wide policy so SAM3 results are seed/determinism-
+  # comparable with the other models. Set deterministic=false to restore SAM3's
+  # faster non-deterministic cudnn kernels (wired via trainers/sam3_adapter.py).
+  deterministic: true
+  seed: 42
   gpu_ids: [0]
 
 # Output configuration
