@@ -21,6 +21,7 @@ import wandb
 from utils.logger import setup_logger
 from utils.evaluate import Evaluator_seg
 from utils.utils import set_seed
+from utils.checkpoint import load_model_weights
 from utils.data_processing import SegDatasetProcessor
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 
@@ -478,9 +479,9 @@ class BaseTrainer(ABC):
         torch.save(self.model.state_dict(), str(path))
 
     def _load_checkpoint(self, path: Path):
-        """Load model from checkpoint. Can be overridden by subclasses for custom loading."""
+        """Load model from checkpoint (any project schema). Overridable by subclasses."""
         self.logger.info(f"Loading checkpoint: {path}")
-        self.model.load_state_dict(torch.load(str(path), map_location=self.device))
+        load_model_weights(self.model, path, map_location=self.device, strict=True)
 
     # =========================================================================
     # 7. Visualization helpers
