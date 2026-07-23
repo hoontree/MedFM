@@ -157,6 +157,7 @@ class SAMTrainer(BaseTrainer):
         self.scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda
         )
+        self._sched_cadence = "batch"  # stepped per-batch inside _supervised_epoch
         self.logger.info(
             f"Scheduler: LambdaLR with warmup={warmup_enabled}, warmup_steps={warmup_steps}, "
             f"max_iterations={total_iters}, power={power}, min_lr={min_lr}"

@@ -391,6 +391,18 @@ class BaseTrainer(ABC):
         """
         from tqdm import tqdm
 
+        # Lazily set up AMP so any trainer using this loop works. Disabled → exact
+        # fp32 (a no-op for TinyUSFM/SegFormer whose configs set no `amp`).
+        if not hasattr(self, "scaler"):
+            self.amp_enabled = bool(self.cfg.training.get("amp", False))
+            amp_dtype_str = str(self.cfg.training.get("amp_dtype", "bfloat16")).lower()
+            self.amp_dtype = (
+                torch.float16 if amp_dtype_str in ("float16", "fp16", "half") else torch.bfloat16
+            )
+            self.scaler = torch.amp.GradScaler(
+                "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+            )
+
         model.train()
         totals: Dict[str, float] = {}
         num_epochs = self.cfg.training.num_epochs
@@ -1053,6 +1065,17 @@ class BaseTrainer(ABC):
                 val_metrics, val_predictions_cache = val_result
             else:
                 val_metrics, val_predictions_cache = val_result, None
+
+            # Step epoch / plateau LR schedulers here (per-batch schedulers already
+            # stepped inside _supervised_epoch). Trainers that step their scheduler
+            # internally in train_epoch/validate leave _sched_cadence unset (None)
+            # and are unaffected.
+            cadence = getattr(self, "_sched_cadence", None)
+            if self.scheduler is not None:
+                if cadence == "plateau":
+                    self.scheduler.step(val_metrics.get("Dice", val_metrics.get("dice", 0.0)))
+                elif cadence == "epoch":
+                    self.scheduler.step()
 
             # Visualize validation every 5 epochs (reuse predictions from validate())
             if should_visualize:
