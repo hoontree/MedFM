@@ -276,9 +276,13 @@ class DistillTrainer(BaseTrainer):
 
     @override
     def _create_optimizer(self):
-        param_groups = [
-            {"params": self.student.parameters(), "lr": self.cfg.training.lr}
-        ]
+        # Only hand the optimizer parameters it can actually update. AdamW allocates
+        # exp_avg + exp_avg_sq per parameter, so passing frozen weights costs 2x their
+        # size in VRAM for nothing — which is free for an all-trainable student like
+        # TinyUSFM but very much not for a LoRA student or the SAM3 student (whose text
+        # tower is frozen by design, model/sam3_student.py).
+        student_trainable = [p for p in self.student.parameters() if p.requires_grad]
+        param_groups = [{"params": student_trainable, "lr": self.cfg.training.lr}]
         if self._is_online:
             teacher_trainable = [
                 p for p in self.teacher.parameters() if p.requires_grad

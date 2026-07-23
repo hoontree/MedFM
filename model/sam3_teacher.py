@@ -71,6 +71,23 @@ def _project_path(path: Optional[str]) -> Optional[str]:
     return str(cand) if cand.exists() else path
 
 
+def _slice_batch(obj, i: int):
+    """Take image ``i``'s slice out of a batched backbone output, keeping the batch
+    dim (``[i:i+1]``) so the downstream single-image grounding path is unchanged.
+
+    ``forward_image`` returns a nest of tensors / lists / dicts
+    (``vision_features``, ``vision_pos_enc``, ``backbone_fpn``, ``sam2_backbone_out``),
+    so the walk has to be recursive. Slicing (not indexing) preserves the leading 1.
+    """
+    if torch.is_tensor(obj):
+        return obj[i : i + 1]
+    if isinstance(obj, dict):
+        return {k: _slice_batch(v, i) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_slice_batch(o, i) for o in obj)
+    return obj  # None / scalars pass through
+
+
 class Sam3Teacher(nn.Module):
     """Frozen SAM3 image model exposed as a dense per-class-logit teacher.
 
@@ -109,12 +126,14 @@ class Sam3Teacher(nn.Module):
         aggregate: str = "auto",
         bpe_path: str = "model/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         load_from_hf: bool = True,
+        trainable: bool = False,
         **kwargs,
     ):
         super().__init__()
         if num_classes < 1:
             raise ValueError(f"Sam3Teacher num_classes must be >=1, got {num_classes}.")
         self.num_classes = int(num_classes)
+        self.trainable = bool(trainable)
         # Instance→dense aggregation.
         #   "max"  — score-gated pixel-max over ALL kept instances. Fine for the single
         #            "lesion" concept (binary), which is what the §8 binary spectrum used.
@@ -123,9 +142,17 @@ class Sam3Teacher(nn.Module):
         #            ("benign") spawns many spurious instances that "max" unions into a
         #            flooded map: measured per-class Dice 0.270 (max) → 0.354 (top1), with
         #            benign over-prediction dropping 4.3x → 1.75x.
-        #   "auto" — top1 when multiclass, max when binary (keeps binary results intact).
+        #   "soft" — score-WEIGHTED max. The only aggregation whose gradient reaches the
+        #            instance score, so the only one a trainable SAM3 (Sam3Student) can
+        #            learn to classify under. See _aggregate_instances.
+        #   "auto" — soft when trainable (a student must be able to move its scores);
+        #            otherwise top1 when multiclass, max when binary (which is what the
+        #            §8 binary spectrum ran, so those numbers stay reproducible).
         if aggregate == "auto":
-            aggregate = "top1" if self.num_classes >= 2 else "max"
+            if self.trainable:
+                aggregate = "soft"
+            else:
+                aggregate = "top1" if self.num_classes >= 2 else "max"
         self.aggregate = aggregate
         self.score_threshold = float(score_threshold)
 
@@ -154,9 +181,14 @@ class Sam3Teacher(nn.Module):
         if checkpoint:
             self._load_finetuned(checkpoint)
 
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
+        # `trainable` is what separates the frozen KD *teacher* from the trainable
+        # SAM3 *student* (model/sam3_student.py). Everything else — the 224→1008
+        # bridge, the per-class prompts, the instance→dense aggregation — is the same
+        # delicate contract, so it lives here once instead of being copied.
+        if not self.trainable:
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad_(False)
 
         # Processor supplies the exact SAM3 input transform + the single-image
         # FindStage; we reuse those but drive grounding ourselves under no_grad.
@@ -211,18 +243,31 @@ class Sam3Teacher(nn.Module):
             path, len(missing), len(unexpected),
         )
 
-    # keep the frozen SAM3 in eval mode regardless of parent .train() calls
     def train(self, mode: bool = True):  # noqa: D401
+        """Frozen teacher: stay in eval regardless of the parent's .train() call.
+        Trainable student: follow the parent (train mode also switches SAM3's own
+        activation-checkpointing on, which is what makes 1008-res backprop fit)."""
         super().train(mode)
-        self.model.eval()
+        if not self.trainable:
+            self.model.eval()
         return self
 
     def _forward_text(self, prompt: str):
-        """Encode a (constant) text prompt once and reuse it."""
+        """Encode a (constant) text prompt once and reuse it.
+
+        Always computed under ``no_grad`` and detached: SAM3's text encoder is frozen
+        (both as a teacher and, per SAM3's own FT recipe, as a student), and a cached
+        tensor that still carried a graph would be re-used across training steps and
+        blow up on the second backward.
+        """
         if prompt not in self._text_cache:
-            self._text_cache[prompt] = self.model.backbone.forward_text(
-                [prompt], device=self.processor.device
-            )
+            with torch.no_grad():
+                out = self.model.backbone.forward_text(
+                    [prompt], device=self.processor.device
+                )
+            self._text_cache[prompt] = {
+                k: (v.detach() if torch.is_tensor(v) else v) for k, v in out.items()
+            }
         # shallow copy so per-image state updates don't mutate the cache
         return dict(self._text_cache[prompt])
 
@@ -238,6 +283,21 @@ class Sam3Teacher(nn.Module):
         presence_score = presence.sigmoid().unsqueeze(1)       # [1, 1, ...]
         score = (probs_cls * presence_score).squeeze(-1)       # [1, Q]
         mask_probs = mask_logits.sigmoid()                     # [1, Q, h, w]
+
+        if self.aggregate == "soft":
+            # Score-WEIGHTED max: fg(pixel) = max_q  score_q * mask_prob_q.
+            #
+            # Required whenever SAM3 is the *student*. "top1" and "max" both feed the
+            # instance score in only through an argmax / a `> threshold` boolean — both
+            # non-differentiable — so gradients reach `pred_masks` and nothing else. But
+            # SAM3's class decision *is* the instance score (pred_logits x presence): the
+            # class is the prompt, and which prompt wins is decided by score. Under those
+            # aggregations the classification head therefore receives exactly zero
+            # gradient, and a SAM3 student could never learn the benign/malignant
+            # distinction we are trying to distill into it — silently, with a loss that
+            # still goes down. Multiplying by the score keeps the whole path live.
+            fg, _ = (mask_probs * score[..., None, None]).max(dim=1, keepdim=True)
+            return fg
 
         if self.aggregate == "top1":
             # Single highest-score instance, gated by threshold. Mirrors the
@@ -256,67 +316,70 @@ class Sam3Teacher(nn.Module):
         fg_prob, _ = mask_probs.max(dim=1, keepdim=True)       # [1, 1, h, w]
         return fg_prob
 
-    @torch.no_grad()
-    def _dense_logit_one(self, img01_chw: torch.Tensor, out_hw) -> torch.Tensor:
-        """Ground a single [3,H,W] (in [0,1]) image → [1, num_classes, out_h, out_w]
-        logit map. The 1008-res image backbone runs once; each foreground prompt
-        reuses those features with only its text swapped."""
-        proc = self.processor
-        model = self.model
-
-        # SAM3 input transform (uint8→resize 1008→float→[0.5] normalize).
-        img = proc.transform(img01_chw).unsqueeze(0).to(proc.device)  # [1,3,R,R]
-        # SAM3's ViT-Det uses a fused MLP kernel that emits bf16; run the whole
-        # forward under bf16 autocast (as the SAM3 trainer does) so linear
-        # layers see a consistent dtype instead of Float/BFloat16 mismatches.
-        fg_probs: List[torch.Tensor] = []
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(proc.device != "cpu")):
-            backbone_out = model.backbone.forward_image(img)  # image features (prompt-independent)
-            # Constant across prompts (a pair of empty box tensors) — build once.
-            geometric_prompt = model._get_dummy_prompt()
-            for prompt in self.class_prompts:
-                bo = dict(backbone_out)
-                bo.update(self._forward_text(prompt))
-                outputs = model.forward_grounding(
-                    backbone_out=bo,
-                    find_input=proc.find_stage,
-                    geometric_prompt=geometric_prompt,
-                    find_target=None,
-                )
-                fg_probs.append(self._aggregate_instances(outputs))
-
+    def _assemble_logits(self, fg_probs: List[torch.Tensor]) -> torch.Tensor:
+        """Per-foreground-class probability maps → one [1, num_classes, h, w] logit map."""
         eps = _EPS
         if self.num_classes == 1:
             # Binary: single foreground channel as calibrated log-odds (unchanged
             # contract — Evaluator/reliability read teacher confidence = sigmoid).
             fg_prob = fg_probs[0].clamp(eps, 1.0 - eps)
-            logits = torch.log(fg_prob / (1.0 - fg_prob))            # [1, 1, h, w]
-        else:
-            # Multiclass: [1, K-1, h, w] per-class fg prob, plus a background
-            # channel = 1 - max_c fg_c (prob that no foreground prompt fired).
-            fg = torch.cat(fg_probs, dim=1)                          # [1, K-1, h, w]
-            bg = 1.0 - fg.max(dim=1, keepdim=True).values           # [1, 1, h, w]
-            probs = torch.cat([bg, fg], dim=1).clamp(eps, 1.0)      # [1, K, h, w]
-            # Encode as log-probs: downstream softmax(dim=1) (CWD / meta) then
-            # recovers a normalized categorical over {bg, c1, …}.
-            logits = torch.log(probs)                                # [1, K, h, w]
+            return torch.log(fg_prob / (1.0 - fg_prob))              # [1, 1, h, w]
+        # Multiclass: [1, K-1, h, w] per-class fg prob, plus a background channel
+        # = 1 - max_c fg_c (prob that no foreground prompt fired).
+        fg = torch.cat(fg_probs, dim=1)                              # [1, K-1, h, w]
+        bg = 1.0 - fg.max(dim=1, keepdim=True).values                # [1, 1, h, w]
+        probs = torch.cat([bg, fg], dim=1).clamp(eps, 1.0)           # [1, K, h, w]
+        # Encode as log-probs: downstream softmax(dim=1) (CWD / meta) then recovers
+        # a normalized categorical over {bg, c1, …}.
+        return torch.log(probs)                                      # [1, K, h, w]
 
-        logits = F.interpolate(
-            logits.float(), size=out_hw, mode="bilinear", align_corners=False
-        )
-        return logits
-
-    @torch.no_grad()
     def forward(self, images: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """images: [B,3,H,W] imagenet-normalized → [B,num_classes,H,W] logits.
 
+        The 1008-res vision backbone — which dominates the cost — runs **once for
+        the whole batch**; each image's grounding then reuses its slice of those
+        features, and each prompt only swaps the (cached, frozen) text embedding.
+        Grounding itself stays on the single-image path, so we never hand-build the
+        query→image ``img_ids`` mapping a fully batched ``forward_grounding`` would
+        need (a wrong mapping there yields silently wrong logits, not a crash).
+
         Returns a bare tensor (like the TinyUSFM student), not a dict. The
-        distiller's ``_call_teacher`` wraps a non-dict return in
-        ``{"masks": ...}``, and ``Evaluator_seg`` (used to log teacher quality in
-        ``_final_evaluation``) calls ``model(images)`` and expects a tensor — a
-        dict return breaks it (``'dict' has no attribute 'shape'``).
+        distiller's ``_call_teacher`` wraps a non-dict return in ``{"masks": ...}``,
+        and ``Evaluator_seg`` (used to log teacher quality in ``_final_evaluation``)
+        calls ``model(images)`` and expects a tensor — a dict return breaks it.
         """
+        proc, model = self.processor, self.model
         b, _, h, w = images.shape
         x01 = (images * self.inet_std + self.inet_mean).clamp(0.0, 1.0)
-        logits = [self._dense_logit_one(x01[i], (h, w)) for i in range(b)]
-        return torch.cat(logits, dim=0)
+
+        with torch.set_grad_enabled(self.trainable):
+            # SAM3 input transform (resize 1008 → [0.5] normalize), then batch.
+            img = torch.stack([proc.transform(x01[i]) for i in range(b)]).to(proc.device)
+
+            per_image: List[torch.Tensor] = []
+            # SAM3's ViT-Det uses a fused MLP kernel that emits bf16; run the whole
+            # forward under bf16 autocast (as the SAM3 trainer does) so linear layers
+            # see a consistent dtype instead of Float/BFloat16 mismatches.
+            with torch.amp.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=(proc.device != "cpu")
+            ):
+                backbone_out = model.backbone.forward_image(img)   # ONE pass, [B, …]
+                # Constant across images/prompts (a pair of empty box tensors).
+                geometric_prompt = model._get_dummy_prompt()
+                for i in range(b):
+                    bo_i = _slice_batch(backbone_out, i)           # this image's features
+                    fg_probs = []
+                    for prompt in self.class_prompts:
+                        bo = dict(bo_i)
+                        bo.update(self._forward_text(prompt))
+                        outputs = model.forward_grounding(
+                            backbone_out=bo,
+                            find_input=proc.find_stage,
+                            geometric_prompt=geometric_prompt,
+                            find_target=None,
+                        )
+                        fg_probs.append(self._aggregate_instances(outputs))
+                    per_image.append(self._assemble_logits(fg_probs))
+
+            logits = torch.cat(per_image, dim=0).float()            # [B, K, h', w']
+            return F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
