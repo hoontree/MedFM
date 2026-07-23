@@ -59,4 +59,5 @@ sampling:
   decouple_dataset_class: true
   num_samples: null   # null → len(train); set to control epoch length
   replacement: true
-  seed: 42
+  # seed omitted → follows the single run seed (hardware.seed, default 42), so a
+  # seed sweep also moves sampler order. Set `seed:` here to decouple it again.

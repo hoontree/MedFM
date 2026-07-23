@@ -129,6 +129,9 @@ def main():
 
     # --- markdown table: rows = teacher (weak→strong), cols = method ---
     print(f"\nStudent={STUDENT}  |  split={args.split}-mean Dice\n")
+    if not tdice:
+        print("(NOTE: teacher order is config insertion order, ASSUMED weak→strong — "
+              "not verified. Pass --teacher-dice to order/label by measured Dice.)\n")
     print("| teacher (Dice) | " + " | ".join(METHODS) + " |")
     print("|" + "---|" * (len(METHODS) + 1))
     for t in order:
@@ -139,8 +142,11 @@ def main():
     if args.pooled_floor and pooled is not None:
         print(f"\nΔDice vs POOLED {BASELINE} = {pooled:.4f}  (n={len(floors)} repeat samples"
               + (f", sd={sigma:.4f} → 2σ={2 * sigma:.4f}" if sigma else "") + ")")
-        print("* = clears 2σ, i.e. larger than run-to-run noise.  "
-              "meta_scalar 'no-harm' = meta_scalar ≥ logit_kd\n")
+        print("* = GAIN clears 2σ (larger than run-to-run noise);  "
+              "! = REGRESSION clears 2σ (significantly WORSE).")
+        print(f"σ estimated from only n={len(floors)} teacher floors — very low power, "
+              "read marks as rough.  meta_scalar 'no-harm' = meta_scalar ≥ logit_kd "
+              "(~ = within 1σ, i.e. indistinguishable)\n")
     else:
         print(f"\nΔDice vs {BASELINE}  (meta_scalar 'no-harm' = meta_scalar ≥ logit_kd)\n")
     print("| teacher | " + " | ".join(KD_METHODS) + " | meta≥logit? |")
@@ -154,10 +160,30 @@ def main():
                 row.append("  -  ")
                 continue
             d = v - base
-            star = "*" if (thresh is not None and abs(d) > thresh) else ""
-            row.append(f"{d:+.4f}{star}")
+            # Signed significance: a gain clearing 2σ is '*', a *regression*
+            # clearing 2σ is '!'. Never the same mark — the old abs(d)>thresh gave
+            # a significant regression the same '*' as a gain, so a large negative
+            # delta could be misread in the gains table as a validated improvement.
+            if thresh is None:
+                mark = ""
+            elif d > thresh:
+                mark = "*"
+            elif d < -thresh:
+                mark = "!"
+            else:
+                mark = ""
+            row.append(f"{d:+.4f}{mark}")
         lk, ms = dice(t, "logit_kd"), dice(t, "meta_scalar")
-        noharm = "-" if (lk is None or ms is None) else ("yes" if ms >= lk else "NO")
+        if lk is None or ms is None:
+            noharm = "-"
+        elif sigma is not None and abs(ms - lk) <= sigma:
+            # Within one σ of the floor's run-to-run noise → the two are
+            # indistinguishable; an exact ≥ would flip on a 0.0001 wobble.
+            noharm = "~"
+        elif ms >= lk:
+            noharm = "yes"
+        else:
+            noharm = "NO"
         print(f"| {TEACHERS[t]} | " + " | ".join(row) + f" | {noharm} |")
 
     if args.plot:

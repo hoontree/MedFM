@@ -91,26 +91,38 @@ def _teacher_student(manifest):
     return teacher, student
 
 
-def _completed_experiments(teacher, student):
-    """Set of experiment names already finished for this teacher->student.
+def _completed_experiments(teacher, student, group):
+    """Set of experiment names already finished for this teacher->student->group.
 
     A run counts as completed when its experiment directory contains a
     ``final_metrics.json`` (written only after final evaluation). Two sources
     are scanned and unioned:
-      * ``logs/distill/<teacher>_to_<student>/*_relab_<exp>_*/final_metrics.json``
+      * ``logs/distill/<teacher>_to_<student>/<group>/*/final_metrics.json``
         — authoritative ``run_name`` is read from the file's ``_meta``.
       * prior ``logs/reliability_ablation/*/index.jsonl`` rows with
-        ``status == OK`` whose ``exp_dir`` matches this direction (covers runs
-        whose dir predates the run_name-in-path convention).
+        ``status == OK`` whose ``exp_dir`` matches this direction AND group.
+
+    The completion key is scoped by the study ``group`` (e.g.
+    ``teacher_strength_mc/sam3``), not just the ``teacher_to_student`` direction.
+    Two study buckets can share a direction (``teacher_strength`` vs
+    ``teacher_strength_mc`` both under ``sam_to_tinyusfm``) and reuse experiment
+    names (``base_``, ``logit_kd``); without the group scope a completion in one
+    bucket wrongly skipped the same-named experiment in another. Mirrors the
+    exact-segment guard in tools/summarize_teacher_strength.py.
     """
+    import os
     done = set()
     direction = f"{teacher}_to_{student}"
+    group_seg = f"{os.sep}{group}{os.sep}" if group else None
 
-    # Recursive: a manifest's group_label nests one extra directory level
+    # Recursive: a manifest's group_label nests one (or more) directory levels
     # under `direction` (see utils.wandb_utils.build_experiment_dir), so a
     # flat `*/` glob would miss runs launched under a group.
     distill_root = PROJECT_DIR / "logs" / "distill" / direction
     for fm in distill_root.glob("**/final_metrics.json"):
+        # Only this study's bucket: the run dir is <direction>/<group>/<run>/.
+        if group_seg and group_seg not in f"{os.sep}{fm.parent.parent}{os.sep}":
+            continue
         try:
             rn = json.loads(fm.read_text()).get("_meta", {}).get("run_name") or ""
         except (OSError, json.JSONDecodeError):
@@ -126,8 +138,12 @@ def _completed_experiments(teacher, student):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("status") == "OK" and direction in (rec.get("exp_dir") or ""):
-                done.add(rec.get("experiment"))
+            exp_dir = rec.get("exp_dir") or ""
+            if rec.get("status") != "OK" or direction not in exp_dir:
+                continue
+            if group_seg and group_seg not in f"{os.sep}{exp_dir}{os.sep}":
+                continue
+            done.add(rec.get("experiment"))
     return done
 
 # Overrides forced on every run in --smoke mode for a fast end-to-end check.
@@ -247,7 +263,7 @@ def main():
 
     if args.resume:
         teacher, student = _teacher_student(manifest)
-        done = _completed_experiments(teacher, student)
+        done = _completed_experiments(teacher, student, group)
         skipped = [n for n in names if n in done]
         names = [n for n in names if n not in done]
         if skipped:

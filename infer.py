@@ -47,10 +47,13 @@ from tqdm import tqdm
 from medpy.metric.binary import dc, hd95
 from medpy.metric.binary import recall as medpy_recall
 
+from omegaconf import OmegaConf
+
 from config.schema import register_schemas
 from utils.data_processing import SegDatasetProcessor
 from utils.evaluate import Evaluator_seg
 from utils.hardware import set_gpu
+from utils.utils import set_seed
 from utils.visualize import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -356,6 +359,12 @@ register_schemas()
 def main(cfg: DictConfig) -> None:
     """Inference entry point: evaluate a checkpoint on test data and save results."""
     set_gpu(cfg)
+    # Seed the eval run under the same policy as train/distill so results are
+    # reproducible (the infer path previously called no set_seed at all).
+    set_seed(
+        cfg.get("hardware", {}).get("seed", 42),
+        deterministic=cfg.get("hardware", {}).get("deterministic", True),
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
 
@@ -366,6 +375,11 @@ def main(cfg: DictConfig) -> None:
     out_dir  = Path(cfg.infer.output_dir) / mdl_name / ds_tag / ts
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Output directory: %s", out_dir.resolve())
+
+    # Snapshot the resolved config so an eval run is self-describing on disk
+    # (train/distill already do this; infer did not).
+    with open(out_dir / "config.yaml", "w") as f:
+        OmegaConf.save(cfg, f)
 
     # ── Build test data loaders ────────────────────────────────────────────────
     # build_dataset also builds train/val (needed for img_size sync side-effects)
@@ -392,8 +406,11 @@ def main(cfg: DictConfig) -> None:
     # ── Load model ─────────────────────────────────────────────────────────────
     model = _load_model(cfg, device)
 
-    img_size    = int(cfg.data.get("img_size", 224))
-    num_classes = int(cfg.data.get("num_classes", 1))
+    # Read the canonical values directly — the old `.get(..., 1)` default for
+    # num_classes disagreed with the training default (3), so an infer run on a
+    # config that omitted the key silently evaluated as binary.
+    img_size    = int(cfg.data.img_size)
+    num_classes = int(cfg.data.num_classes)
     threshold   = float(cfg.infer.get("threshold", 0.5))
 
     # ── Inference per test set ─────────────────────────────────────────────────

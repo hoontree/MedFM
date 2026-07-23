@@ -1,9 +1,62 @@
 from typing import Optional, List, Dict, Union, Type, Sequence
 
+import random
+import numpy as np
 import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 from omegaconf import OmegaConf, ListConfig, DictConfig
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed each DataLoader worker's Python/NumPy RNG deterministically.
+
+    The augmentation transforms (utils/ultrasound_datasets.py) draw from the
+    process-global ``random`` / ``np.random``; with ``num_workers>0`` each worker
+    is a fresh process whose global RNG is otherwise unseeded, so augmentation
+    was not reproducible on the main (non-Lightning) path. torch already gives
+    each worker a distinct ``initial_seed()`` derived from the DataLoader's
+    ``generator``; mirror it into numpy/random (the canonical PyTorch recipe).
+    """
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _effective_seed(cfg) -> int:
+    """The single run seed: cfg.hardware.seed, else 42.
+
+    42 matches BaseTrainer's ``set_seed`` default (base_trainer.py) so every path
+    agrees on one seed even for the train configs that carry no ``hardware`` block.
+    """
+    return int(cfg.get("hardware", {}).get("seed", 42))
+
+
+def _seeded_generator(cfg) -> torch.Generator:
+    """A torch.Generator seeded from the single run seed.
+
+    Drives per-worker seeding (via _seed_worker) and DataLoader shuffle order so
+    a run is reproducible from one seed.
+    """
+    g = torch.Generator()
+    g.manual_seed(_effective_seed(cfg))
+    return g
+
+
+def _resolve_sampling_cfg(cfg):
+    """Sampling config whose ``seed`` follows the single run seed when unset.
+
+    Collapses the previously independent ``data.sampling.seed`` onto
+    ``hardware.seed``: a seed sweep now also moves the balanced-sampler order
+    instead of leaving it pinned. Set ``data.sampling.seed`` explicitly to
+    decouple it again. Behaviour is unchanged for the standard seed=42 runs
+    (both were 42 already).
+    """
+    sampling_cfg = cfg.data.get("sampling", OmegaConf.create({}))
+    if sampling_cfg.get("seed", None) is None:
+        sampling_cfg = OmegaConf.create(OmegaConf.to_container(sampling_cfg, resolve=True) or {})
+        sampling_cfg.seed = _effective_seed(cfg)
+    return sampling_cfg
 
 from utils.ultrasound_datasets import (
     BUID,
@@ -22,13 +75,6 @@ DATASET_REGISTRY: Dict[str, Type[Dataset]] = {
     "BUSBRA": BUSBRA,
     "B": B,
 }
-
-DEFAULT_SAM_IMG_SIZE_BY_TYPE = {
-    "vit_b": 224,
-    "vit_l": 256,
-    "vit_h": 256,
-}
-
 
 def get_dataset_class(name: str) -> Type[Dataset]:
     """Get dataset class from registry by name."""
@@ -233,11 +279,30 @@ class SegDatasetProcessor:
             return
 
         sam_type = str(sam_cfg.get("sam_type")).lower()
-        size_map = data_cfg.get("sam_img_size_map", DEFAULT_SAM_IMG_SIZE_BY_TYPE)
+        # Single source of truth: data.sam_img_size_map (dynamic.yaml / DataConfig
+        # schema default {vit_b:224, vit_l:1024, vit_h:1024}). There is deliberately
+        # no code-side fallback — the old DEFAULT_SAM_IMG_SIZE_BY_TYPE mapped vit_l/h
+        # to 256, silently diverging from every config's 1024, so a config missing the
+        # key trained at the wrong resolution. Require it instead.
+        size_map = data_cfg.get("sam_img_size_map")
+        if size_map is None:
+            raise ValueError(
+                "data.sam_img_size_map is required when auto_img_size_by_sam_type=true. "
+                "There is no code default (it previously diverged: 256 vs the configs' "
+                "1024). Add it to your data config, e.g. "
+                "{vit_b: 224, vit_l: 1024, vit_h: 1024}, or set "
+                "data.auto_img_size_by_sam_type=false to keep data.img_size."
+            )
         target_size = size_map.get(sam_type)
         if target_size is None:
             return
 
+        # NOTE on precedence: for distillation the size is taken from the TEACHER's
+        # sam_type first (then the student's) — see the sam_cfg selection above — so
+        # this rewrites the whole pipeline's img_size, student included. A teacher-
+        # strength sweep that varies the teacher's sam_type therefore also moves the
+        # student's input resolution; keep the teachers at one sam_type (or pin
+        # data.img_size with auto_img_size_by_sam_type=false) to avoid confounding.
         target_size = int(target_size)
         cfg.data.img_size = target_size
         sam_cfg.img_size = target_size
@@ -331,6 +396,20 @@ class SegDatasetProcessor:
         elif not test_list and not isinstance(cfg.data.train, (list, ListConfig)):
             test_list = [cfg.data.name]
 
+        # Latent-leakage guard: an external test set (usage="external") can return
+        # ALL of a dataset's samples (BUID/BUS_UCLM/BUS_UCLM_filtered), so if the
+        # same dataset is also trained on, external eval would score on its own
+        # training data. Previously only a comment in dynamic.yaml warned about
+        # this — make it a hard error.
+        overlap = set(train_list) & set(test_list)
+        if overlap:
+            raise ValueError(
+                f"data.train and data.test share dataset(s) {sorted(overlap)}: an "
+                "external test set can return that dataset's full sample set, so this "
+                "leaks training data into evaluation. Remove the overlap (internal "
+                "held-out test sets are added automatically as '<name>_test')."
+            )
+
         for name in test_list:
             SegDatasetProcessor._add_test_dataset_with_unfiltered(
                 cfg, name, test_datasets
@@ -370,7 +449,7 @@ class SegDatasetProcessor:
         sampler = _build_balanced_sampler(
             components["train_components"],
             components["train_component_names"],
-            cfg.data.get("sampling", OmegaConf.create({})),
+            _resolve_sampling_cfg(cfg),
         )
         shuffle = sampler is None
         train_loader = DataLoader(
@@ -380,6 +459,8 @@ class SegDatasetProcessor:
             sampler=sampler,
             num_workers=num_workers,
             pin_memory=True,
+            worker_init_fn=_seed_worker,
+            generator=_seeded_generator(cfg),
         )
         val_loader = DataLoader(
             val_ds,
@@ -418,10 +499,10 @@ class SegDatasetProcessor:
         sampler = _build_balanced_sampler(
             datasets["train_components"],
             datasets["train_component_names"],
-            cfg.data.get("sampling", OmegaConf.create({})),
+            _resolve_sampling_cfg(cfg),
         )
 
-        def _get_loader(ds, shuffle, sampler=None):
+        def _get_loader(ds, shuffle, sampler=None, seed_workers=False):
             return DataLoader(
                 ds,
                 batch_size=batch_size,
@@ -429,10 +510,12 @@ class SegDatasetProcessor:
                 sampler=sampler,
                 num_workers=num_workers,
                 pin_memory=True,
+                worker_init_fn=_seed_worker if seed_workers else None,
+                generator=_seeded_generator(cfg) if seed_workers else None,
             )
 
         return {
-            "train": _get_loader(datasets["train"], True, sampler=sampler),
+            "train": _get_loader(datasets["train"], True, sampler=sampler, seed_workers=True),
             "val": _get_loader(datasets["val"], False),
             "test": {
                 name: _get_loader(ds, False) for name, ds in datasets["test"].items()
