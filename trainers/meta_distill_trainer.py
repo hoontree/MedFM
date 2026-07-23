@@ -49,6 +49,10 @@ def _infinite(loader) -> Iterator:
 class MetaDistillTrainer(DistillTrainer):
     """DistillTrainer with a meta-learned reliability predictor."""
 
+    # Meta learning computes the task loss inside its own inner/outer loops via the
+    # distiller, so it must NOT have the task loss moved to the trainer.
+    _task_loss_in_trainer = False
+
     def __init__(self, cfg):
         # Parse meta scalars *before* super().__init__ — the base constructor
         # calls our overridden _create_optimizer(), which needs these.

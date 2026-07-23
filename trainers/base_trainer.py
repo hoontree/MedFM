@@ -380,6 +380,69 @@ class BaseTrainer(ABC):
             data.update({f"step/{k}": v for k, v in metrics.items()})
             wandb.log(self._round_log_values(data))
 
+    def _supervised_epoch(self, model, compute_batch_loss, clip_params_fn, cadence, epoch):
+        """One supervised training epoch, shared by the normal trainers and the
+        distill task_only path so the two run bit-identical code.
+
+        ``compute_batch_loss(model, batch, device) -> (loss, loss_dict)`` does the
+        model's forward + supervised loss; this loop owns AMP (autocast +
+        GradScaler), gradient clipping, the optimizer step, and per-batch LR
+        stepping. AMP is a no-op (exact fp32) unless ``self.amp_enabled``.
+        """
+        from tqdm import tqdm
+
+        # Lazily set up AMP so any trainer using this loop works. Disabled → exact
+        # fp32 (a no-op for TinyUSFM/SegFormer whose configs set no `amp`).
+        if not hasattr(self, "scaler"):
+            self.amp_enabled = bool(self.cfg.training.get("amp", False))
+            amp_dtype_str = str(self.cfg.training.get("amp_dtype", "bfloat16")).lower()
+            self.amp_dtype = (
+                torch.float16 if amp_dtype_str in ("float16", "fp16", "half") else torch.bfloat16
+            )
+            self.scaler = torch.amp.GradScaler(
+                "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+            )
+
+        model.train()
+        totals: Dict[str, float] = {}
+        num_epochs = self.cfg.training.num_epochs
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        for batch in pbar:
+            self.optimizer.zero_grad()
+            with torch.amp.autocast(
+                device_type=self.device.type,
+                enabled=getattr(self, "amp_enabled", False),
+                dtype=getattr(self, "amp_dtype", torch.bfloat16),
+            ):
+                loss, loss_dict = compute_batch_loss(model, batch, self.device)
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            max_norm = self.cfg.optimizer.get("gradient_clip", {}).get("max_norm", 1.0)
+            nn.utils.clip_grad_norm_(clip_params_fn(), max_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            if cadence == "batch" and self.scheduler is not None:
+                self.scheduler.step()
+
+            for k, v in loss_dict.items():
+                totals[k] = totals.get(k, 0.0) + (v.item() if hasattr(v, "item") else float(v))
+            lr = self.optimizer.param_groups[0]["lr"]
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr:.6f}"})
+            if self.global_step % 10 == 0:
+                self._log_step_metrics(
+                    {**{k: (v.item() if hasattr(v, "item") else float(v))
+                        for k, v in loss_dict.items()}, "lr": lr},
+                    self.global_step,
+                )
+            self.global_step += 1
+
+        n = len(self.train_loader)
+        out = {k: v / n for k, v in totals.items()}
+        out["lr"] = self.optimizer.param_groups[0]["lr"]
+        return out
+
     @staticmethod
     def _round_log_values(data: Dict, ndigits: int = 4) -> Dict:
         """Round float values before sending them to W&B.
@@ -1002,6 +1065,17 @@ class BaseTrainer(ABC):
                 val_metrics, val_predictions_cache = val_result
             else:
                 val_metrics, val_predictions_cache = val_result, None
+
+            # Step epoch / plateau LR schedulers here (per-batch schedulers already
+            # stepped inside _supervised_epoch). Trainers that step their scheduler
+            # internally in train_epoch/validate leave _sched_cadence unset (None)
+            # and are unaffected.
+            cadence = getattr(self, "_sched_cadence", None)
+            if self.scheduler is not None:
+                if cadence == "plateau":
+                    self.scheduler.step(val_metrics.get("Dice", val_metrics.get("dice", 0.0)))
+                elif cadence == "epoch":
+                    self.scheduler.step()
 
             # Visualize validation every 5 epochs (reuse predictions from validate())
             if should_visualize:
