@@ -35,6 +35,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from .base_trainer import BaseTrainer
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
+from utils.checkpoint import load_model_weights
 
 # The vendored SAM3 package (model/sam3_vendor, an unmodified fork of
 # facebookresearch/sam3) imports `pkg_resources` and `timm.models.layers`,
@@ -1324,14 +1325,9 @@ class SAM3TrainerAdapter(BaseTrainer):
         torch.save(checkpoint, str(path))
 
     def _load_checkpoint(self, path: Path):
-        """Load model checkpoint."""
+        """Load model checkpoint (any project schema)."""
         self.logger.info(f"Loading checkpoint: {path}")
-        checkpoint = torch.load(str(path), map_location=self.device)
-
-        if "model" in checkpoint:
-            self.model.load_state_dict(checkpoint["model"])
-        else:
-            self.model.load_state_dict(checkpoint)
+        load_model_weights(self.model, path, map_location=self.device, strict=True)
 
 
 def run_sam3_orchestrator(cfg: DictConfig):

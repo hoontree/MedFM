@@ -25,6 +25,7 @@ from utils.utils import set_seed
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 from trainers.base_trainer import BaseTrainer
 from trainers.model_adapters import make_adapter
+from utils.checkpoint import unwrap_state_dict
 from omegaconf import OmegaConf, DictConfig
 
 
@@ -830,7 +831,7 @@ class DistillTrainer(BaseTrainer):
         self.logger.info(f"Resuming from {path}")
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-        self.student.load_state_dict(ckpt["model_state_dict"])
+        self.student.load_state_dict(unwrap_state_dict(ckpt))
         self.student.to(self.device)
         if "distiller_state_dict" in ckpt:
             self.distiller.load_state_dict(ckpt["distiller_state_dict"], strict=False)
@@ -1004,7 +1005,7 @@ class DistillTrainer(BaseTrainer):
 
             self.logger.info(f"Loading best model for final evaluation: {self.best_model_path}")
             checkpoint = torch.load(self.best_model_path, map_location="cpu", weights_only=False)
-            self.student.load_state_dict(checkpoint["model_state_dict"])
+            self.student.load_state_dict(unwrap_state_dict(checkpoint))
             self.student.to(self.device)
 
             test_metrics, student_cache = self.test(phase="final_test")
@@ -1066,8 +1067,7 @@ class DistillTrainer(BaseTrainer):
 
         self.logger.info(f"Loading checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        self.student.load_state_dict(state_dict)
+        self.student.load_state_dict(unwrap_state_dict(checkpoint))
         self.student.to(self.device)
         self.student.eval()
         self.best_model_path = ckpt_path
