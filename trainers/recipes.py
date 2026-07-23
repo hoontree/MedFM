@@ -101,7 +101,6 @@ def _sam_recipe(cfg) -> Recipe:
     backbone_lr_scale = float(cfg.training.get("backbone_lr_scale", 1.0))
     base_lr = float(cfg.training.get("lr", 1e-4))
     weight_decay = float(cfg.optimizer.get("weight_decay", 0.1))
-    num_epochs = int(cfg.training.get("num_epochs", 100))
 
     # MonaiDiceLoss is stateless w.r.t. device (fixed sigmoid/softmax); pos_weight
     # is applied functionally so no buffer needs moving.
@@ -194,7 +193,6 @@ def _segformer_recipe(cfg) -> Recipe:
     dice_weight = float(cfg.training.get("dice_weight", 0.8))
     base_lr = float(cfg.training.base_lr)
     weight_decay = float(cfg.optimizer.get("weight_decay", 0.1))
-    num_epochs = int(cfg.training.num_epochs)
     bce = nn.BCEWithLogitsLoss()
     dice = DiceLoss(num_classes)  # matches SegformerTrainer exactly (num_classes as first arg)
 

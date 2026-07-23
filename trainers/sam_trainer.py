@@ -9,16 +9,11 @@ from typing import Dict, override
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.nn.modules.loss import CrossEntropyLoss
-from tqdm import tqdm
 import wandb
 
 from hydra.utils import instantiate
 from .base_trainer import BaseTrainer
 from utils.data_processing import SegDatasetProcessor
-from utils.criterion import DiceLoss
-from monai.losses import DiceLoss as MonaiDiceLoss
 
 
 class SAMTrainer(BaseTrainer):
@@ -29,19 +24,10 @@ class SAMTrainer(BaseTrainer):
         super().__init__(cfg)
 
         # SAM-specific attributes
-        self.ce_loss = None
-        self.bce_loss = None
-        self.dice_loss = None
         self.img_size = cfg.model.img_size
-        self.step_log_interval = 10
 
         self.num_epochs = self.cfg.training.get("num_epochs", 100)
         self.base_lr = float(self.cfg.training.get("lr", 1e-4))
-        self.dice_loss_weight = self.cfg.training.get("dice_loss_weight", 0.8)
-        self.moe_loss_weight = float(self.cfg.get("training", {}).get("moe_loss_weight", 0.0))
-        self.gradient_clip_max_norm = float(
-            self.cfg.optimizer.get("gradient_clip", {}).get("max_norm", 1.0)
-        )
         self.warmup_config = self.cfg.training.get(
             "warmup", {"enabled": False, "steps": 0}
         )
@@ -77,8 +63,6 @@ class SAMTrainer(BaseTrainer):
         # Setup DataParallel
         if len(self.cfg.get("hardware", {}).get("gpu_ids", [0])) > 1:
             self.model = nn.DataParallel(self.model)
-
-        self._setup_loss_functions()
 
         self._log_model_info()
 
@@ -186,74 +170,6 @@ class SAMTrainer(BaseTrainer):
                 },
                 allow_val_change=True,
             )
-
-    def _setup_loss_functions(self):
-        """Setup loss functions based on number of classes."""
-        num_classes = self.cfg.data.num_classes
-
-        # Targets arrive already one-hot encoded ([B, C, H, W] float), so
-        # to_onehot_y stays False. The activation is fixed at construction time
-        # (MonaiDiceLoss has no per-call `activation` arg): sigmoid for binary,
-        # softmax for multi-class.
-        if num_classes == 1:
-            pos_weight = torch.tensor([5.0], device=self.device)
-            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            self.dice_loss = MonaiDiceLoss(
-                include_background=True,
-                to_onehot_y=False,
-                sigmoid=True,
-            )
-        else:
-            self.ce_loss = CrossEntropyLoss()
-            self.dice_loss = MonaiDiceLoss(
-                include_background=False,  # Exclude background from Dice loss
-                to_onehot_y=False,
-                softmax=True,
-            )
-
-    def _calc_loss(self, outputs, label_batch, low_res_label_batch):
-        """Calculate loss using unified channel-based approach."""
-        dice_weight = self.dice_loss_weight
-        moe_loss_weight = self.moe_loss_weight
-        num_classes = self.cfg.data.num_classes
-
-        logits = outputs["low_res_logits"]
-        target = low_res_label_batch
-
-        # Ensure target and logits have the same resolution.
-        # Expected: target is downsampled to match low-res logits.
-        # Upsampling (target smaller than logits) should never happen in normal use.
-        if logits.shape[-2:] != target.shape[-2:]:
-            if target.shape[-2] < logits.shape[-2] or target.shape[-1] < logits.shape[-1]:
-                import warnings
-                warnings.warn(
-                    f"_calc_loss: target {tuple(target.shape[-2:])} is smaller than "
-                    f"logits {tuple(logits.shape[-2:])} — upsampling target, which may "
-                    "silently degrade training. Check data pipeline resolution.",
-                    stacklevel=2,
-                )
-            target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
-
-        if num_classes == 1:
-            loss_ce = self.bce_loss(logits, target)
-            loss_dice = self.dice_loss(logits, target)
-        else:
-            # target is one-hot [B, C, H, W] float; CE expects class index [B, H, W] long
-            target_idx = target.argmax(dim=1).long()
-            loss_ce = self.ce_loss(logits, target_idx)
-            loss_dice = self.dice_loss(logits, target)
-
-        loss_moe = outputs.get("moe_loss", torch.tensor(0.0, device=logits.device))
-        if not torch.is_tensor(loss_moe):
-            loss_moe = torch.tensor(float(loss_moe), device=logits.device)
-
-        loss = (
-            (1 - dice_weight) * loss_ce
-            + dice_weight * loss_dice
-            + moe_loss_weight * loss_moe
-        )
-
-        return loss, loss_ce, loss_dice, loss_moe
 
     @override
     def train_epoch(self, epoch: int) -> Dict[str, float]:

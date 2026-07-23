@@ -9,7 +9,6 @@ from typing import Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
 from hydra.utils import instantiate
 
 from .base_trainer import BaseTrainer
