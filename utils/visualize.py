@@ -140,16 +140,6 @@ def _collect_wandb_image(
         return None
 
 
-def _extract_filenames(batch) -> Optional[List[str]]:
-    """Extract filenames from the last element of a dataloader batch.
-
-    Returns a list of filename strings if the last batch element contains
-    strings, otherwise None.
-    """
-    last = batch[-1]
-    if isinstance(last, (list, tuple)) and len(last) > 0 and isinstance(last[0], str):
-        return list(last)
-    return None
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -9,7 +9,6 @@ from typing import Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
 from hydra.utils import instantiate
 
 from .base_trainer import BaseTrainer
@@ -146,75 +145,25 @@ class TinyUSFMTrainer(BaseTrainer):
                 patience=self.cfg.scheduler.get("patience", 5),
                 min_lr=self.cfg.scheduler.get("min_lr", 1e-7),
             )
+            self._sched_cadence = "plateau"
             self.logger.info(f"Using ReduceLROnPlateau scheduler")
         else:
             self.scheduler = build_scheduler(self.optimizer, self.cfg)
+            self._sched_cadence = "epoch"
             self.logger.info("Using WarmupPolyLR scheduler")
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Train for one epoch."""
-        self.model.train()
-
-        total_loss = 0.0
-        num_batches = len(self.train_loader)
-        step_log_interval = 10
-
-        train_pbar = tqdm(
-            self.train_loader,
-            desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}",
+        """One epoch via the shared BaseTrainer._supervised_epoch loop, using the
+        TinyUSFM recipe's per-batch compute — the SAME loop + compute a distillation
+        task_only run of a TinyUSFM student uses, so the two are bit-identical.
+        The epoch/plateau scheduler steps in BaseTrainer.train() (cadence-driven)."""
+        if getattr(self, "_recipe", None) is None:
+            from trainers.recipes import get_recipe
+            self._recipe = get_recipe("tinyusfm", self.cfg)
+        return self._supervised_epoch(
+            self.model, self._recipe.compute_batch_loss,
+            self.model.parameters, getattr(self, "_sched_cadence", "epoch"), epoch,
         )
-
-        for images, masks, *_ in train_pbar:
-            images, masks = images.to(self.device), masks.to(self.device).float()
-
-            # Forward pass
-            outputs = self.model(images)
-
-            # Calculate loss
-            loss = _compute_loss(
-                self.criterion, outputs, masks, self.cfg.data.num_classes
-            )
-
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-
-            # Gradient clipping
-            max_norm = self.cfg.optimizer.get("gradient_clip", {}).get(
-                "max_norm", 1.0
-            )
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=max_norm
-            )
-
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            current_lr = self.optimizer.param_groups[0]["lr"]
-
-            # Update progress bar
-            train_pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.6f}"})
-
-            # Step-level wandb logging
-            if self.global_step % step_log_interval == 0:
-                self._log_step_metrics(
-                    {"loss": loss.item(), "lr": current_lr},
-                    self.global_step,
-                )
-
-            self.global_step += 1
-
-        # Advance epoch-level scheduler (ReduceLROnPlateau is handled in validate())
-        use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
-            "use_reduce_on_plateau", False
-        )
-        if not use_reduce_on_plateau and self.scheduler is not None:
-            self.scheduler.step()
-
-        epoch_loss = total_loss / num_batches
-        current_lr = self.optimizer.param_groups[0]["lr"]
-
-        return {"loss": epoch_loss, "lr": current_lr}
 
     def validate(self, epoch: int, return_predictions: bool = False):
         """Validate model.
@@ -236,12 +185,8 @@ class TinyUSFMTrainer(BaseTrainer):
         else:
             val_metrics = result
 
-        # ReduceLROnPlateau needs the val metric; other schedulers are stepped in train_epoch()
-        use_reduce_on_plateau = self.cfg.get("scheduler", {}).get(
-            "use_reduce_on_plateau", False
-        )
-        if use_reduce_on_plateau and self.scheduler is not None:
-            self.scheduler.step(val_metrics["Dice"])
+        # Scheduler stepping (epoch / plateau) now happens in BaseTrainer.train()
+        # via _sched_cadence, so both normal and distill training step it identically.
 
         self.evaluator.print_metrics(val_metrics, phase="validation")
 
@@ -287,134 +232,3 @@ class TinyUSFMTrainer(BaseTrainer):
         )
 
         return test_metrics, predictions_cache
-
-
-try:
-    import lightning as L
-except ImportError:
-    L = None
-
-
-class TinyUSFMLightningModule(L.LightningModule if L is not None else object):
-    """Lightning module for TinyUSFM training."""
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.model = load_model_seg(self.cfg, torch.device("cpu"))
-        self.criterion = _build_criterion(self.cfg.model.num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
-    def training_step(self, batch: Tuple, batch_idx: int) -> torch.Tensor:
-        images, masks, *_ = batch
-        outputs = self.model(images)
-        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
-        self.log(
-            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
-        )
-        return loss
-
-    def configure_optimizers(self) -> Tuple[List[optim.Optimizer], List]:
-        optimizer = _build_optimizer(self.model, self.cfg)
-        scheduler = build_scheduler(optimizer, self.cfg)
-        return [optimizer], [scheduler]
-
-    def validation_step(self, batch: Tuple, batch_idx: int) -> torch.Tensor:
-        images, masks, *_ = batch
-        outputs = self.model(images)
-        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
-        self.log(
-            "val_loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True
-        )
-        return loss
-
-    def test_step(
-        self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0
-    ) -> torch.Tensor:
-        images, masks, *extra = batch
-        last = extra[-1] if extra else None
-        filenames = (
-            list(last)
-            if isinstance(last, (list, tuple)) and last and isinstance(last[0], str)
-            else None
-        )
-        outputs = self.model(images)
-        loss = _compute_loss(self.criterion, outputs, masks, self.cfg.model.num_classes)
-
-        preds = (
-            (torch.sigmoid(outputs) > 0.5).float()
-            if self.cfg.model.num_classes == 1
-            else torch.argmax(outputs, dim=1, keepdim=True).float()
-        )
-
-        vis_dir = Path(self.trainer.logger.log_dir) / "visualizations"
-        self.visualize_predictions_batch(
-            images.cpu(),
-            preds.cpu(),
-            masks.cpu(),
-            vis_dir,
-            batch_idx=batch_idx,
-            num_samples=10,
-            filenames=filenames,
-        )
-
-        self.log(
-            "test_loss", loss, prog_bar=True, logger=True, on_step=False, on_epoch=True
-        )
-        return loss
-
-    def configure_gradient_clipping(
-        self,
-        optimizer: optim.Optimizer,
-        gradient_clip_val: Optional[float] = None,
-        gradient_clip_algorithm: Optional[str] = None,
-    ) -> None:
-        gradient_clip_val = self.cfg.optimizer.get("gradient_clip", {}).get(
-            "max_norm", 1.0
-        )
-        gradient_clip_algorithm = "norm"
-        super().configure_gradient_clipping(
-            optimizer, gradient_clip_val, gradient_clip_algorithm
-        )
-
-    def predict_step(
-        self, batch: Tuple, batch_idx: int, dataloader_idx: int = 0
-    ) -> torch.Tensor:
-        images, *_ = batch
-        return self.model(images)
-
-    def visualize_predictions_batch(
-        self,
-        images: torch.Tensor,
-        preds: torch.Tensor,
-        masks: torch.Tensor,
-        vis_dir: Path,
-        batch_idx: int = 0,
-        num_samples: int = 10,
-        filenames: list = None,
-    ) -> None:
-        from utils.visualize import _visualize_sample_arrays
-
-        vis_dir.mkdir(parents=True, exist_ok=True)
-
-        images_np = images.numpy()
-        preds_np = preds.numpy()
-        masks_np = masks.numpy()
-
-        sample_count = batch_idx * images_np.shape[0]
-
-        for i in range(images_np.shape[0]):
-            fname = filenames[i] if filenames else None
-            file_label = fname or f"{sample_count:03d}"
-            save_path = vis_dir / f"sample_{file_label}.png"
-            _visualize_sample_arrays(
-                images_np[i], masks_np[i], preds_np[i],
-                save_path, self.cfg.model.num_classes,
-                filename=fname,
-            )
-
-            sample_count += 1
-            if sample_count >= num_samples:
-                break

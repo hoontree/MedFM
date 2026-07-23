@@ -76,9 +76,8 @@ The project uses Hydra for hierarchical configuration management:
 
 - **config/train.yaml**: Main training configuration entry point
 - **config/distill.yaml**: Knowledge distillation configuration
-- **config/model/**: Model-specific configs (sam.yaml, TinyUSFM.yaml, segformer.yaml)
+- **config/model/**: Model-specific configs (sam.yaml, tinyusfm.yaml, segformer.yaml, sam3*.yaml)
 - **config/data/**: Dataset configurations (BUSBRA.yaml, BUSI.yaml, etc.)
-- **config/model/encoder/**: Encoder variants (vit_b.yaml, vit_l.yaml, vit_h.yaml)
 
 Configuration override syntax: `python main.py key.subkey=value`
 
@@ -110,8 +109,7 @@ The framework uses a factory pattern with model-specific trainers:
 Models are in `model/` directory:
 
 - **SAM models**:
-  - `sam_lora_image_encoder.py`: LoRA adaptation of image encoder only
-  - `sam_lora_image_encoder_mask_decoder.py`: LoRA for encoder + mask decoder
+  - `sam_hybrid_adapter.py`: `LoRA_Sam` — the unified SAM wrapper with flexible encoder/decoder adaptation (LoRA / Conv-LoRA / FT / frozen)
   - `segment_anything/`: Original SAM implementation
 
 - **Lightweight models**:

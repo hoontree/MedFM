@@ -426,34 +426,6 @@ def entropy_penalty_from_probs(probs: torch.Tensor, eps: float = 1e-8) -> torch.
     return (1.0 - _normalized_entropy_from_probs(probs, eps=eps)).clamp(0.0, 1.0)
 
 
-def entropy_penalty_from_logits(
-    teacher_logits: torch.Tensor,
-    tau: float = 1.0,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Entropy penalty computed directly from teacher logits.
-
-    Convenience wrapper around ``pixelwise_entropy`` that softens logits
-    by ``tau``, computes the entropy, and returns
-    ``1 - H(p) / log(C_eff)``. Equivalent to first converting logits to
-    probabilities and calling ``entropy_penalty_from_probs``, but avoids
-    materialising the probability tensor outside ``no_grad``. Binary vs.
-    multi-class is inferred from ``teacher_logits.shape[1]``.
-
-    Args:
-        teacher_logits: Raw teacher logits ``[B, C, H, W]``.
-        tau: Softmax temperature for entropy computation.
-        eps: Stability constant for ``max_entropy`` clamping.
-
-    Returns:
-        Penalty tensor of shape ``[B, H, W]`` in ``[0, 1]``.
-    """
-    entropy = pixelwise_entropy(teacher_logits, tau=tau, eps=eps)
-    c_eff = _effective_num_classes(teacher_logits)
-    max_entropy = torch.log(
-        torch.tensor(float(c_eff), device=entropy.device, dtype=entropy.dtype)
-    ).clamp(min=eps)
-    return (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
 
 # Teacher correctness gate
 def teacher_correctness_gate(
@@ -784,34 +756,6 @@ def pixelwise_entropy(
     return entropy
 
 
-def compute_margin_uncertainty(
-    teacher_logits: torch.Tensor,
-    tau: float = 4.0,
-) -> torch.Tensor:
-    """Margin-based uncertainty from teacher logits.
-
-    Defined as ``u = 1 - (p_top1 - p_top2)``, where probabilities come from
-    ``softmax(logits / tau)``. A small top-1/top-2 gap implies high
-    uncertainty (``u -> 1``); a confident pixel yields ``u -> 0``.
-
-    Binary vs. multi-class is inferred from ``teacher_logits.shape[1]``;
-    for ``C == 1`` the logit is expanded to ``[0, logit]`` before softmax,
-    matching the convention used by ``LogitDistillLoss``.
-
-    Args:
-        teacher_logits: Raw teacher logits, shape ``[B, C, H, W]``.
-        tau: Softmax temperature.
-
-    Returns:
-        Tensor of shape ``[B, H, W]`` with values in ``[0, 1]``.
-    """
-    with torch.no_grad():
-        logits = _expand_binary_logits(teacher_logits)
-        p = F.softmax(logits / tau, dim=1)              # [B, C_eff, H, W]
-        top2 = p.topk(k=2, dim=1).values                # [B, 2, H, W]
-        margin = top2[:, 0] - top2[:, 1]                # [B, H, W]
-        uncertainty = 1.0 - margin                      # invert margin to get uncertainty
-    return uncertainty
 
 def compute_disagreement_uncertainty(
     teacher_probs_a: torch.Tensor,
@@ -864,48 +808,6 @@ def compute_disagreement_uncertainty(
 
     return uncertainty
 
-def augmentation_variance_uncertainty(
-    probs_list: list[torch.Tensor],
-    reduce_class: str = "mean",
-) -> torch.Tensor:
-    """Per-pixel variance across augmented teacher predictions.
-
-    Given ``K`` teacher probability maps obtained from augmented views (and
-    inverse-aligned to a common coordinate system), computes the across-view
-    variance per class and reduces over the class dimension.
-
-    Args:
-        probs_list: List of ``K`` probability tensors, each
-            ``[B, C, H, W]``. ``K >= 2`` and all entries must share shape
-            and coordinate frame.
-        reduce_class: Reduction across classes, ``"mean"`` or ``"max"``.
-
-    Returns:
-        Tensor of shape ``[B, H, W]`` clamped to ``[0, 1]``.
-
-    Raises:
-        ValueError: If fewer than two maps are provided, shapes mismatch,
-            or ``reduce_class`` is invalid.
-    """
-    if len(probs_list) < 2:
-        raise ValueError("At least two probability maps are required.")
-
-    ref_shape = probs_list[0].shape
-    for p in probs_list:
-        if p.shape != ref_shape:
-            raise ValueError("All probability maps must have the same shape.")
-
-    stacked = torch.stack(probs_list, dim=0)  # [K, B, C, H, W]
-    var = stacked.var(dim=0, unbiased=False)  # [B, C, H, W]
-
-    if reduce_class == "mean":
-        uncertainty = var.mean(dim=1)
-    elif reduce_class == "max":
-        uncertainty = var.max(dim=1).values
-    else:
-        raise ValueError(f"Unknown reduce_class: {reduce_class}")
-
-    return uncertainty.clamp(0.0, 1.0)
 
 def _entropy_from_probs_raw(
     probs: torch.Tensor, eps: float = 1e-8
@@ -920,89 +822,8 @@ def _entropy_from_probs_raw(
     return -(probs * (probs + eps).log()).sum(dim=1)
 
 
-def ensemble_predictive_entropy_uncertainty(
-    probs_list: list[torch.Tensor],
-    normalize: bool = True,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Predictive entropy of an ensemble / MC-dropout mean prediction.
-
-    Total uncertainty in the Bayesian sense: ``H(E[p])`` where the
-    expectation is the mean over members.
-
-    Args:
-        probs_list: List of ``K >= 2`` already-normalised probability
-            tensors ``[B, C, H, W]``.
-        normalize: If ``True``, divide by ``log(C)`` to get values in
-            ``[0, 1]``.
-        eps: Log-stability constant.
-
-    Returns:
-        Tensor of shape ``[B, H, W]``.
-
-    Raises:
-        ValueError: If fewer than two maps are provided.
-    """
-    if len(probs_list) < 2:
-        raise ValueError("At least two probability maps are required.")
-
-    mean_probs = torch.stack(probs_list, dim=0).mean(dim=0)  # [B, C, H, W]
-    entropy = _entropy_from_probs_raw(mean_probs, eps=eps)
-
-    if normalize:
-        c = mean_probs.shape[1]
-        entropy = entropy / torch.log(
-            torch.tensor(c, device=entropy.device, dtype=entropy.dtype)
-        ).clamp(min=eps)
-
-    return entropy
 
 
-def ensemble_mutual_information_uncertainty(
-    probs_list: list[torch.Tensor],
-    normalize: bool = True,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Mutual information (epistemic uncertainty) of an ensemble.
-
-    Decomposes total uncertainty ``H(E[p])`` into aleatoric and epistemic
-    components and returns the epistemic part:
-
-        I[y; theta] = H(E[p]) - E[H(p)]
-
-    Args:
-        probs_list: List of ``K >= 2`` already-normalised probability
-            tensors ``[B, C, H, W]``.
-        normalize: If ``True``, divide by ``log(C)``.
-        eps: Log-stability constant.
-
-    Returns:
-        Tensor of shape ``[B, H, W]`` clamped to ``>= 0``.
-
-    Raises:
-        ValueError: If fewer than two maps are provided.
-    """
-    if len(probs_list) < 2:
-        raise ValueError("At least two probability maps are required.")
-
-    stacked = torch.stack(probs_list, dim=0)  # [K, B, C, H, W]
-    mean_probs = stacked.mean(dim=0)
-
-    predictive_entropy = _entropy_from_probs_raw(mean_probs, eps=eps)
-    expected_entropy = torch.stack(
-        [_entropy_from_probs_raw(p, eps=eps) for p in probs_list],
-        dim=0,
-    ).mean(dim=0)
-
-    mutual_info = predictive_entropy - expected_entropy
-
-    if normalize:
-        c = mean_probs.shape[1]
-        mutual_info = mutual_info / torch.log(
-            torch.tensor(c, device=mutual_info.device, dtype=mutual_info.dtype)
-        ).clamp(min=eps)
-
-    return mutual_info.clamp(min=0.0)
 
 def boundary_uncertainty_from_probs(
     foreground_probs: torch.Tensor,

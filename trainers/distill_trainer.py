@@ -24,6 +24,9 @@ from utils.visualize import visualize_segmentation
 from utils.utils import set_seed
 from utils.wandb_utils import resolve_wandb_identity, build_experiment_dir
 from trainers.base_trainer import BaseTrainer
+from trainers.model_adapters import make_adapter
+from trainers.recipes import get_recipe
+from utils.checkpoint import unwrap_state_dict
 from omegaconf import OmegaConf, DictConfig
 
 
@@ -32,7 +35,13 @@ class DistillTrainer(BaseTrainer):
     Trainer for Knowledge Distillation.
     Inherits common infrastructure from BaseTrainer and overrides distillation-specific logic.
     """
-    
+
+    # When a recipe exists for the student, compute the task loss here (train_epoch)
+    # instead of inside the distiller, so it can use the full student output + batch
+    # (e.g. SAM's low-res loss). Subclasses that own the task loss in their own loop
+    # (MetaDistillTrainer's meta inner/outer loops) set this False to opt out.
+    _task_loss_in_trainer = True
+
     # Construction
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)  # initializes cfg, device, evaluator, base attrs
@@ -337,6 +346,15 @@ class DistillTrainer(BaseTrainer):
         self.student = self.student.to(self.device)
         self.model = self.student  # base-class compatibility
 
+        # One uniform seam for calling/evaluating each model, replacing the
+        # scattered isinstance(LoRA_Sam) branches (trainers/model_adapters.py).
+        self.teacher_adapter = make_adapter(
+            self.teacher, self.cfg, self.cfg.teacher_cfg, is_student=False
+        )
+        self.student_adapter = make_adapter(
+            self.student, self.cfg, self.cfg.student_cfg, is_student=True
+        )
+
         self.distiller = create_distiller(self.cfg).to(self.device)
 
         # Single source of truth for "online": the trainer decides online-ness from
@@ -358,28 +376,90 @@ class DistillTrainer(BaseTrainer):
 
         self.distiller.prepare(self.student, self.teacher)
 
+        # "distillation = normal training + KD": route the student's task loss /
+        # optimizer / scheduler through its normal-training recipe, so a run with
+        # every KD weight = 0 reduces exactly to normal supervised training. The
+        # task loss is computed in train_epoch (not the distiller) so it can use the
+        # full student output + batch — needed for SAM, whose supervised loss is on
+        # the low-res logits vs a low-res label the KD pipeline doesn't carry. The
+        # distiller then computes KD terms only (w_task forced to 0).
+        # Not applied to subclasses that own the task loss themselves
+        # (MetaDistillTrainer: _task_loss_in_trainer = False).
+        self._student_recipe = get_recipe(self.student_name, self.cfg)
+        self._sched_cadence = "epoch"
+        self._use_recipe = self._student_recipe is not None and self._task_loss_in_trainer
+        self._task_weight = 0.0
+        # Any active KD term means the teacher is needed each step; if none is active
+        # (a pure task_only run) we skip the teacher forward entirely, so a recipe
+        # student's task_only run is literally its normal training (no teacher).
+        self._kd_active = any(
+            float(getattr(self.distiller, w, 0.0)) > 0
+            for w in ("w_logit_kd", "w_logit_cwd", "w_feature_cwd",
+                      "w_reliability_kd", "w_uncertainty_kd")
+        )
+        if self._use_recipe:
+            self._task_weight = float(self.cfg.method.get("w_task", 1.0))
+            self.distiller.w_task = 0.0
+            self.logger.info(
+                "[recipe] Student '%s': task loss computed in trainer (weight=%s), "
+                "distiller does KD only — task_only ≡ normal training.",
+                self.student_name, self._task_weight,
+            )
+
+        # AMP: match the student's normal-training precision (e.g. SAM trains under
+        # bf16 autocast). Disabled → exact fp32, a no-op for models like TinyUSFM
+        # whose training config sets no `amp` (preserves their fp32 behavior).
+        self.amp_enabled = bool(self.cfg.training.get("amp", False))
+        amp_dtype_str = str(self.cfg.training.get("amp_dtype", "bfloat16")).lower()
+        self.amp_dtype = torch.float16 if amp_dtype_str in ("float16", "fp16", "half") else torch.bfloat16
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        if self.amp_enabled:
+            self.logger.info("[recipe] AMP enabled: dtype=%s", self.amp_dtype)
+
         self._log_model_info()
+
+    def _add_kd_param_groups(self):
+        """Append online-teacher and distiller param groups to self.optimizer."""
+        if self._is_online:
+            teacher_trainable = [p for p in self.teacher.parameters() if p.requires_grad]
+            if teacher_trainable:
+                teacher_lr = self.cfg.training.get("teacher_lr", self.cfg.training.lr)
+                self.optimizer.add_param_group(
+                    {"params": teacher_trainable, "lr": teacher_lr}
+                )
+                self.logger.info(
+                    f"[Online Distillation] Teacher trainable params: "
+                    f"{sum(p.numel() for p in teacher_trainable):,}  lr={teacher_lr}"
+                )
+        distiller_params = list(self.distiller.parameters())
+        if distiller_params:
+            self.optimizer.add_param_group(
+                {"params": distiller_params, "lr": self.cfg.training.lr}
+            )
 
     @override
     def _create_optimizer(self):
-        # Only hand the optimizer parameters it can actually update. AdamW allocates
-        # exp_avg + exp_avg_sq per parameter, so passing frozen weights costs 2x their
-        # size in VRAM for nothing — which is free for an all-trainable student like
-        # TinyUSFM but very much not for a LoRA student or the SAM3 student (whose text
-        # tower is frozen by design, model/sam3_student.py).
+        # With a recipe, build the student's optimizer exactly as its normal trainer
+        # does (e.g. TinyUSFM's layer-wise LR decay) so task_only ≡ normal training,
+        # then add the KD-side groups on top.
+        if self._use_recipe:
+            self.optimizer = self._student_recipe.build_optimizer(self.student, self.cfg)
+            self._add_kd_param_groups()
+            return
+
+        # Fallback (models without a recipe): single-group AdamW over trainable
+        # student params. AdamW allocates exp_avg + exp_avg_sq per parameter, so
+        # passing frozen weights costs 2x their size in VRAM for nothing — matters
+        # for a LoRA / SAM3 student whose parts are frozen by design.
         student_trainable = [p for p in self.student.parameters() if p.requires_grad]
         param_groups = [{"params": student_trainable, "lr": self.cfg.training.lr}]
         if self._is_online:
-            teacher_trainable = [
-                p for p in self.teacher.parameters() if p.requires_grad
-            ]
+            teacher_trainable = [p for p in self.teacher.parameters() if p.requires_grad]
             if teacher_trainable:
-                teacher_lr = self.cfg.training.get(
-                    "teacher_lr", self.cfg.training.lr
-                )
-                param_groups.append(
-                    {"params": teacher_trainable, "lr": teacher_lr}
-                )
+                teacher_lr = self.cfg.training.get("teacher_lr", self.cfg.training.lr)
+                param_groups.append({"params": teacher_trainable, "lr": teacher_lr})
                 self.logger.info(
                     f"[Online Distillation] Teacher trainable params: "
                     f"{sum(p.numel() for p in teacher_trainable):,}  lr={teacher_lr}"
@@ -394,7 +474,18 @@ class DistillTrainer(BaseTrainer):
 
     @override
     def _create_scheduler(self):
+        # With a recipe, build the student's scheduler as its normal trainer does
+        # (incl. honoring use_reduce_on_plateau / per-batch poly) and record its step
+        # cadence so the train loop steps it at the right time.
+        if self._use_recipe:
+            total_iters = int(self.cfg.training.num_epochs) * len(self.train_loader)
+            self.scheduler, self._sched_cadence = self._student_recipe.build_scheduler(
+                self.optimizer, self.cfg, total_iters
+            )
+            self.logger.info("[recipe] scheduler cadence: %s", self._sched_cadence)
+            return
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
+        self._sched_cadence = "epoch"
 
     @override
     def _log_model_info(self):
@@ -415,48 +506,32 @@ class DistillTrainer(BaseTrainer):
             }
         )
 
-    # Forward helpers (teacher / student calls)
-    @staticmethod
-    def _is_sam_model(model) -> bool:
-        """Return True if *model* is a SAM-based model (LoRA_Sam)."""
-        try:
-            from model.sam_hybrid_adapter import LoRA_Sam
-            return isinstance(model, LoRA_Sam)
-        except ImportError:
-            return False
-
+    # Forward helpers (teacher / student calls) — thin delegators to the
+    # per-model adapters built in _create_model. Signatures unchanged so every
+    # caller (incl. MetaDistillTrainer) is unaffected.
     def _call_teacher(self, images):
-        """Call teacher model with the appropriate forward signature."""
-        if self._is_sam_model(self.teacher):
-            img_size = self.cfg.teacher_cfg.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            return self.teacher(images, multimask, img_size)
-        else:
-            raw = self.teacher(images)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
+        """Call the teacher, returning ``{"masks", ...}``."""
+        return self.teacher_adapter.forward_kd(images)
 
     def _call_student(self, images):
-        """Call student model and normalise its output to a dict."""
-        if self._is_sam_model(self.student):
-            img_size = self.cfg.student_cfg.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            raw = self.student(images, multimask, img_size)
-            if isinstance(raw, dict):
-                return raw
-            return {"masks": raw}
-        else:
-            raw = self.student(images, return_features=True)
-            if isinstance(raw, (list, tuple)):
-                return {"masks": raw[0], "features": raw[1]}
-            return {"masks": raw}
+        """Call the student, returning ``{"masks", ["features"]}``."""
+        return self.student_adapter.forward_kd(images)
 
     # Training step
     @override
     def train_epoch(self, epoch) -> Dict[str, float]:
         self.student.train()
         self.distiller.train()
+
+        # Pure task_only (recipe student, no KD term active): run the ONE shared
+        # supervised loop + the SAME per-batch compute the student's normal trainer
+        # uses, so it is bit-identical to normal training. No teacher, no distiller.
+        if self._use_recipe and not self._kd_active:
+            return self._supervised_epoch(
+                self.student, self._student_recipe.compute_batch_loss,
+                self.student.parameters, self._sched_cadence, epoch,
+            )
+
         if self._is_online:
             self.teacher.train()
 
@@ -465,9 +540,9 @@ class DistillTrainer(BaseTrainer):
             self.train_loader, desc=f"Epoch {epoch + 1}/{self.cfg.training.num_epochs}"
         )
 
-        for i, (images, masks, *_) in enumerate(pbar):
-            images = images.to(self.device)
-            masks = masks.to(self.device)
+        for i, batch in enumerate(pbar):
+            images = batch[0].to(self.device)
+            masks = batch[1].to(self.device)
 
             self.distiller.on_step_begin()
 
@@ -477,19 +552,39 @@ class DistillTrainer(BaseTrainer):
                 with torch.no_grad():
                     teacher_outputs = self._call_teacher(images)
 
-            student_outputs = self._call_student(images)
-
-            loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
-            loss = loss_dict["loss"]
-
             self.optimizer.zero_grad()
-            loss.backward()
+            # autocast/GradScaler match the student's normal precision (bf16 for SAM,
+            # fp32 no-op otherwise).
+            with torch.amp.autocast(
+                device_type=self.device.type, enabled=self.amp_enabled, dtype=self.amp_dtype
+            ):
+                student_outputs = self._call_student(images)
+                loss_dict = self.distiller(student_outputs, teacher_outputs, masks)
+                if self._use_recipe:
+                    # KD run with a recipe student: task loss owned by the trainer
+                    # (distiller ran with w_task=0, so loss_dict holds KD terms only).
+                    task = self._student_recipe.task_loss(student_outputs, batch, self.device)
+                    loss = self._task_weight * task + loss_dict["loss"]
+                    loss_dict = dict(loss_dict)
+                    loss_dict["task_loss"] = task
+                    loss_dict["loss"] = loss
+                else:
+                    loss = loss_dict["loss"]
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
 
             max_norm = self.cfg.optimizer.gradient_clip.get("max_norm", 1.0)
             all_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
             nn.utils.clip_grad_norm_(all_params, max_norm=max_norm)
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Per-batch LR schedulers (SAM / SegFormer) step here; epoch / plateau
+            # schedulers step once per epoch in the train() loop.
+            if self._sched_cadence == "batch" and self.scheduler is not None:
+                self.scheduler.step()
 
             for k, v in loss_dict.items():
                 val = v.item() if hasattr(v, "item") else v
@@ -517,17 +612,11 @@ class DistillTrainer(BaseTrainer):
         return self.test_loader
 
     def _evaluate_model(self, model, loader, return_predictions=False):
-        """Call the appropriate evaluate_model variant depending on model type."""
+        """Evaluate via the model's adapter (teacher or student)."""
         num_classes = self.cfg.data.num_classes
-        if self._is_sam_model(model):
-            img_size = self.cfg.data.img_size
-            return self.evaluator.evaluate_model_sam(
-                model, loader, self.device, num_classes,
-                img_size=img_size, return_predictions=return_predictions,
-            )
-        return self.evaluator.evaluate_model(
-            model, loader, self.device, num_classes,
-            return_predictions=return_predictions,
+        adapter = self.teacher_adapter if model is self.teacher else self.student_adapter
+        return adapter.evaluate(
+            self.evaluator, loader, self.device, num_classes, return_predictions
         )
 
     @override
@@ -852,7 +941,7 @@ class DistillTrainer(BaseTrainer):
         self.logger.info(f"Resuming from {path}")
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-        self.student.load_state_dict(ckpt["model_state_dict"])
+        self.student.load_state_dict(unwrap_state_dict(ckpt))
         self.student.to(self.device)
         if "distiller_state_dict" in ckpt:
             self.distiller.load_state_dict(ckpt["distiller_state_dict"], strict=False)
@@ -1003,7 +1092,13 @@ class DistillTrainer(BaseTrainer):
                     self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                     break
 
-            self.scheduler.step()
+            # Step the LR scheduler at the recipe's cadence (a plateau scheduler
+            # needs the val metric; an epoch scheduler steps once per epoch; a
+            # per-batch scheduler was already stepped inside train_epoch).
+            if self._sched_cadence == "plateau":
+                self.scheduler.step(val_metrics.get("Dice", val_metrics.get("dice", 0.0)))
+            elif self._sched_cadence == "epoch":
+                self.scheduler.step()
             # Persist full training state so an interrupted run resumes here.
             self._save_resume_checkpoint(epoch)
 
@@ -1026,7 +1121,7 @@ class DistillTrainer(BaseTrainer):
 
             self.logger.info(f"Loading best model for final evaluation: {self.best_model_path}")
             checkpoint = torch.load(self.best_model_path, map_location="cpu", weights_only=False)
-            self.student.load_state_dict(checkpoint["model_state_dict"])
+            self.student.load_state_dict(unwrap_state_dict(checkpoint))
             self.student.to(self.device)
 
             test_metrics, student_cache = self.test(phase="final_test")
@@ -1088,8 +1183,7 @@ class DistillTrainer(BaseTrainer):
 
         self.logger.info(f"Loading checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        self.student.load_state_dict(state_dict)
+        self.student.load_state_dict(unwrap_state_dict(checkpoint))
         self.student.to(self.device)
         self.student.eval()
         self.best_model_path = ckpt_path

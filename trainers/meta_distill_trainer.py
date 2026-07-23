@@ -49,6 +49,10 @@ def _infinite(loader) -> Iterator:
 class MetaDistillTrainer(DistillTrainer):
     """DistillTrainer with a meta-learned reliability predictor."""
 
+    # Meta learning computes the task loss inside its own inner/outer loops via the
+    # distiller, so it must NOT have the task loss moved to the trainer.
+    _task_loss_in_trainer = False
+
     def __init__(self, cfg):
         # Parse meta scalars *before* super().__init__ — the base constructor
         # calls our overridden _create_optimizer(), which needs these.
@@ -146,14 +150,11 @@ class MetaDistillTrainer(DistillTrainer):
         parameters/buffers, so passing only the (fast-updated) trainable subset
         merged over the originals is sufficient.
         """
-        if self._is_sam_model(self.student):
-            img_size = self.cfg.student_cfg.get("img_size", self.cfg.data.img_size)
-            multimask = self.cfg.data.num_classes > 1
-            out = functional_call(self.student, params, (images, multimask, img_size))
-        else:
-            out = functional_call(
-                self.student, params, (images,), {"return_features": True}
-            )
+        # Reuse the student adapter's exact forward signature (SAM: (images,
+        # multimask, img_size); dense student: (images,), return_features=True)
+        # so the meta param-swap path can't drift from the normal forward.
+        args, kwargs = self.student_adapter.forward_args(images)
+        out = functional_call(self.student, params, args, kwargs)
         if isinstance(out, dict):
             return out["masks"]
         if isinstance(out, (list, tuple)):
